@@ -68,6 +68,9 @@ Rules:
     * Question that needs reasoning over fetched data
       (e.g. "search the web for X and summarize", "what's the latest
       version of Y") → one or more FETCH, then a SAY.
+- For multi-step shell tasks, emit a SINGLE CMD that chains all steps with
+  '&&' or newlines. Never output multiple CMD lines. Use here-docs or printf
+  to write file contents when needed.
 - Web access: use `curl -sSL -A 'Mozilla/5.0' <url>`. For web search
   prefer DuckDuckGo's HTML endpoint:
     curl -sSL -A 'Mozilla/5.0' 'https://html.duckduckgo.com/html/?q=QUERY'

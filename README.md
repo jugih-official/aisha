@@ -95,6 +95,12 @@ ai which processes are using the most memory
 ai restart the bluetooth service
 ```
 
+Chained tasks in one request (single CMD with multiple steps):
+
+```sh
+ai create ./table.sh, make it executable, and write a 3-column table where col1 is 2..16, col2 is random numbers, col3 counts down from 100
+```
+
 Questions that need the web (run silently, then answered in prose):
 
 ```sh
