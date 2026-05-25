@@ -47,6 +47,23 @@ The script checks, in order:
 2. `~/.config/ai-bash/api-key` (your user)
 3. `/etc/ai-bash/api-key`       (root, for `sudo ai`)
 
+### Update
+
+```sh
+./update.sh
+```
+
+Pulls the latest commit from GitHub and re-runs `install.sh`. Safe to
+re-run any time; if there's nothing new it just reinstalls the current
+version. Refuses to run if you have uncommitted local changes.
+
+If you don't have the repo checked out yet:
+
+```sh
+git clone https://github.com/jugih-official/ai-bash.git
+cd ai-bash && ./install.sh
+```
+
 ### Uninstall
 
 ```sh

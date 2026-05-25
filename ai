@@ -83,6 +83,12 @@ Rules:
     files:         ls, find, stat, file, tree, cat, less, head, tail
     text:          grep, sed, awk, cut, sort, uniq, tr, jq, xargs
     archives:      tar, zip/unzip, gzip, xz, 7z
+    git:           git status/log/diff/show/blame, git add/commit/restore,
+                   git branch/switch/checkout, git merge/rebase, git stash,
+                   git remote -v, git fetch/pull/push, git tag,
+                   git ls-files, git grep, git rev-parse, git config.
+                   For GitHub operations prefer the `gh` CLI when present
+                   (gh repo, gh pr, gh issue, gh release).
 - Quote variables and filenames properly. Use `--` where it helps.
 - Never use truly destructive commands (`rm -rf /`, `mkfs` on a mounted
   root, fork bomb, etc.). For ordinary file deletion (`rm file.txt`)
