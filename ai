@@ -25,6 +25,7 @@ API_URL = "https://api.deepseek.com/chat/completions"
 MODEL = "deepseek-chat"
 MAX_TURNS = 8
 FETCH_OUTPUT_LIMIT = 8000  # chars of FETCH output sent back to the model
+STDIN_LIMIT = 50_000       # chars of piped stdin attached to the prompt
 
 # Where to look for the API key if $DEEPSEEK_API_KEY is unset. First
 # match wins. The user-scoped path is checked before the system one so
@@ -96,6 +97,12 @@ Rules:
 - If the request is ambiguous, pick the most reasonable interpretation;
   do not ask questions.
 - Conversational input ("hi", "how are you") → reply with SAY.
+- The user may pipe data into the tool. When they do, it is appended
+  to their message inside a <stdin>...</stdin> block (possibly
+  truncated with an […truncated…] marker). Treat that block as
+  primary context — e.g. for `cat err.log | ai why is this failing?`
+  read the log inside the block and answer with SAY. Do not re-fetch
+  data you already have.
 """
 
 
@@ -222,14 +229,32 @@ def parse_action(text: str):
 # ---- command execution -----------------------------------------------------
 
 def confirm(prompt: str) -> bool:
-    if not sys.stdin.isatty():
+    # Read confirmation from the controlling terminal directly, since
+    # sys.stdin may have been consumed by a pipe (stdin-as-context).
+    try:
+        tty = open("/dev/tty", "r+")
+    except OSError:
         return False
     try:
-        ans = input(prompt).strip().lower()
-    except (EOFError, KeyboardInterrupt):
+        tty.write(prompt)
+        tty.flush()
+        ans = tty.readline().strip().lower()
+    except (OSError, KeyboardInterrupt):
         print()
         return False
+    finally:
+        tty.close()
     return ans in ("y", "yes", "k", "kyllä")
+
+
+def read_piped_stdin() -> str | None:
+    if sys.stdin.isatty():
+        return None
+    try:
+        data = sys.stdin.read()
+    except (OSError, KeyboardInterrupt):
+        return None
+    return data if data.strip() else None
 
 
 def run_cmd_visible(cmd: str) -> int:
@@ -270,16 +295,22 @@ def usage():
         "usage: ai [-n] [-v] <natural language request>\n"
         "\n"
         "  -n    print the suggested command(s) only; do not run\n"
-        "  -v    verbose: also show FETCH steps and outputs\n"
+        "  -v    verbose: also show FETCH steps, outputs, and stdin info\n"
         "\n"
         "env:\n"
         "  DEEPSEEK_API_KEY   required\n"
+        "\n"
+        "stdin:\n"
+        "  If data is piped in, it is attached to your prompt as context.\n"
+        "  Example:  cat error.log | ai why is this failing?\n"
         "\n"
         "examples:\n"
         "  ai list all the files in cwd\n"
         "  ai show how much RAM is free\n"
         "  ai safely eject the USB stick mounted at /media/jukka/USB\n"
-        "  ai search the web for the latest python release and tell me the version\n",
+        "  ai search the web for the latest python release and tell me the version\n"
+        "  git diff | ai write a commit message for this\n"
+        "  journalctl -u nginx -n 200 | ai any errors here?\n",
         file=sys.stderr,
     )
     sys.exit(2)
@@ -315,9 +346,24 @@ def main(argv):
             "~/.config/ai-bash/api-key (or /etc/ai-bash/api-key)."
         )
 
+    piped = read_piped_stdin()
+    if piped is not None:
+        original_len = len(piped)
+        piped = truncate(piped, STDIN_LIMIT)
+        user_content = (
+            f"{prompt}\n\n<stdin>\n{piped}\n</stdin>"
+        )
+        if verbose:
+            note = f"[stdin] attached {original_len} chars"
+            if original_len > STDIN_LIMIT:
+                note += f" (truncated to {STDIN_LIMIT})"
+            print(dim(note), file=sys.stderr)
+    else:
+        user_content = prompt
+
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": prompt},
+        {"role": "user", "content": user_content},
     ]
 
     for turn in range(MAX_TURNS):

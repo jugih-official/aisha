@@ -103,6 +103,18 @@ ai what is the latest stable kernel version
 ai what's the weather forecast for Helsinki tomorrow
 ```
 
+Pipe in context — anything on stdin gets attached to your prompt:
+
+```sh
+cat error.log | ai why is this failing?
+git diff      | ai write a commit message for this
+journalctl -u nginx -n 200 | ai any errors here?
+curl -s https://example.com/api | ai what fields does this response have?
+```
+
+Stdin is capped at 50 KB; longer input is truncated head + tail with
+a `[…truncated N chars…]` marker.
+
 ## How it works
 
 The model speaks a small line-prefixed protocol:
