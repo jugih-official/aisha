@@ -26,6 +26,14 @@ MODEL = "deepseek-chat"
 MAX_TURNS = 8
 FETCH_OUTPUT_LIMIT = 8000  # chars of FETCH output sent back to the model
 
+# Where to look for the API key if $DEEPSEEK_API_KEY is unset. First
+# match wins. The user-scoped path is checked before the system one so
+# personal keys override a shared one.
+API_KEY_FILES = [
+    os.path.expanduser("~/.config/ai-bash/api-key"),
+    "/etc/ai-bash/api-key",
+]
+
 SYSTEM_PROMPT = r"""You are a senior GNU/Linux bash and sysadmin expert helping the user from their terminal. You can both *execute* shell commands on their machine and *answer* questions by gathering information (including from the web).
 
 You MUST respond with exactly one of these line-prefixed forms, and nothing else:
@@ -114,6 +122,20 @@ DESTRUCTIVE_RE = re.compile(
 
 def looks_destructive(cmd: str) -> bool:
     return bool(DESTRUCTIVE_RE.search(cmd))
+
+
+def read_key_file() -> str | None:
+    for path in API_KEY_FILES:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                key = f.read().strip()
+            if key:
+                return key
+        except FileNotFoundError:
+            continue
+        except PermissionError:
+            continue
+    return None
 
 
 # ---- io helpers ------------------------------------------------------------
@@ -280,9 +302,12 @@ def main(argv):
 
     prompt = " ".join(args)
 
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    api_key = os.environ.get("DEEPSEEK_API_KEY") or read_key_file()
     if not api_key:
-        die("DEEPSEEK_API_KEY is not set")
+        die(
+            "no API key found. Set $DEEPSEEK_API_KEY or write the key to "
+            "~/.config/ai-bash/api-key (or /etc/ai-bash/api-key)."
+        )
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},

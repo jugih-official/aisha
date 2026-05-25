@@ -24,24 +24,36 @@ The latest stable release of Python is 3.13.x (released Oct 2024).
 
 ## Install
 
-1. Get an API key from <https://platform.deepseek.com/> and export it:
+```sh
+./install.sh
+```
 
-   ```sh
-   export DEEPSEEK_API_KEY=sk-...
-   ```
+The installer:
 
-   (Add the line to `~/.bashrc` so it persists.)
+- copies `ai` to `/usr/local/bin/ai` (uses `sudo`),
+- if you don't already have a `DEEPSEEK_API_KEY` in your environment,
+  prompts for one and saves it to `~/.config/ai-bash/api-key` (mode `600`),
+- optionally also writes `/etc/ai-bash/api-key` so `sudo ai ...` works
+  without needing `sudo -E`.
 
-2. Drop `ai` onto your `PATH`:
+Requires Python 3.10+ (stdlib only — no `pip install`). Get a DeepSeek
+key at <https://platform.deepseek.com/> (starts with `sk-`).
 
-   ```sh
-   chmod +x ai
-   sudo install -m 0755 ai /usr/local/bin/ai
-   # or, no sudo:
-   mkdir -p ~/.local/bin && cp ai ~/.local/bin/ && chmod +x ~/.local/bin/ai
-   ```
+### Where the API key is read from
 
-Requires Python 3 (stdlib only — no `pip install`).
+The script checks, in order:
+
+1. `$DEEPSEEK_API_KEY`
+2. `~/.config/ai-bash/api-key` (your user)
+3. `/etc/ai-bash/api-key`       (root, for `sudo ai`)
+
+### Uninstall
+
+```sh
+./uninstall.sh
+```
+
+Removes `/usr/local/bin/ai` and offers to delete the saved key files.
 
 ## Usage
 
