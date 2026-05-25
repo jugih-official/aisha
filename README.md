@@ -60,8 +60,8 @@ version. Refuses to run if you have uncommitted local changes.
 If you don't have the repo checked out yet:
 
 ```sh
-git clone https://github.com/jugih-official/ai-bash.git
-cd ai-bash && ./install.sh
+git clone https://github.com/jugih-official/ai-prompt.git
+cd ai-prompt && ./install.sh
 ```
 
 ### Uninstall

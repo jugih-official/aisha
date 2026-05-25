@@ -12,7 +12,7 @@ dim()    { printf '\033[2m%s\033[0m\n' "$*"; }
 
 if [ ! -d .git ]; then
     red "error: $SCRIPT_DIR is not a git checkout."
-    echo "Clone the repo first:  git clone https://github.com/jugih-official/ai-bash.git"
+    echo "Clone the repo first:  git clone https://github.com/jugih-official/ai-prompt.git"
     exit 1
 fi
 
