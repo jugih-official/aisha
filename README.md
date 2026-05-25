@@ -1,4 +1,4 @@
-# ai
+# ai.
 
 A tiny CLI that turns natural-language requests into bash actions using the
 DeepSeek API. It can:
