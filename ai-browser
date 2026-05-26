@@ -114,7 +114,7 @@ def _build_context(browser):
     )
 
 
-def run_steps(steps: list[dict[str, Any]], headless: bool, timeout_ms: int, stealth: bool):
+def run_steps(steps: list[dict[str, Any]], headless: bool, timeout_ms: int, stealth: bool, wait_for_close: bool):
     extracted: dict[str, Any] = {}
 
     # Stealth().use_sync wraps the playwright manager so every page created
@@ -223,10 +223,33 @@ def run_steps(steps: list[dict[str, Any]], headless: bool, timeout_ms: int, stea
             "extracted": extracted,
         }
 
-        context.close()
-        browser.close()
+        # Emit the result *before* waiting on the user, so callers piping
+        # stdout don't block until the window is closed.
+        print(json.dumps(result, ensure_ascii=False), flush=True)
 
-    print(json.dumps(result, ensure_ascii=False))
+        if wait_for_close and not headless:
+            print(
+                "ai-browser: steps complete. Close the browser window to exit "
+                "(or press Ctrl-C).",
+                file=sys.stderr,
+            )
+            try:
+                # timeout=0 means wait indefinitely. Fires when the user closes
+                # the last window or quits Chromium.
+                browser.wait_for_event("disconnected", timeout=0)
+            except KeyboardInterrupt:
+                pass
+            except Exception:
+                # Browser may already be gone — that's the expected exit.
+                pass
+
+        # close() on an already-disconnected browser is a no-op / raises;
+        # swallow either way so we always exit cleanly.
+        for closer in (context.close, browser.close):
+            try:
+                closer()
+            except Exception:
+                pass
 
 
 def main(argv: list[str]) -> int:
@@ -256,6 +279,12 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="Disable playwright-stealth anti-detection patches",
     )
+    parser.add_argument(
+        "--no-wait",
+        action="store_true",
+        help="Exit immediately after steps; do not wait for the user to "
+             "close the browser (headed mode only).",
+    )
     args = parser.parse_args(argv[1:])
 
     steps = load_steps(args)
@@ -274,6 +303,7 @@ def main(argv: list[str]) -> int:
             headless=args.headless,
             timeout_ms=args.timeout,
             stealth=not args.no_stealth,
+            wait_for_close=not args.no_wait,
         )
     except PlaywrightTimeoutError:
         die("timed out waiting for page action")

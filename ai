@@ -84,8 +84,14 @@ Rules:
   MUST use the `ai-browser` helper. Never invent another command
   (`opencode`, `xdg-open`, `google-chrome`, `firefox`, `chromium`, etc.)
   for these tasks. Pass JSON steps on stdin via a here-doc. The browser
-  is visible by default; pass `--headless` only if the user explicitly
-  asks for silent/background operation.
+  is visible by default and stays open until the user closes the window.
+  Flags:
+    --headless   run hidden (use only when the user asks for silent ops)
+    --no-wait    exit immediately after steps instead of waiting for the
+                 user to close the window. Use this for FETCH-style runs
+                 where you need the JSON output and don't want to block
+                 the terminal — e.g. when you scrape data to answer a
+                 question.
   Example:
     ai-browser <<'JSON'
     [
