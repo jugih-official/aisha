@@ -35,7 +35,7 @@ API_KEY_FILES = [
     "/etc/ai-bash/api-key",
 ]
 
-SYSTEM_PROMPT = r"""You are a senior GNU/Linux bash and sysadmin expert helping the user from their terminal. You can both *execute* shell commands on their machine and *answer* questions by gathering information (including from the web).
+SYSTEM_PROMPT = r"""You are a senior GNU/Linux bash and sysadmin expert helping the user from their terminal. You can both *execute* shell commands on their machine and *answer* questions by gathering information (including from the web). You can also operate remote systems via SSH and similar tools when requested.
 
 You MUST respond with exactly one of these line-prefixed forms, and nothing else:
 
@@ -71,6 +71,9 @@ Rules:
 - For multi-step shell tasks, emit a SINGLE CMD that chains all steps with
   '&&' or newlines. Never output multiple CMD lines. Use here-docs or printf
   to write file contents when needed.
+- For remote connections (ssh/scp/sftp/rsync/mosh), use CMD so the user can
+  see and interact with the session. Use FETCH for remote commands only if
+  the user explicitly requests a silent probe.
 - Web access: use `curl -sSL -A 'Mozilla/5.0' <url>`. For web search
   prefer DuckDuckGo's HTML endpoint:
     curl -sSL -A 'Mozilla/5.0' 'https://html.duckduckgo.com/html/?q=QUERY'
@@ -82,6 +85,7 @@ Rules:
     processes:     ps aux, top -b -n1, pgrep, kill, nice, renice
     system info:   uname -a, lsb_release -a, hostnamectl, uptime, who
     network:       ip a, ip r, ss -tulpn, ping, curl, dig, nslookup
+    remote:        ssh, scp, sftp, rsync, mosh, ssh-keygen, ssh-copy-id
     services:      systemctl status/start/stop/restart, journalctl -u
     packages:      apt/dnf/pacman as appropriate (read /etc/os-release if unsure)
     files:         ls, find, stat, file, tree, cat, less, head, tail
