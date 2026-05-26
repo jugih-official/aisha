@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""ai-browser — small Playwright-based browser automation helper.
+
+Reads a JSON array of steps from stdin (or --steps/--file) and executes
+them in a Chromium browser. Prints a JSON summary to stdout.
+"""
+
+import argparse
+import json
+import sys
+from typing import Any
+
+try:
+    from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+except ImportError:
+    print(
+        "ai-browser: playwright is not installed. Run:\n"
+        "  python3 -m pip install --user playwright\n"
+        "  python3 -m playwright install chromium",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"ai-browser: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_steps(args: argparse.Namespace) -> list[dict[str, Any]]:
+    if args.steps:
+        raw = args.steps
+    elif args.file:
+        if args.file == "-":
+            raw = sys.stdin.read()
+        else:
+            try:
+                with open(args.file, "r", encoding="utf-8") as f:
+                    raw = f.read()
+            except OSError as e:
+                die(f"cannot read steps file: {e}")
+    else:
+        raw = sys.stdin.read()
+
+    if not raw.strip():
+        die("no steps provided (use --steps, --file, or stdin)")
+
+    try:
+        steps = json.loads(raw)
+    except json.JSONDecodeError as e:
+        die(f"invalid JSON steps: {e}")
+
+    if not isinstance(steps, list):
+        die("steps must be a JSON array")
+
+    for step in steps:
+        if not isinstance(step, dict):
+            die("each step must be an object")
+
+    return steps
+
+
+def locator_from_spec(page, spec: Any):
+    if isinstance(spec, str):
+        locator = page.locator(spec)
+    elif isinstance(spec, dict):
+        if "selector" in spec:
+            locator = page.locator(spec["selector"])
+        elif "text" in spec:
+            locator = page.get_by_text(spec["text"], exact=bool(spec.get("exact")))
+        elif "role" in spec:
+            locator = page.get_by_role(spec["role"], name=spec.get("name"))
+        else:
+            die("locator spec must include selector, text, or role")
+        if "index" in spec:
+            locator = locator.nth(int(spec["index"]))
+    else:
+        die("invalid locator spec")
+    return locator
+
+
+def run_steps(steps: list[dict[str, Any]], headless: bool, timeout_ms: int):
+    extracted: dict[str, Any] = {}
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless)
+        context = browser.new_context()
+        page = context.new_page()
+
+        for step in steps:
+            action_keys = [key for key in step if key in {
+                "goto",
+                "click",
+                "fill",
+                "press",
+                "wait_for",
+                "sleep",
+                "screenshot",
+                "extract_text",
+                "extract_all_text",
+                "extract_attribute",
+            }]
+            if len(action_keys) != 1:
+                die("each step must contain exactly one action key")
+            action = action_keys[0]
+            value = step[action]
+
+            if action == "goto":
+                wait_until = step.get("wait_until", "domcontentloaded")
+                page.goto(value, wait_until=wait_until, timeout=timeout_ms)
+                continue
+            if action == "click":
+                locator_from_spec(page, value).click(timeout=timeout_ms)
+                continue
+            if action == "fill":
+                if not isinstance(value, dict) or "value" not in value:
+                    die("fill requires {selector|text|role, value}")
+                locator_from_spec(page, value).fill(value["value"], timeout=timeout_ms)
+                continue
+            if action == "press":
+                page.keyboard.press(value)
+                continue
+            if action == "wait_for":
+                if isinstance(value, str) and value in {"load", "domcontentloaded", "networkidle"}:
+                    page.wait_for_load_state(value, timeout=timeout_ms)
+                else:
+                    locator_from_spec(page, value).wait_for(timeout=timeout_ms)
+                continue
+            if action == "sleep":
+                page.wait_for_timeout(int(float(value) * 1000))
+                continue
+            if action == "screenshot":
+                if isinstance(value, str):
+                    page.screenshot(path=value, full_page=True)
+                elif isinstance(value, dict) and "path" in value:
+                    page.screenshot(
+                        path=value["path"],
+                        full_page=bool(value.get("full_page", True)),
+                    )
+                else:
+                    die("screenshot requires a path")
+                continue
+            if action == "extract_text":
+                name = "extract_text"
+                if isinstance(value, dict) and "name" in value:
+                    name = value["name"]
+                locator = locator_from_spec(page, value)
+                extracted[name] = locator.first.inner_text()
+                continue
+            if action == "extract_all_text":
+                name = "extract_all_text"
+                if isinstance(value, dict) and "name" in value:
+                    name = value["name"]
+                locator = locator_from_spec(page, value)
+                extracted[name] = locator.all_inner_texts()
+                continue
+            if action == "extract_attribute":
+                if not isinstance(value, dict) or "attribute" not in value:
+                    die("extract_attribute requires {selector|text|role, attribute, name?}")
+                name = value.get("name", value["attribute"])
+                locator = locator_from_spec(page, value)
+                extracted[name] = locator.first.get_attribute(value["attribute"])
+                continue
+
+            die(f"unknown step: {list(step.keys())}")
+
+        result = {
+            "url": page.url,
+            "title": page.title(),
+            "extracted": extracted,
+        }
+
+        context.close()
+        browser.close()
+
+    print(json.dumps(result, ensure_ascii=False))
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description="Run browser automation steps from JSON input."
+    )
+    parser.add_argument("--steps", help="JSON steps string")
+    parser.add_argument("--file", help="Path to JSON steps file ('-' for stdin)")
+    parser.add_argument(
+        "--headed",
+        action="store_true",
+        help="Show the browser (default is headless)",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=30000,
+        help="Timeout per step in milliseconds (default: 30000)",
+    )
+    args = parser.parse_args(argv[1:])
+
+    steps = load_steps(args)
+
+    try:
+        run_steps(steps, headless=not args.headed, timeout_ms=args.timeout)
+    except PlaywrightTimeoutError:
+        die("timed out waiting for page action")
+    except KeyboardInterrupt:
+        die("interrupted", code=130)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
