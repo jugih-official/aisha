@@ -28,6 +28,25 @@ except ImportError:
     )
     sys.exit(1)
 
+# Optional stealth shim — masks automation fingerprints (navigator.webdriver,
+# missing plugins, Chrome runtime, WebGL vendor, etc.) so SERPs are less likely
+# to CAPTCHA-wall us. Falls back gracefully if the package isn't installed.
+try:
+    from playwright_stealth import Stealth  # type: ignore
+    _HAS_STEALTH = True
+except ImportError:
+    Stealth = None  # type: ignore
+    _HAS_STEALTH = False
+
+# A plausible, current desktop-Linux Chrome UA. Override with AI_BROWSER_UA.
+DEFAULT_UA = os.environ.get(
+    "AI_BROWSER_UA",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+)
+DEFAULT_LOCALE = os.environ.get("AI_BROWSER_LOCALE", "en-US")
+DEFAULT_TIMEZONE = os.environ.get("AI_BROWSER_TZ", "Europe/Helsinki")
+
 
 def die(msg: str, code: int = 1) -> None:
     print(f"ai-browser: {msg}", file=sys.stderr)
@@ -86,12 +105,39 @@ def locator_from_spec(page, spec: Any):
     return locator
 
 
-def run_steps(steps: list[dict[str, Any]], headless: bool, timeout_ms: int):
+def _build_context(browser):
+    return browser.new_context(
+        user_agent=DEFAULT_UA,
+        locale=DEFAULT_LOCALE,
+        timezone_id=DEFAULT_TIMEZONE,
+        viewport={"width": 1280, "height": 800},
+    )
+
+
+def run_steps(steps: list[dict[str, Any]], headless: bool, timeout_ms: int, stealth: bool):
     extracted: dict[str, Any] = {}
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless)
-        context = browser.new_context()
+    # Stealth().use_sync wraps the playwright manager so every page created
+    # under it has anti-detection patches applied automatically.
+    if stealth and _HAS_STEALTH:
+        pw_ctx = Stealth().use_sync(sync_playwright())
+    else:
+        pw_ctx = sync_playwright()
+
+    with pw_ctx as p:
+        # Chromium flags that reduce automation tells. --disable-blink-features
+        # hides navigator.webdriver; the others quiet noisy automation banners
+        # and the "Chrome is being controlled by automated test software" bar.
+        browser = p.chromium.launch(
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--no-default-browser-check",
+                "--no-first-run",
+            ],
+        )
+        context = _build_context(browser)
         page = context.new_page()
 
         for step in steps:
@@ -190,9 +236,14 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--steps", help="JSON steps string")
     parser.add_argument("--file", help="Path to JSON steps file ('-' for stdin)")
     parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Hide the browser window (default is headed)",
+    )
+    parser.add_argument(
         "--headed",
         action="store_true",
-        help="Show the browser (default is headless)",
+        help="Show the browser window (default; kept for backward compat)",
     )
     parser.add_argument(
         "--timeout",
@@ -200,12 +251,30 @@ def main(argv: list[str]) -> int:
         default=30000,
         help="Timeout per step in milliseconds (default: 30000)",
     )
+    parser.add_argument(
+        "--no-stealth",
+        action="store_true",
+        help="Disable playwright-stealth anti-detection patches",
+    )
     args = parser.parse_args(argv[1:])
 
     steps = load_steps(args)
 
+    if not args.no_stealth and not _HAS_STEALTH:
+        print(
+            "ai-browser: warning: playwright-stealth is not installed; "
+            "sites with bot detection (Google, DDG, Cloudflare) may CAPTCHA-wall.\n"
+            "Install with:  sudo /opt/ai-bash/venv/bin/pip install playwright-stealth",
+            file=sys.stderr,
+        )
+
     try:
-        run_steps(steps, headless=not args.headed, timeout_ms=args.timeout)
+        run_steps(
+            steps,
+            headless=args.headless,
+            timeout_ms=args.timeout,
+            stealth=not args.no_stealth,
+        )
     except PlaywrightTimeoutError:
         die("timed out waiting for page action")
     except KeyboardInterrupt:

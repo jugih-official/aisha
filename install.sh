@@ -115,9 +115,9 @@ case "${yn,,}" in
                 if ! sudo "$BROWSER_VENV/bin/pip" install --upgrade pip >/dev/null; then
                     yellow "  failed to upgrade pip inside venv (continuing)"
                 fi
-                if ! sudo "$BROWSER_VENV/bin/pip" install --upgrade playwright; then
+                if ! sudo "$BROWSER_VENV/bin/pip" install --upgrade playwright playwright-stealth; then
                     install_ok=0
-                    yellow "  pip failed to install playwright"
+                    yellow "  pip failed to install playwright / playwright-stealth"
                 fi
             fi
 
