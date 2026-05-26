@@ -7,6 +7,7 @@ DeepSeek API. It can:
 - gather information from the web before answering,
 - handle everyday sysadmin tasks — RAM, disks, USB sticks, processes,
   services, networking — by picking the right tool for you.
+- operate SSH and other remote connections (ssh/scp/sftp/rsync).
 
 ```
 $ ai list all the files in cwd
@@ -93,6 +94,8 @@ ai how much free RAM do I have
 ai safely eject the USB stick mounted at /media/jukka/USB
 ai which processes are using the most memory
 ai restart the bluetooth service
+ai ssh to user@server and show uptime
+ai copy /var/log/syslog from user@server to ./ with scp
 ```
 
 Chained tasks in one request (single CMD with multiple steps):
