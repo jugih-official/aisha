@@ -9,6 +9,8 @@ import argparse
 import json
 import os
 import sys
+import urllib.error
+import urllib.request
 from typing import Any
 
 # Rewritten by install.sh to point at the directory where Playwright's
@@ -47,10 +49,98 @@ DEFAULT_UA = os.environ.get(
 DEFAULT_LOCALE = os.environ.get("AI_BROWSER_LOCALE", "en-US")
 DEFAULT_TIMEZONE = os.environ.get("AI_BROWSER_TZ", "Europe/Helsinki")
 
+# DeepSeek wiring for interactive (--interactive) steering — translates the
+# user's natural-language instructions into more JSON steps that run on the
+# already-open page. Mirrors the key-file lookup used by `ai`.
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_MODEL = "deepseek-v4-flash"
+API_KEY_FILES = [
+    os.path.expanduser("~/.config/ai-bash/api-key"),
+    "/etc/ai-bash/api-key",
+]
+
+INTERACTIVE_SYSTEM_PROMPT = """You translate a user's natural-language instructions into JSON browser-automation steps that run on an already-open Chromium page.
+
+Respond with EXACTLY one of:
+  STEPS: <JSON array of steps>
+  SAY: <one-line natural-language reply>
+  QUIT
+
+Step shapes (each step is an object with exactly one action key):
+  {"goto": "<url>", "wait_until": "domcontentloaded"|"load"|"networkidle"}
+  {"click": "<css>"  |  {"selector"|"text"|"role": "...", "index": N?, "exact": bool?, "name": "..."}}
+  {"fill":  {"selector"|"text"|"role": "...", "value": "..."}}
+  {"press": "<key>"}                                # e.g. "Enter"
+  {"wait_for": "load"|"domcontentloaded"|"networkidle" | <locator spec>}
+  {"sleep": <seconds>}
+  {"screenshot": "<path>" | {"path": "...", "full_page": bool}}
+  {"extract_text":      <locator spec> | {..., "name": "<key>"}}
+  {"extract_all_text":  <locator spec> | {..., "name": "<key>"}}
+  {"extract_attribute": {"selector"|"text"|"role": "...", "attribute": "...", "name": "<key>"?}}
+
+Rules:
+- Output ONLY the prefix line. No markdown fences, no commentary.
+- The browser is already on a page; reuse it. Never relaunch.
+- Keep STEPS short and focused on the user's latest instruction.
+- Use SAY when the user is asking a question you can answer from context
+  already known (current URL/title, previous extractions).
+- Use QUIT when the user clearly wants to end (e.g. "exit", "done", "thanks").
+"""
+
+
+class StepError(Exception):
+    """Raised when a step is malformed. Caller decides whether to die or recover."""
+
 
 def die(msg: str, code: int = 1) -> None:
     print(f"ai-browser: {msg}", file=sys.stderr)
     sys.exit(code)
+
+
+def _read_api_key() -> str | None:
+    key = os.environ.get("DEEPSEEK_API_KEY")
+    if key:
+        return key
+    for path in API_KEY_FILES:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                k = f.read().strip()
+            if k:
+                return k
+        except OSError:
+            continue
+    return None
+
+
+def _call_deepseek(messages: list[dict[str, str]], api_key: str) -> str:
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": messages,
+        "temperature": 0.2,
+        "stream": False,
+    }
+    req = urllib.request.Request(
+        DEEPSEEK_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return data["choices"][0]["message"]["content"].strip()
+
+
+def _strip_fences(text: str) -> str:
+    t = text.strip()
+    if t.startswith("```"):
+        lines = t.splitlines()[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        t = "\n".join(lines).strip()
+    return t
 
 
 def load_steps(args: argparse.Namespace) -> list[dict[str, Any]]:
@@ -97,11 +187,11 @@ def locator_from_spec(page, spec: Any):
         elif "role" in spec:
             locator = page.get_by_role(spec["role"], name=spec.get("name"))
         else:
-            die("locator spec must include selector, text, or role")
+            raise StepError("locator spec must include selector, text, or role")
         if "index" in spec:
             locator = locator.nth(int(spec["index"]))
     else:
-        die("invalid locator spec")
+        raise StepError("invalid locator spec")
     return locator
 
 
@@ -114,7 +204,221 @@ def _build_context(browser):
     )
 
 
-def run_steps(steps: list[dict[str, Any]], headless: bool, timeout_ms: int, stealth: bool, wait_for_close: bool):
+_ACTION_KEYS = {
+    "goto",
+    "click",
+    "fill",
+    "press",
+    "wait_for",
+    "sleep",
+    "screenshot",
+    "extract_text",
+    "extract_all_text",
+    "extract_attribute",
+}
+
+
+def _execute_steps(page, steps: list[dict[str, Any]], timeout_ms: int, extracted: dict[str, Any]) -> None:
+    for step in steps:
+        action_keys = [key for key in step if key in _ACTION_KEYS]
+        if len(action_keys) != 1:
+            raise StepError("each step must contain exactly one action key")
+        action = action_keys[0]
+        value = step[action]
+
+        if action == "goto":
+            wait_until = step.get("wait_until", "domcontentloaded")
+            page.goto(value, wait_until=wait_until, timeout=timeout_ms)
+            continue
+        if action == "click":
+            locator_from_spec(page, value).click(timeout=timeout_ms)
+            continue
+        if action == "fill":
+            if not isinstance(value, dict) or "value" not in value:
+                raise StepError("fill requires {selector|text|role, value}")
+            locator_from_spec(page, value).fill(value["value"], timeout=timeout_ms)
+            continue
+        if action == "press":
+            page.keyboard.press(value)
+            continue
+        if action == "wait_for":
+            if isinstance(value, str) and value in {"load", "domcontentloaded", "networkidle"}:
+                page.wait_for_load_state(value, timeout=timeout_ms)
+            else:
+                locator_from_spec(page, value).wait_for(timeout=timeout_ms)
+            continue
+        if action == "sleep":
+            page.wait_for_timeout(int(float(value) * 1000))
+            continue
+        if action == "screenshot":
+            if isinstance(value, str):
+                page.screenshot(path=value, full_page=True)
+            elif isinstance(value, dict) and "path" in value:
+                page.screenshot(
+                    path=value["path"],
+                    full_page=bool(value.get("full_page", True)),
+                )
+            else:
+                raise StepError("screenshot requires a path")
+            continue
+        if action == "extract_text":
+            name = "extract_text"
+            if isinstance(value, dict) and "name" in value:
+                name = value["name"]
+            locator = locator_from_spec(page, value)
+            extracted[name] = locator.first.inner_text()
+            continue
+        if action == "extract_all_text":
+            name = "extract_all_text"
+            if isinstance(value, dict) and "name" in value:
+                name = value["name"]
+            locator = locator_from_spec(page, value)
+            extracted[name] = locator.all_inner_texts()
+            continue
+        if action == "extract_attribute":
+            if not isinstance(value, dict) or "attribute" not in value:
+                raise StepError("extract_attribute requires {selector|text|role, attribute, name?}")
+            name = value.get("name", value["attribute"])
+            locator = locator_from_spec(page, value)
+            extracted[name] = locator.first.get_attribute(value["attribute"])
+            continue
+
+        raise StepError(f"unknown step: {list(step.keys())}")
+
+
+def _interactive_loop(page, browser, api_key: str, timeout_ms: int) -> None:
+    """REPL that turns user instructions into more steps on the same page.
+
+    Reads from /dev/tty (stdin may have been consumed by the initial steps
+    here-doc). Exits on EOF, "exit"/"quit", QUIT from the model, or when
+    the browser disconnects.
+    """
+    try:
+        tty = open("/dev/tty", "r+")
+    except OSError:
+        print(
+            "ai-browser: no /dev/tty available; skipping interactive control",
+            file=sys.stderr,
+        )
+        return
+
+    print(
+        "\nai-browser: interactive mode. Tell me what to do next, or type "
+        "'exit' / Ctrl-D to quit (closing the window also exits).",
+        file=sys.stderr,
+    )
+
+    history: list[dict[str, str]] = [
+        {"role": "system", "content": INTERACTIVE_SYSTEM_PROMPT}
+    ]
+
+    try:
+        while True:
+            # Bail if the user closed the window between turns.
+            try:
+                _ = page.url
+            except Exception:
+                break
+
+            try:
+                tty.write("\nbrowser> ")
+                tty.flush()
+                line = tty.readline()
+            except KeyboardInterrupt:
+                tty.write("\n")
+                break
+
+            if not line:  # EOF
+                tty.write("\n")
+                break
+            instruction = line.strip()
+            if not instruction:
+                continue
+            if instruction.lower() in ("exit", "quit", ":q"):
+                break
+
+            try:
+                ctx = f"Current URL: {page.url}\nCurrent title: {page.title()}\n"
+            except Exception:
+                break
+
+            history.append({
+                "role": "user",
+                "content": f"{ctx}User instruction: {instruction}",
+            })
+            # Keep the trailing-turn window small so the request stays cheap.
+            if len(history) > 13:  # system + 12 turns
+                history = [history[0]] + history[-12:]
+
+            try:
+                reply = _call_deepseek(history, api_key)
+            except urllib.error.HTTPError as e:
+                body = e.read().decode("utf-8", errors="replace")
+                tty.write(f"ai-browser: deepseek HTTP {e.code}: {body}\n")
+                history.pop()
+                continue
+            except urllib.error.URLError as e:
+                tty.write(f"ai-browser: network error: {e.reason}\n")
+                history.pop()
+                continue
+            history.append({"role": "assistant", "content": reply})
+
+            reply = _strip_fences(reply)
+            if reply.startswith("QUIT"):
+                break
+            if reply.startswith("SAY:"):
+                tty.write(reply[4:].strip() + "\n")
+                continue
+
+            steps_json = reply[len("STEPS:"):].strip() if reply.startswith("STEPS:") else reply
+            try:
+                steps = json.loads(steps_json)
+                if not isinstance(steps, list):
+                    raise ValueError("expected a JSON array of steps")
+            except Exception as e:
+                tty.write(f"ai-browser: couldn't parse model reply as steps ({e})\n  {reply}\n")
+                continue
+
+            new_extracted: dict[str, Any] = {}
+            try:
+                _execute_steps(page, steps, timeout_ms, new_extracted)
+            except PlaywrightTimeoutError:
+                tty.write("ai-browser: step timed out\n")
+                continue
+            except StepError as e:
+                tty.write(f"ai-browser: {e}\n")
+                continue
+            except Exception as e:
+                tty.write(f"ai-browser: step error: {e}\n")
+                # If the browser is gone, exit; otherwise keep looping.
+                try:
+                    _ = page.url
+                except Exception:
+                    break
+                continue
+
+            try:
+                summary: dict[str, Any] = {"url": page.url, "title": page.title()}
+            except Exception:
+                break
+            if new_extracted:
+                summary["extracted"] = new_extracted
+            tty.write(json.dumps(summary, ensure_ascii=False) + "\n")
+    finally:
+        try:
+            tty.close()
+        except Exception:
+            pass
+
+
+def run_steps(
+    steps: list[dict[str, Any]],
+    headless: bool,
+    timeout_ms: int,
+    stealth: bool,
+    wait_for_close: bool,
+    interactive: bool,
+):
     extracted: dict[str, Any] = {}
 
     # Stealth().use_sync wraps the playwright manager so every page created
@@ -140,82 +444,10 @@ def run_steps(steps: list[dict[str, Any]], headless: bool, timeout_ms: int, stea
         context = _build_context(browser)
         page = context.new_page()
 
-        for step in steps:
-            action_keys = [key for key in step if key in {
-                "goto",
-                "click",
-                "fill",
-                "press",
-                "wait_for",
-                "sleep",
-                "screenshot",
-                "extract_text",
-                "extract_all_text",
-                "extract_attribute",
-            }]
-            if len(action_keys) != 1:
-                die("each step must contain exactly one action key")
-            action = action_keys[0]
-            value = step[action]
-
-            if action == "goto":
-                wait_until = step.get("wait_until", "domcontentloaded")
-                page.goto(value, wait_until=wait_until, timeout=timeout_ms)
-                continue
-            if action == "click":
-                locator_from_spec(page, value).click(timeout=timeout_ms)
-                continue
-            if action == "fill":
-                if not isinstance(value, dict) or "value" not in value:
-                    die("fill requires {selector|text|role, value}")
-                locator_from_spec(page, value).fill(value["value"], timeout=timeout_ms)
-                continue
-            if action == "press":
-                page.keyboard.press(value)
-                continue
-            if action == "wait_for":
-                if isinstance(value, str) and value in {"load", "domcontentloaded", "networkidle"}:
-                    page.wait_for_load_state(value, timeout=timeout_ms)
-                else:
-                    locator_from_spec(page, value).wait_for(timeout=timeout_ms)
-                continue
-            if action == "sleep":
-                page.wait_for_timeout(int(float(value) * 1000))
-                continue
-            if action == "screenshot":
-                if isinstance(value, str):
-                    page.screenshot(path=value, full_page=True)
-                elif isinstance(value, dict) and "path" in value:
-                    page.screenshot(
-                        path=value["path"],
-                        full_page=bool(value.get("full_page", True)),
-                    )
-                else:
-                    die("screenshot requires a path")
-                continue
-            if action == "extract_text":
-                name = "extract_text"
-                if isinstance(value, dict) and "name" in value:
-                    name = value["name"]
-                locator = locator_from_spec(page, value)
-                extracted[name] = locator.first.inner_text()
-                continue
-            if action == "extract_all_text":
-                name = "extract_all_text"
-                if isinstance(value, dict) and "name" in value:
-                    name = value["name"]
-                locator = locator_from_spec(page, value)
-                extracted[name] = locator.all_inner_texts()
-                continue
-            if action == "extract_attribute":
-                if not isinstance(value, dict) or "attribute" not in value:
-                    die("extract_attribute requires {selector|text|role, attribute, name?}")
-                name = value.get("name", value["attribute"])
-                locator = locator_from_spec(page, value)
-                extracted[name] = locator.first.get_attribute(value["attribute"])
-                continue
-
-            die(f"unknown step: {list(step.keys())}")
+        try:
+            _execute_steps(page, steps, timeout_ms, extracted)
+        except StepError as e:
+            die(str(e))
 
         result = {
             "url": page.url,
@@ -227,9 +459,20 @@ def run_steps(steps: list[dict[str, Any]], headless: bool, timeout_ms: int, stea
         # stdout don't block until the window is closed.
         print(json.dumps(result, ensure_ascii=False), flush=True)
 
+        if interactive and not headless:
+            api_key = _read_api_key()
+            if not api_key:
+                print(
+                    "ai-browser: interactive mode needs $DEEPSEEK_API_KEY or "
+                    "~/.config/ai-bash/api-key — skipping steering REPL.",
+                    file=sys.stderr,
+                )
+            else:
+                _interactive_loop(page, browser, api_key, timeout_ms)
+
         if wait_for_close and not headless:
             print(
-                "ai-browser: steps complete. Close the browser window to exit "
+                "ai-browser: close the browser window to exit "
                 "(or press Ctrl-C).",
                 file=sys.stderr,
             )
@@ -285,6 +528,13 @@ def main(argv: list[str]) -> int:
         help="Exit immediately after steps; do not wait for the user to "
              "close the browser (headed mode only).",
     )
+    parser.add_argument(
+        "--no-interactive",
+        action="store_true",
+        help="Disable the natural-language steering REPL that, by default, "
+             "runs after the scripted steps in headed mode. Implied by "
+             "--headless and --no-wait.",
+    )
     args = parser.parse_args(argv[1:])
 
     steps = load_steps(args)
@@ -297,6 +547,10 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
 
+    # Steering REPL defaults on in headed runs; off for scripted scrapes
+    # (--no-wait) and headless (no point — no window to steer alongside).
+    interactive = not (args.no_interactive or args.headless or args.no_wait)
+
     try:
         run_steps(
             steps,
@@ -304,6 +558,7 @@ def main(argv: list[str]) -> int:
             timeout_ms=args.timeout,
             stealth=not args.no_stealth,
             wait_for_close=not args.no_wait,
+            interactive=interactive,
         )
     except PlaywrightTimeoutError:
         die("timed out waiting for page action")

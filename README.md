@@ -140,8 +140,18 @@ sudo sed -i 's|^AI_BROWSER_PW_DIR =.*|AI_BROWSER_PW_DIR = "/opt/ai-bash/browsers
 ```
 
 You can use the helper directly. The browser is **visible by default**
-and stays open after the steps finish — close the window (or press
-Ctrl-C) to end the session.
+and, once the scripted steps finish, drops you into a small natural-
+language prompt where you can keep steering the same session:
+
+```
+browser> click the second result
+browser> fill the search box with "lily of the valley" and press enter
+browser> exit
+```
+
+Each instruction is translated to more JSON steps by DeepSeek and run on
+the already-open page. Type `exit` / `quit` (or Ctrl-D, or close the
+window) to end the session.
 
 ```sh
 ai-browser <<'JSON'
@@ -155,12 +165,19 @@ JSON
 
 Flags:
 
-- `--headless` — hide the browser window (good for scripted scrapes).
+- `--headless` — hide the browser window (good for scripted scrapes;
+  disables the steering REPL).
 - `--no-wait` — exit immediately after the last step instead of waiting
   for the user to close the window. Use this for FETCH-style runs where
-  you only care about the JSON output.
+  you only care about the JSON output. Disables the REPL.
+- `--no-interactive` — keep the window open but skip the natural-language
+  steering prompt.
 - `--no-stealth` — disable the anti-detection patches.
 - `--timeout MS` — per-step timeout (default 30 000 ms).
+
+The steering REPL needs the same `DEEPSEEK_API_KEY` as `ai` (or a key
+file under `~/.config/ai-bash/api-key` or `/etc/ai-bash/api-key`). With
+no key it just keeps the window open without the prompt.
 
 Environment overrides: `AI_BROWSER_UA`, `AI_BROWSER_LOCALE`,
 `AI_BROWSER_TZ`.

@@ -85,13 +85,23 @@ Rules:
   (`opencode`, `xdg-open`, `google-chrome`, `firefox`, `chromium`, etc.)
   for these tasks. Pass JSON steps on stdin via a here-doc. The browser
   is visible by default and stays open until the user closes the window.
+  In headed runs, after your scripted steps finish, ai-browser drops the
+  user into a natural-language steering prompt so they can continue to
+  drive the same session ("now click the second link", "fill the email
+  with foo@bar"). You do NOT need to add a flag for this — it's the
+  default. Just emit the minimal scripted steps to get the user where
+  they want to be, and let the REPL handle whatever they do next.
   Flags:
-    --headless   run hidden (use only when the user asks for silent ops)
-    --no-wait    exit immediately after steps instead of waiting for the
-                 user to close the window. Use this for FETCH-style runs
-                 where you need the JSON output and don't want to block
-                 the terminal — e.g. when you scrape data to answer a
-                 question.
+    --headless        run hidden (use only when the user asks for silent
+                      ops). Disables the steering REPL.
+    --no-wait         exit immediately after steps instead of waiting for
+                      the user to close the window. Use this for
+                      FETCH-style runs where you need the JSON output and
+                      don't want to block the terminal — e.g. when you
+                      scrape data to answer a question. Disables the REPL.
+    --no-interactive  keep the window open after steps but skip the
+                      natural-language REPL. Use only if the user asked
+                      for "no follow-up prompts" or similar.
   Example:
     ai-browser <<'JSON'
     [
