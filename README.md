@@ -117,18 +117,20 @@ ai what's the weather forecast for Helsinki tomorrow
 
 ### Browser control (optional)
 
-For browser automation, the tool uses Playwright. The installer offers to
-install Playwright and Chromium for you. It places them in a dedicated
-venv at `/opt/ai-bash/venv` (with Chromium under `/opt/ai-bash/browsers`)
-so it doesn't fight PEP 668 on modern Debian/Ubuntu/Fedora. On
-Debian/Ubuntu you may need `sudo apt install python3-venv python3-full`
-first.
+For browser automation, the tool uses Playwright plus
+[`playwright-stealth`](https://pypi.org/project/playwright-stealth/) to
+reduce the chance of being CAPTCHA-walled by sites like DuckDuckGo or
+Cloudflare. The installer offers to set this up for you. It places
+everything in a dedicated venv at `/opt/ai-bash/venv` (with Chromium
+under `/opt/ai-bash/browsers`) so it doesn't fight PEP 668 on modern
+Debian/Ubuntu/Fedora. On Debian/Ubuntu you may need
+`sudo apt install python3-venv python3-full` first.
 
 To install manually:
 
 ```sh
 sudo python3 -m venv /opt/ai-bash/venv
-sudo /opt/ai-bash/venv/bin/pip install --upgrade playwright
+sudo /opt/ai-bash/venv/bin/pip install --upgrade playwright playwright-stealth
 sudo PLAYWRIGHT_BROWSERS_PATH=/opt/ai-bash/browsers \
     /opt/ai-bash/venv/bin/playwright install --with-deps chromium
 sudo chmod -R a+rX /opt/ai-bash/browsers
@@ -137,24 +139,36 @@ sudo sed -i 's|^AI_BROWSER_PW_DIR =.*|AI_BROWSER_PW_DIR = "/opt/ai-bash/browsers
     /usr/local/bin/ai-browser
 ```
 
-You can use the helper directly:
+You can use the helper directly. The browser is **visible by default**
+and stays open after the steps finish — close the window (or press
+Ctrl-C) to end the session.
 
 ```sh
-ai-browser --headless <<'JSON'
+ai-browser <<'JSON'
 [
-  {"goto": "https://www.google.com"},
-  {"fill": {"selector": "input[name=q]", "value": "flowers"}},
-  {"press": "Enter"},
-  {"wait_for": "networkidle"},
-  {"click": {"selector": "a h3", "index": 0}}
+  {"goto": "https://duckduckgo.com/?q=flowers"},
+  {"wait_for": {"selector": "a[data-testid=result-title-a]", "index": 0}},
+  {"click": {"selector": "a[data-testid=result-title-a]", "index": 0}}
 ]
 JSON
 ```
 
+Flags:
+
+- `--headless` — hide the browser window (good for scripted scrapes).
+- `--no-wait` — exit immediately after the last step instead of waiting
+  for the user to close the window. Use this for FETCH-style runs where
+  you only care about the JSON output.
+- `--no-stealth` — disable the anti-detection patches.
+- `--timeout MS` — per-step timeout (default 30 000 ms).
+
+Environment overrides: `AI_BROWSER_UA`, `AI_BROWSER_LOCALE`,
+`AI_BROWSER_TZ`.
+
 Or just ask `ai` in natural language (it will call `ai-browser` when needed):
 
 ```sh
-ai go to google, search for flowers, and click the first result
+ai go to duckduckgo, search for flowers, and click the first result
 ```
 
 Pipe in context — anything on stdin gets attached to your prompt:
