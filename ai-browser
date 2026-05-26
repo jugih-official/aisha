@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -293,14 +294,21 @@ def _interactive_loop(page, browser, api_key: str, timeout_ms: int) -> None:
     here-doc). Exits on EOF, "exit"/"quit", QUIT from the model, or when
     the browser disconnects.
     """
+    # Open /dev/tty as two separate fds. Single-handle text-mode "r+" wraps
+    # the fd in BufferedRandom, which calls seek() during init on some Python
+    # builds — fatal on a character device like /dev/tty.
     try:
-        tty = open("/dev/tty", "r+")
-    except OSError:
+        fd_in = os.open("/dev/tty", os.O_RDONLY)
+        fd_out = os.open("/dev/tty", os.O_WRONLY)
+    except OSError as e:
         print(
-            "ai-browser: no /dev/tty available; skipping interactive control",
+            f"ai-browser: cannot open /dev/tty ({e}); skipping interactive "
+            "control. Try running `ai-browser` directly instead of via `ai`.",
             file=sys.stderr,
         )
         return
+    tty_in = os.fdopen(fd_in, "r")
+    tty = os.fdopen(fd_out, "w", buffering=1)
 
     print(
         "\nai-browser: interactive mode. Tell me what to do next, or type "
@@ -323,7 +331,7 @@ def _interactive_loop(page, browser, api_key: str, timeout_ms: int) -> None:
             try:
                 tty.write("\nbrowser> ")
                 tty.flush()
-                line = tty.readline()
+                line = tty_in.readline()
             except KeyboardInterrupt:
                 tty.write("\n")
                 break
@@ -405,10 +413,11 @@ def _interactive_loop(page, browser, api_key: str, timeout_ms: int) -> None:
                 summary["extracted"] = new_extracted
             tty.write(json.dumps(summary, ensure_ascii=False) + "\n")
     finally:
-        try:
-            tty.close()
-        except Exception:
-            pass
+        for handle in (tty_in, tty):
+            try:
+                handle.close()
+            except Exception:
+                pass
 
 
 def run_steps(
@@ -476,14 +485,18 @@ def run_steps(
                 "(or press Ctrl-C).",
                 file=sys.stderr,
             )
+            # Poll is_connected() rather than wait_for_event("disconnected"),
+            # which has been observed to return immediately in the sync API
+            # instead of blocking.
             try:
-                # timeout=0 means wait indefinitely. Fires when the user closes
-                # the last window or quits Chromium.
-                browser.wait_for_event("disconnected", timeout=0)
+                while True:
+                    try:
+                        if not browser.is_connected():
+                            break
+                    except Exception:
+                        break
+                    time.sleep(0.5)
             except KeyboardInterrupt:
-                pass
-            except Exception:
-                # Browser may already be gone — that's the expected exit.
                 pass
 
         # close() on an already-disconnected browser is a no-op / raises;
