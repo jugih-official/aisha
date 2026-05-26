@@ -21,8 +21,9 @@ import sys
 import urllib.request
 import urllib.error
 
-API_URL = "https://api.deepseek.com/chat/completions"
-MODEL = "deepseek-chat"
+API_BASE_URL = "https://api.deepseek.com"
+API_URL = f"{API_BASE_URL}/chat/completions"
+MODEL = "deepseek-v4-flash"
 MAX_TURNS = 8
 FETCH_OUTPUT_LIMIT = 8000  # chars of FETCH output sent back to the model
 STDIN_LIMIT = 50_000       # chars of piped stdin attached to the prompt
@@ -78,6 +79,19 @@ Rules:
   prefer DuckDuckGo's HTML endpoint:
     curl -sSL -A 'Mozilla/5.0' 'https://html.duckduckgo.com/html/?q=QUERY'
   then grep/sed result links. Avoid Google scraping (it blocks bots).
+- Browser automation (optional): use `ai-browser` when the user asks to
+  control a browser (open pages, click, fill forms). Provide JSON steps on
+  stdin. Use `--headed` only if the user wants to see the browser.
+  Example:
+    ai-browser --headless <<'JSON'
+    [
+      {"goto": "https://www.google.com"},
+      {"fill": {"selector": "input[name=q]", "value": "flowers"}},
+      {"press": "Enter"},
+      {"wait_for": "networkidle"},
+      {"click": {"selector": "a h3", "index": 0}}
+    ]
+    JSON
 - Sysadmin coverage you should fluently use when relevant:
     memory:        free -h, vmstat, /proc/meminfo
     disks:         df -h, du -sh, lsblk, blkid, mount, findmnt

@@ -3,11 +3,13 @@
 set -euo pipefail
 
 BIN_TARGET=/usr/local/bin/ai
+BROWSER_BIN_TARGET=/usr/local/bin/ai-browser
 CFG_DIR_USER="$HOME/.config/ai-bash"
 CFG_KEY_USER="$CFG_DIR_USER/api-key"
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_BIN="$SRC_DIR/ai"
+SRC_BROWSER="$SRC_DIR/ai-browser"
 
 red()    { printf '\033[1;31m%s\033[0m\n' "$*"; }
 green()  { printf '\033[1;32m%s\033[0m\n' "$*"; }
@@ -31,6 +33,11 @@ fi
 echo "Installing $SRC_BIN -> $BIN_TARGET"
 sudo install -m 0755 "$SRC_BIN" "$BIN_TARGET"
 green "  installed."
+if [ -f "$SRC_BROWSER" ]; then
+    echo "Installing $SRC_BROWSER -> $BROWSER_BIN_TARGET"
+    sudo install -m 0755 "$SRC_BROWSER" "$BROWSER_BIN_TARGET"
+    green "  installed."
+fi
 
 # --- API key handling -------------------------------------------------------
 have_key=0
@@ -75,6 +82,36 @@ if [ "$have_key" -eq 0 ]; then
         yellow "  skipped. Set \$DEEPSEEK_API_KEY or write the key to $CFG_KEY_USER later."
     fi
 fi
+
+# --- optional browser tools ---------------------------------------------------
+echo
+read -r -p "Install optional browser automation tools (Playwright + Chromium)? [y/N] " yn
+case "${yn,,}" in
+    y|yes)
+        if ! python3 -m pip --version >/dev/null 2>&1; then
+            yellow "pip is not available. Install pip and then run:"
+            echo "  python3 -m pip install --user playwright"
+            echo "  python3 -m playwright install chromium"
+        else
+            set +e
+            python3 -m pip install --user --upgrade playwright
+            pip_rc=$?
+            python3 -m playwright install chromium
+            pw_rc=$?
+            set -e
+            if [ "$pip_rc" -ne 0 ] || [ "$pw_rc" -ne 0 ]; then
+                yellow "Browser tool install failed. You can retry manually:"
+                echo "  python3 -m pip install --user playwright"
+                echo "  python3 -m playwright install chromium"
+            else
+                green "  browser tools installed."
+            fi
+        fi
+        ;;
+    *)
+        dim "  skipped browser tools."
+        ;;
+esac
 
 # --- post-install message ---------------------------------------------------
 echo

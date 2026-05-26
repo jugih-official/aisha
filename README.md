@@ -32,13 +32,16 @@ The latest stable release of Python is 3.13.x (released Oct 2024).
 The installer:
 
 - copies `ai` to `/usr/local/bin/ai` (uses `sudo`),
+- optionally installs browser automation tools (Playwright + Chromium),
 - if you don't already have a `DEEPSEEK_API_KEY` in your environment,
   prompts for one and saves it to `~/.config/ai-bash/api-key` (mode `600`),
 - optionally also writes `/etc/ai-bash/api-key` so `sudo ai ...` works
   without needing `sudo -E`.
 
-Requires Python 3.10+ (stdlib only — no `pip install`). Get a DeepSeek
-key at <https://platform.deepseek.com/> (starts with `sk-`).
+Requires Python 3.10+. The core tool uses stdlib only; browser automation
+optionally installs Playwright via `pip`. Get a DeepSeek key at
+<https://platform.deepseek.com/> (starts with `sk-`). API base is
+<https://api.deepseek.com>; default model is `deepseek-v4-flash`.
 
 ### Where the API key is read from
 
@@ -110,6 +113,36 @@ Questions that need the web (run silently, then answered in prose):
 ai search the web for "lily of the valley" and tell me the first result
 ai what is the latest stable kernel version
 ai what's the weather forecast for Helsinki tomorrow
+```
+
+### Browser control (optional)
+
+For browser automation, the tool uses Playwright. The installer offers to
+install Playwright and Chromium for you. To install manually:
+
+```sh
+python3 -m pip install --user playwright
+python3 -m playwright install chromium
+```
+
+You can use the helper directly:
+
+```sh
+ai-browser --headless <<'JSON'
+[
+  {"goto": "https://www.google.com"},
+  {"fill": {"selector": "input[name=q]", "value": "flowers"}},
+  {"press": "Enter"},
+  {"wait_for": "networkidle"},
+  {"click": {"selector": "a h3", "index": 0}}
+]
+JSON
+```
+
+Or just ask `ai` in natural language (it will call `ai-browser` when needed):
+
+```sh
+ai go to google, search for flowers, and click the first result
 ```
 
 Pipe in context — anything on stdin gets attached to your prompt:
