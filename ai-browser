@@ -7,16 +7,23 @@ them in a Chromium browser. Prints a JSON summary to stdout.
 
 import argparse
 import json
+import os
 import sys
 from typing import Any
+
+# Rewritten by install.sh to point at the directory where Playwright's
+# browsers were downloaded (so both `ai` and `sudo ai` can find Chromium).
+AI_BROWSER_PW_DIR = ""
+
+if AI_BROWSER_PW_DIR and "PLAYWRIGHT_BROWSERS_PATH" not in os.environ:
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = AI_BROWSER_PW_DIR
 
 try:
     from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 except ImportError:
     print(
-        "ai-browser: playwright is not installed. Run:\n"
-        "  python3 -m pip install --user playwright\n"
-        "  python3 -m playwright install chromium",
+        "ai-browser: playwright is not installed.\n"
+        "Re-run ./install.sh and answer 'y' when asked about browser automation tools.",
         file=sys.stderr,
     )
     sys.exit(1)

@@ -7,6 +7,12 @@ BROWSER_BIN_TARGET=/usr/local/bin/ai-browser
 CFG_DIR_USER="$HOME/.config/ai-bash"
 CFG_KEY_USER="$CFG_DIR_USER/api-key"
 
+# Browser automation lives in its own venv so we don't fight PEP 668
+# (externally-managed-environment) on modern Debian/Ubuntu/Fedora.
+BROWSER_PREFIX=/opt/ai-bash
+BROWSER_VENV="$BROWSER_PREFIX/venv"
+BROWSER_PW_DIR="$BROWSER_PREFIX/browsers"
+
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_BIN="$SRC_DIR/ai"
 SRC_BROWSER="$SRC_DIR/ai-browser"
@@ -88,23 +94,62 @@ echo
 read -r -p "Install optional browser automation tools (Playwright + Chromium)? [y/N] " yn
 case "${yn,,}" in
     y|yes)
-        if ! python3 -m pip --version >/dev/null 2>&1; then
-            yellow "pip is not available. Install pip and then run:"
-            echo "  python3 -m pip install --user playwright"
-            echo "  python3 -m playwright install chromium"
+        if ! python3 -c 'import venv' >/dev/null 2>&1; then
+            yellow "python3 venv module is missing."
+            echo "  On Debian/Ubuntu:  sudo apt install python3-venv python3-full"
+            echo "  On Fedora:         sudo dnf install python3-virtualenv"
+            yellow "Re-run ./install.sh after installing it."
         else
-            set +e
-            python3 -m pip install --user --upgrade playwright
-            pip_rc=$?
-            python3 -m playwright install chromium
-            pw_rc=$?
-            set -e
-            if [ "$pip_rc" -ne 0 ] || [ "$pw_rc" -ne 0 ]; then
-                yellow "Browser tool install failed. You can retry manually:"
-                echo "  python3 -m pip install --user playwright"
-                echo "  python3 -m playwright install chromium"
-            else
+            echo "Creating browser venv at $BROWSER_VENV"
+            sudo install -d -m 0755 "$BROWSER_PREFIX"
+            sudo install -d -m 0755 "$BROWSER_PW_DIR"
+
+            install_ok=1
+            if ! sudo python3 -m venv "$BROWSER_VENV"; then
+                install_ok=0
+                yellow "  failed to create venv at $BROWSER_VENV"
+            fi
+
+            if [ "$install_ok" -eq 1 ]; then
+                echo "Installing Playwright into venv"
+                if ! sudo "$BROWSER_VENV/bin/pip" install --upgrade pip >/dev/null; then
+                    yellow "  failed to upgrade pip inside venv (continuing)"
+                fi
+                if ! sudo "$BROWSER_VENV/bin/pip" install --upgrade playwright; then
+                    install_ok=0
+                    yellow "  pip failed to install playwright"
+                fi
+            fi
+
+            if [ "$install_ok" -eq 1 ]; then
+                echo "Downloading Chromium to $BROWSER_PW_DIR (this may take a while)"
+                # --with-deps tries to apt-install the system libs Chromium needs.
+                # Fall back to a plain install if the OS isn't supported by the helper.
+                if ! sudo PLAYWRIGHT_BROWSERS_PATH="$BROWSER_PW_DIR" \
+                        "$BROWSER_VENV/bin/playwright" install --with-deps chromium; then
+                    yellow "  '--with-deps' failed; retrying without it (system libs may be missing)"
+                    if ! sudo PLAYWRIGHT_BROWSERS_PATH="$BROWSER_PW_DIR" \
+                            "$BROWSER_VENV/bin/playwright" install chromium; then
+                        install_ok=0
+                        yellow "  failed to download Chromium"
+                    fi
+                fi
+            fi
+
+            if [ "$install_ok" -eq 1 ]; then
+                # Make Chromium readable/executable by every user (so plain `ai` works,
+                # not just `sudo ai`).
+                sudo chmod -R a+rX "$BROWSER_PW_DIR"
+
+                # Point the installed ai-browser at the venv's python and at the
+                # shared browsers dir.
+                if [ -f "$BROWSER_BIN_TARGET" ]; then
+                    sudo sed -i "1s|^#!.*|#!$BROWSER_VENV/bin/python3|" "$BROWSER_BIN_TARGET"
+                    sudo sed -i "s|^AI_BROWSER_PW_DIR =.*|AI_BROWSER_PW_DIR = \"$BROWSER_PW_DIR\"|" "$BROWSER_BIN_TARGET"
+                fi
                 green "  browser tools installed."
+            else
+                yellow "Browser tool install failed. You can retry by re-running ./install.sh"
             fi
         fi
         ;;

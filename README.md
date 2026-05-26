@@ -118,11 +118,23 @@ ai what's the weather forecast for Helsinki tomorrow
 ### Browser control (optional)
 
 For browser automation, the tool uses Playwright. The installer offers to
-install Playwright and Chromium for you. To install manually:
+install Playwright and Chromium for you. It places them in a dedicated
+venv at `/opt/ai-bash/venv` (with Chromium under `/opt/ai-bash/browsers`)
+so it doesn't fight PEP 668 on modern Debian/Ubuntu/Fedora. On
+Debian/Ubuntu you may need `sudo apt install python3-venv python3-full`
+first.
+
+To install manually:
 
 ```sh
-python3 -m pip install --user playwright
-python3 -m playwright install chromium
+sudo python3 -m venv /opt/ai-bash/venv
+sudo /opt/ai-bash/venv/bin/pip install --upgrade playwright
+sudo PLAYWRIGHT_BROWSERS_PATH=/opt/ai-bash/browsers \
+    /opt/ai-bash/venv/bin/playwright install --with-deps chromium
+sudo chmod -R a+rX /opt/ai-bash/browsers
+sudo sed -i '1s|^#!.*|#!/opt/ai-bash/venv/bin/python3|' /usr/local/bin/ai-browser
+sudo sed -i 's|^AI_BROWSER_PW_DIR =.*|AI_BROWSER_PW_DIR = "/opt/ai-bash/browsers"|' \
+    /usr/local/bin/ai-browser
 ```
 
 You can use the helper directly:
