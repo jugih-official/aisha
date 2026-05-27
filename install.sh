@@ -4,6 +4,7 @@ set -euo pipefail
 
 BIN_TARGET=/usr/local/bin/ai
 BROWSER_BIN_TARGET=/usr/local/bin/ai-browser
+DESKTOP_BIN_TARGET=/usr/local/bin/ai-desktop
 CFG_DIR_USER="$HOME/.config/ai-bash"
 CFG_KEY_USER="$CFG_DIR_USER/api-key"
 
@@ -16,6 +17,7 @@ BROWSER_PW_DIR="$BROWSER_PREFIX/browsers"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_BIN="$SRC_DIR/ai"
 SRC_BROWSER="$SRC_DIR/ai-browser"
+SRC_DESKTOP="$SRC_DIR/ai-desktop"
 
 red()    { printf '\033[1;31m%s\033[0m\n' "$*"; }
 green()  { printf '\033[1;32m%s\033[0m\n' "$*"; }
@@ -42,6 +44,11 @@ green "  installed."
 if [ -f "$SRC_BROWSER" ]; then
     echo "Installing $SRC_BROWSER -> $BROWSER_BIN_TARGET"
     sudo install -m 0755 "$SRC_BROWSER" "$BROWSER_BIN_TARGET"
+    green "  installed."
+fi
+if [ -f "$SRC_DESKTOP" ]; then
+    echo "Installing $SRC_DESKTOP -> $DESKTOP_BIN_TARGET"
+    sudo install -m 0755 "$SRC_DESKTOP" "$DESKTOP_BIN_TARGET"
     green "  installed."
 fi
 
@@ -157,6 +164,31 @@ case "${yn,,}" in
         dim "  skipped browser tools."
         ;;
 esac
+
+# --- optional desktop control tools ----------------------------------------
+echo
+echo "ai-desktop drives the X11 desktop via wmctrl + xdotool (and uses scrot"
+echo "for screenshots, tesseract for OCR — both optional)."
+missing=()
+for cmd in wmctrl xdotool; do
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+done
+if [ ${#missing[@]} -gt 0 ]; then
+    yellow "  missing: ${missing[*]}"
+    read -r -p "Install desktop control tools (wmctrl xdotool scrot)? [y/N] " yn
+    case "${yn,,}" in
+        y|yes)
+            if   command -v apt    >/dev/null 2>&1; then sudo apt    install -y wmctrl xdotool scrot
+            elif command -v dnf    >/dev/null 2>&1; then sudo dnf    install -y wmctrl xdotool scrot
+            elif command -v pacman >/dev/null 2>&1; then sudo pacman -S --needed --noconfirm wmctrl xdotool scrot
+            else yellow "  unknown package manager; install wmctrl, xdotool, scrot manually."
+            fi
+            ;;
+        *) dim "  skipped desktop tools." ;;
+    esac
+else
+    dim "  wmctrl + xdotool already present."
+fi
 
 # --- post-install message ---------------------------------------------------
 echo

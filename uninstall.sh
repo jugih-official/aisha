@@ -4,6 +4,7 @@ set -euo pipefail
 
 BIN_TARGET=/usr/local/bin/ai
 BROWSER_BIN_TARGET=/usr/local/bin/ai-browser
+DESKTOP_BIN_TARGET=/usr/local/bin/ai-desktop
 BROWSER_PREFIX=/opt/ai-bash
 CFG_DIR_USER="$HOME/.config/ai-bash"
 CFG_DIR_SYS=/etc/ai-bash
@@ -31,6 +32,7 @@ remove_path() {
 echo "Uninstalling ai-bash."
 remove_path "$BIN_TARGET" sudo
 remove_path "$BROWSER_BIN_TARGET" sudo
+remove_path "$DESKTOP_BIN_TARGET" sudo
 remove_path "$BROWSER_PREFIX" sudo
 
 # API-key files. Ask before deleting — they hold secrets the user may

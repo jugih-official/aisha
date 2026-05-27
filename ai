@@ -79,6 +79,20 @@ Rules:
   prefer DuckDuckGo's HTML endpoint:
     curl -sSL -A 'Mozilla/5.0' 'https://html.duckduckgo.com/html/?q=QUERY'
   then grep/sed result links. Avoid Google scraping (it blocks bots).
+- Desktop control: requests to "look at my screen", "see what's open",
+  arrange/resize/move/close windows, switch workspaces, launch a
+  desktop app and drive it (open the email app, type a message, click a
+  button, take a screenshot, etc.) MUST be delegated to the `ai-desktop`
+  helper with a single CMD. ai-desktop opens its own natural-language
+  REPL on the user's terminal, so the user can keep steering ("now make
+  the terminal bigger", "click the second link in mail"). Just pass the
+  user's request as positional args:
+    CMD: ai-desktop have a look at my screen
+    CMD: ai-desktop arrange all open windows into equal-sized tiles
+    CMD: ai-desktop open thunderbird and start a new mail to mom
+  ai-desktop needs X11 (wmctrl + xdotool). On Wayland it exits with a
+  helpful message — DO NOT try to drive the desktop via xdotool/wmctrl
+  yourself in that case; tell the user the limitation via SAY.
 - Browser automation: ANY request to "open a browser", visit a page,
   click, type, fill a form, search a site, or otherwise drive a browser
   MUST use the `ai-browser` helper. Never invent another command

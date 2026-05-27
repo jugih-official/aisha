@@ -1,0 +1,689 @@
+#!/usr/bin/env python3
+"""ai-desktop — read and operate the X11 desktop in natural language.
+
+Mirrors `ai-browser`'s shape: a natural-language REPL on top of a small
+JSON action protocol that drives X11 tools (wmctrl, xdotool) and runs
+shell commands. The model sees a text description of the current screen
+state (window list with geometry, active window, screen size, optional
+OCR of the focused window) and replies with one of:
+
+  STEPS: <JSON array of steps>   ai-desktop runs them, then re-observes
+  SAY:   <text>                  final natural-language reply
+  REFUSE: <reason>               refuse
+  QUIT                           end the REPL
+
+Step shapes (each is one object, exactly one action key):
+  {"observe"}                                       re-capture screen state
+  {"exec":  "<bash>"}                               capture stdout/stderr
+  {"launch": "<app>"}                               start an app in the background
+  {"focus":  "<window-title-substring>"}            wmctrl -a
+  {"move_resize": {"window": "<title-substr>"|"active",
+                    "x": N, "y": N, "w": N, "h": N}}
+  {"close":  "<window-title-substring>"}            wmctrl -c (always confirms)
+  {"key":    "<keystroke>"}                         xdotool key (e.g. "ctrl+l")
+  {"type":   "<text>"}                              xdotool type (active window)
+  {"click_at": {"x": N, "y": N, "button": 1}}       xdotool click at absolute coords
+  {"sleep":  <seconds>}
+  {"screenshot": "<path>"}                          save a fresh shot (optional OCR)
+
+Any step may include "confirm": "<one-line reason>" — ai-desktop will
+prompt y/N before running it. This lets the model gate irreversible
+actions ("send mail to mom") without ai-desktop having to second-guess.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from typing import Any
+
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_MODEL = os.environ.get("AI_DESKTOP_MODEL", "deepseek-v4-flash")
+API_KEY_FILES = [
+    os.path.expanduser("~/.config/ai-bash/api-key"),
+    "/etc/ai-bash/api-key",
+]
+MAX_HISTORY = 14  # system + ~13 turns
+EXEC_TIMEOUT = 30
+OCR_CHAR_LIMIT = 2000
+SCREENSHOT_PATH = "/tmp/ai-desktop-screen.png"
+
+SYSTEM_PROMPT = r"""You operate the user's X11 GNU/Linux desktop on their behalf.
+
+You see a SCREEN STATE block before every turn — current screen geometry,
+window list (with geometry), active window, optionally OCR text from the
+focused window. Use it to plan. Respond with EXACTLY one of:
+
+  STEPS: <JSON array of steps>
+  SAY: <one-line natural-language reply to the user>
+  REFUSE: <short reason>
+  QUIT
+
+Step shapes (each object has exactly one action key, plus optional "confirm"):
+  {"observe"}                                       re-capture screen state
+  {"exec":  "<bash>"}                               run a shell command
+  {"launch": "<app or .desktop name>"}              start an app (xdg-open / gtk-launch)
+  {"focus":  "<window-title-substring>"}            raise+focus a window
+  {"move_resize": {"window": "<title-substr>"|"active",
+                    "x": N, "y": N, "w": N, "h": N}}
+  {"close":  "<window-title-substring>"}            close a window (always confirms)
+  {"key":    "<keystroke>"}                         e.g. "ctrl+l", "alt+Tab", "Return"
+  {"type":   "<text>"}                              type text into the active window
+  {"click_at": {"x": N, "y": N, "button": 1}}       click at absolute screen coords
+  {"sleep":  <seconds>}
+  {"screenshot": "<path>"}                          save a shot (and OCR it next turn)
+
+Rules:
+- Output ONLY the prefix line. No markdown fences, no extra commentary.
+- Pick the SIMPLEST flow. For a pure question about the screen ("what's
+  open?", "where is the terminal?"), emit a single SAY using SCREEN STATE.
+- For an action (arrange windows, open an app, click something, send a
+  message), emit STEPS. ai-desktop runs them and shows you a fresh
+  SCREEN STATE; then you either emit more STEPS or finish with SAY.
+- For irreversible / user-visible side-effects (sending a message,
+  submitting a form, deleting data, closing an app that may have unsaved
+  state), add "confirm": "<one-line, human-readable description>" to the
+  step. The user is shown that reason and asked y/N before it runs.
+- For equal-tiling on N windows, compute a grid from the screen geometry.
+  Subtract a small margin (e.g. 16px) and reserve space for any
+  always-on-top panels visible in SCREEN STATE.
+- Coordinates and sizes are pixels. Geometry strings are "x,y wxh".
+- "active" as a window targets the currently focused window.
+- For email/messages: the realistic flow is launch the app, focus its
+  compose window, type recipient, Tab to subject, type, Tab to body,
+  type body, then a `key: "ctrl+Return"` (or whatever the app uses)
+  with `"confirm": "send mail to <recipient>"`. Do NOT actually send
+  without that confirm field.
+- Do not retry a failed step blindly. Re-observe and adjust.
+- Conversational input → SAY.
+"""
+
+
+# Steps that should always require user confirmation regardless of what the
+# model tags. close is irreversible (lost work), and a handful of keystrokes
+# routinely trigger "send"/"submit"/"close window" behavior.
+ALWAYS_CONFIRM_ACTIONS = {"close"}
+DANGEROUS_KEY_RE = re.compile(
+    r"^(alt\+F4|ctrl\+w|ctrl\+q|ctrl\+shift\+q|ctrl\+Return|ctrl\+Enter)$",
+    re.IGNORECASE,
+)
+DESTRUCTIVE_EXEC_RE = re.compile(
+    r"""
+    \b(
+        rm        | rmdir    | shred    | unlink   |
+        mkfs(\.[a-z0-9]+)?   | wipefs   | fdisk    | parted   | sfdisk |
+        shutdown  | reboot   | poweroff | halt     |
+        pkill     | killall
+    )\b
+    |
+    \bfind\b[^|;&]*\s-delete\b
+    |
+    \bdd\b[^|;&]*\bof=/dev/
+    |
+    >\s*/dev/(sd|nvme|hd|mmc|loop)
+    """,
+    re.VERBOSE,
+)
+
+
+# ---- output helpers --------------------------------------------------------
+
+def cyan(s: str) -> str:   return f"\033[1;36m{s}\033[0m"
+def yellow(s: str) -> str: return f"\033[1;33m{s}\033[0m"
+def dim(s: str) -> str:    return f"\033[2m{s}\033[0m"
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"ai-desktop: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ---- API key + deepseek ----------------------------------------------------
+
+def _read_api_key() -> str | None:
+    key = os.environ.get("DEEPSEEK_API_KEY")
+    if key:
+        return key
+    for path in API_KEY_FILES:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                k = f.read().strip()
+            if k:
+                return k
+        except OSError:
+            continue
+    return None
+
+
+def _call_deepseek(messages: list[dict[str, str]], api_key: str) -> str:
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": messages,
+        "temperature": 0.2,
+        "stream": False,
+    }
+    req = urllib.request.Request(
+        DEEPSEEK_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return data["choices"][0]["message"]["content"].strip()
+
+
+def _strip_fences(text: str) -> str:
+    t = text.strip()
+    if t.startswith("```"):
+        lines = t.splitlines()[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        t = "\n".join(lines).strip()
+    return t
+
+
+# ---- environment probes ----------------------------------------------------
+
+def check_x11() -> None:
+    if os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland":
+        die(
+            "this session is Wayland; ai-desktop needs X11 (wmctrl/xdotool). "
+            "Log into an Xorg session or run inside Xwayland."
+        )
+    if not os.environ.get("DISPLAY"):
+        die("$DISPLAY is not set. Are you running in a graphical session?")
+    for tool in ("wmctrl", "xdotool"):
+        if not shutil.which(tool):
+            die(
+                f"required tool '{tool}' not found. Install with:\n"
+                f"  Debian/Ubuntu: sudo apt install wmctrl xdotool\n"
+                f"  Fedora:        sudo dnf install wmctrl xdotool\n"
+                f"  Arch:          sudo pacman -S wmctrl xdotool"
+            )
+
+
+def _run(cmd: list[str] | str, timeout: int = 5) -> tuple[int, str, str]:
+    try:
+        proc = subprocess.run(
+            cmd,
+            shell=isinstance(cmd, str),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+    except FileNotFoundError as e:
+        return 127, "", str(e)
+
+
+def screen_geometry() -> tuple[int, int] | None:
+    rc, out, _ = _run(["xdotool", "getdisplaygeometry"])
+    if rc == 0:
+        try:
+            w, h = out.split()
+            return int(w), int(h)
+        except ValueError:
+            pass
+    return None
+
+
+def list_windows() -> list[dict[str, Any]]:
+    """Returns visible top-level windows from `wmctrl -l -G -p`.
+
+    Format per line:  id  desktop  pid  x  y  w  h  hostname  title...
+    """
+    rc, out, _ = _run(["wmctrl", "-l", "-G", "-p"])
+    if rc != 0:
+        return []
+    rows = []
+    for line in out.splitlines():
+        parts = line.split(None, 8)
+        if len(parts) < 9:
+            continue
+        wid, desktop, pid, x, y, w, h, host, title = parts
+        if desktop == "-1":  # sticky panels, docks
+            continue
+        rows.append({
+            "id": wid,
+            "desktop": int(desktop),
+            "pid": int(pid),
+            "x": int(x), "y": int(y), "w": int(w), "h": int(h),
+            "host": host,
+            "title": title,
+        })
+    return rows
+
+
+def active_window() -> dict[str, Any] | None:
+    rc, out, _ = _run(["xdotool", "getactivewindow"])
+    if rc != 0:
+        return None
+    wid = out.strip()
+    rc, name, _ = _run(["xdotool", "getwindowname", wid])
+    rc2, geom, _ = _run(["xdotool", "getwindowgeometry", "--shell", wid])
+    info = {"id": wid, "title": name.strip() if rc == 0 else ""}
+    if rc2 == 0:
+        for line in geom.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                if k in ("X", "Y", "WIDTH", "HEIGHT"):
+                    info[k.lower()] = int(v)
+    return info
+
+
+def maybe_ocr(path: str) -> str | None:
+    if not shutil.which("tesseract"):
+        return None
+    rc, out, _ = _run(["tesseract", path, "-", "-l", "eng", "--psm", "6"], timeout=15)
+    if rc != 0:
+        return None
+    text = out.strip()
+    if len(text) > OCR_CHAR_LIMIT:
+        text = text[:OCR_CHAR_LIMIT] + "\n…[truncated]"
+    return text or None
+
+
+def take_screenshot(path: str = SCREENSHOT_PATH) -> str | None:
+    """Best-effort screenshot using whatever tool is available."""
+    candidates = [
+        ["scrot", "-o", path],
+        ["maim", path],
+        ["import", "-window", "root", path],  # ImageMagick
+        ["gnome-screenshot", "-f", path],
+    ]
+    for cmd in candidates:
+        if shutil.which(cmd[0]):
+            rc, _, _ = _run(cmd, timeout=10)
+            if rc == 0:
+                return path
+    return None
+
+
+def describe_screen(extra: dict[str, Any] | None = None) -> str:
+    geom = screen_geometry()
+    windows = list_windows()
+    active = active_window()
+    lines = ["SCREEN STATE:"]
+    if geom:
+        lines.append(f"  display: {geom[0]}x{geom[1]}")
+    if active:
+        lines.append(
+            f"  active : id={active.get('id')} title={active.get('title')!r} "
+            f"@({active.get('x','?')},{active.get('y','?')}) "
+            f"{active.get('width','?')}x{active.get('height','?')}"
+        )
+    if windows:
+        lines.append("  windows:")
+        for w in windows:
+            lines.append(
+                f"    - {w['title']!r}  id={w['id']}  "
+                f"@({w['x']},{w['y']}) {w['w']}x{w['h']}  desk={w['desktop']}"
+            )
+    else:
+        lines.append("  windows: (none visible)")
+    if extra:
+        for k, v in extra.items():
+            lines.append(f"  {k}: {v}")
+    return "\n".join(lines)
+
+
+# ---- step execution --------------------------------------------------------
+
+class StepError(Exception):
+    pass
+
+
+def _confirm_tty(prompt: str) -> bool:
+    try:
+        fd_in = os.open("/dev/tty", os.O_RDONLY)
+        fd_out = os.open("/dev/tty", os.O_WRONLY)
+    except OSError:
+        return False
+    tty_in = os.fdopen(fd_in, "r")
+    tty_out = os.fdopen(fd_out, "w", buffering=1)
+    try:
+        tty_out.write(prompt)
+        tty_out.flush()
+        ans = (tty_in.readline() or "").strip().lower()
+    except (OSError, KeyboardInterrupt):
+        return False
+    finally:
+        tty_in.close()
+        tty_out.close()
+    return ans in ("y", "yes", "k", "kyllä")
+
+
+def _step_needs_confirm(action: str, value: Any, step: dict[str, Any]) -> str | None:
+    """Returns a human-readable reason if confirmation is required, else None."""
+    if "confirm" in step and step["confirm"]:
+        return str(step["confirm"])
+    if action in ALWAYS_CONFIRM_ACTIONS:
+        return f"close window matching {value!r}"
+    if action == "exec" and isinstance(value, str) and DESTRUCTIVE_EXEC_RE.search(value):
+        return f"run destructive shell command: {value}"
+    if action == "key" and isinstance(value, str) and DANGEROUS_KEY_RE.match(value):
+        return f"send keystroke {value!r} (often closes/sends)"
+    return None
+
+
+def _find_window_id(needle: str) -> str | None:
+    if needle == "active":
+        a = active_window()
+        return a["id"] if a else None
+    for w in list_windows():
+        if needle.lower() in w["title"].lower():
+            return w["id"]
+    return None
+
+
+def _exec_step(action: str, value: Any, step: dict[str, Any]) -> dict[str, Any]:
+    if action == "observe":
+        return {"ok": True}
+
+    if action == "exec":
+        if not isinstance(value, str):
+            raise StepError("exec requires a string")
+        rc, out, err = _run(value, timeout=EXEC_TIMEOUT)
+        return {
+            "ok": rc == 0,
+            "exit": rc,
+            "stdout": out[-2000:],
+            "stderr": err[-1000:],
+        }
+
+    if action == "launch":
+        if not isinstance(value, str):
+            raise StepError("launch requires a string")
+        subprocess.Popen(
+            ["sh", "-c", f"({value}) >/dev/null 2>&1 &"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return {"ok": True, "launched": value}
+
+    if action == "focus":
+        if not isinstance(value, str):
+            raise StepError("focus requires a window title substring")
+        rc, _, err = _run(["wmctrl", "-a", value])
+        return {"ok": rc == 0, "stderr": err.strip()}
+
+    if action == "move_resize":
+        if not isinstance(value, dict):
+            raise StepError("move_resize requires an object")
+        win = value.get("window", "active")
+        wid = _find_window_id(win)
+        if not wid:
+            return {"ok": False, "error": f"no window matching {win!r}"}
+        try:
+            x, y, w, h = (int(value[k]) for k in ("x", "y", "w", "h"))
+        except (KeyError, ValueError, TypeError) as e:
+            raise StepError(f"move_resize needs ints x,y,w,h: {e}")
+        # Unmaximize first; wmctrl -e is ignored on maximized windows.
+        _run(["wmctrl", "-i", "-r", wid, "-b", "remove,maximized_vert,maximized_horz"])
+        rc, _, err = _run(
+            ["wmctrl", "-i", "-r", wid, "-e", f"0,{x},{y},{w},{h}"]
+        )
+        return {"ok": rc == 0, "stderr": err.strip(), "window_id": wid}
+
+    if action == "close":
+        if not isinstance(value, str):
+            raise StepError("close requires a window title substring")
+        wid = _find_window_id(value)
+        if not wid:
+            return {"ok": False, "error": f"no window matching {value!r}"}
+        rc, _, err = _run(["wmctrl", "-i", "-c", wid])
+        return {"ok": rc == 0, "stderr": err.strip()}
+
+    if action == "key":
+        if not isinstance(value, str):
+            raise StepError("key requires a string")
+        rc, _, err = _run(["xdotool", "key", "--clearmodifiers", value])
+        return {"ok": rc == 0, "stderr": err.strip()}
+
+    if action == "type":
+        if not isinstance(value, str):
+            raise StepError("type requires a string")
+        rc, _, err = _run(["xdotool", "type", "--delay", "12", "--", value])
+        return {"ok": rc == 0, "stderr": err.strip()}
+
+    if action == "click_at":
+        if not isinstance(value, dict) or "x" not in value or "y" not in value:
+            raise StepError("click_at requires {x, y, button?}")
+        x, y = int(value["x"]), int(value["y"])
+        button = str(value.get("button", 1))
+        _run(["xdotool", "mousemove", str(x), str(y)])
+        rc, _, err = _run(["xdotool", "click", button])
+        return {"ok": rc == 0, "stderr": err.strip()}
+
+    if action == "sleep":
+        time.sleep(float(value))
+        return {"ok": True}
+
+    if action == "screenshot":
+        path = value if isinstance(value, str) else SCREENSHOT_PATH
+        saved = take_screenshot(path)
+        if not saved:
+            return {"ok": False, "error": "no screenshot tool found (try: sudo apt install scrot)"}
+        ocr = maybe_ocr(saved)
+        result: dict[str, Any] = {"ok": True, "path": saved}
+        if ocr:
+            result["ocr"] = ocr
+        return result
+
+    raise StepError(f"unknown action: {action}")
+
+
+_ACTION_KEYS = {
+    "observe", "exec", "launch", "focus", "move_resize", "close",
+    "key", "type", "click_at", "sleep", "screenshot",
+}
+
+
+def execute_steps(steps: list[dict[str, Any]], verbose: bool) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for step in steps:
+        action_keys = [k for k in step if k in _ACTION_KEYS]
+        if len(action_keys) != 1:
+            results.append({"step": step, "ok": False, "error": "step needs exactly one action key"})
+            continue
+        action = action_keys[0]
+        value = step[action]
+
+        reason = _step_needs_confirm(action, value, step)
+        if reason:
+            print(yellow(f"! {reason}"), file=sys.stderr)
+            if not _confirm_tty("run? [y/N] "):
+                results.append({"step": step, "ok": False, "skipped": "user declined"})
+                continue
+
+        if verbose:
+            print(dim(f"[{action}] {json.dumps(value, ensure_ascii=False)}"), file=sys.stderr)
+
+        try:
+            result = _exec_step(action, value, step)
+        except StepError as e:
+            result = {"ok": False, "error": str(e)}
+        except Exception as e:
+            result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+        result["step"] = step
+        results.append(result)
+    return results
+
+
+# ---- main REPL -------------------------------------------------------------
+
+def _format_results(results: list[dict[str, Any]]) -> str:
+    """Compact, model-friendly summary of step results."""
+    lines = ["RESULTS:"]
+    for r in results:
+        action = next((k for k in r.get("step", {}) if k in _ACTION_KEYS), "?")
+        ok = r.get("ok")
+        prefix = "  ✓" if ok else "  ✗"
+        detail = []
+        for key in ("exit", "skipped", "error", "stderr", "stdout", "ocr", "launched", "window_id", "path"):
+            if key in r and r[key]:
+                val = r[key]
+                if isinstance(val, str) and len(val) > 400:
+                    val = val[:400] + "…"
+                detail.append(f"{key}={val!r}")
+        lines.append(f"{prefix} {action}: " + ", ".join(detail) if detail else f"{prefix} {action}")
+    return "\n".join(lines)
+
+
+def _open_tty() -> tuple[Any, Any] | None:
+    try:
+        fd_in = os.open("/dev/tty", os.O_RDONLY)
+        fd_out = os.open("/dev/tty", os.O_WRONLY)
+    except OSError as e:
+        print(f"ai-desktop: cannot open /dev/tty ({e}); REPL disabled", file=sys.stderr)
+        return None
+    return os.fdopen(fd_in, "r"), os.fdopen(fd_out, "w", buffering=1)
+
+
+MAX_AUTO_TURNS = 8  # safety cap on consecutive STEPS without a SAY in one-shot mode
+
+
+def run_loop(initial_prompt: str | None, api_key: str, *, one_shot: bool, verbose: bool) -> int:
+    history: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    tty_in = tty_out = None
+    if not one_shot:
+        opened = _open_tty()
+        if opened is None:
+            one_shot = True
+        else:
+            tty_in, tty_out = opened
+
+    pending = initial_prompt
+    auto_turns = 0
+
+    def _say(msg: str) -> None:
+        if tty_out is not None:
+            tty_out.write(msg + "\n")
+        else:
+            print(msg)
+
+    try:
+        while True:
+            if pending is None:
+                if one_shot or tty_in is None:
+                    return 0
+                try:
+                    tty_out.write("\ndesktop> ")
+                    tty_out.flush()
+                    line = tty_in.readline()
+                except KeyboardInterrupt:
+                    tty_out.write("\n")
+                    return 0
+                if not line:
+                    tty_out.write("\n")
+                    return 0
+                pending = line.strip()
+                if not pending:
+                    continue
+                if pending.lower() in ("exit", "quit", ":q"):
+                    return 0
+                auto_turns = 0
+
+            screen = describe_screen()
+            history.append({"role": "user", "content": f"{screen}\n\nUser instruction: {pending}"})
+            pending = None
+            if len(history) > MAX_HISTORY:
+                history = [history[0]] + history[-(MAX_HISTORY - 1):]
+
+            try:
+                reply = _call_deepseek(history, api_key)
+            except urllib.error.HTTPError as e:
+                body = e.read().decode("utf-8", errors="replace")
+                print(f"ai-desktop: deepseek HTTP {e.code}: {body}", file=sys.stderr)
+                history.pop()
+                if one_shot:
+                    return 1
+                continue
+            except urllib.error.URLError as e:
+                print(f"ai-desktop: network error: {e.reason}", file=sys.stderr)
+                history.pop()
+                if one_shot:
+                    return 1
+                continue
+            history.append({"role": "assistant", "content": reply})
+            reply = _strip_fences(reply)
+
+            if reply.startswith("QUIT"):
+                return 0
+            if reply.startswith("SAY:"):
+                _say(reply[4:].strip())
+                if one_shot:
+                    return 0
+                continue
+            if reply.startswith("REFUSE:"):
+                print(f"refused: {reply[7:].strip()}", file=sys.stderr)
+                if one_shot:
+                    return 3
+                continue
+
+            steps_text = reply[len("STEPS:"):].strip() if reply.startswith("STEPS:") else reply
+            try:
+                steps = json.loads(steps_text)
+                if not isinstance(steps, list):
+                    raise ValueError("expected a JSON array")
+            except Exception as e:
+                print(f"ai-desktop: couldn't parse reply as steps ({e}): {reply[:200]}", file=sys.stderr)
+                history.append({"role": "user", "content": f"PARSE ERROR: {e}. Reply with STEPS:/SAY:/REFUSE/QUIT only."})
+                continue
+
+            results = execute_steps(steps, verbose=verbose)
+            if verbose:
+                print(dim(_format_results(results)), file=sys.stderr)
+            history.append({"role": "user", "content": _format_results(results)})
+
+            auto_turns += 1
+            if one_shot and auto_turns >= MAX_AUTO_TURNS:
+                print(yellow(f"ai-desktop: hit {MAX_AUTO_TURNS}-turn cap without a SAY; stopping."), file=sys.stderr)
+                return 0
+            pending = "(continue based on the results above and the fresh SCREEN STATE; either emit more STEPS or finish with SAY)"
+    finally:
+        for h in (tty_in, tty_out):
+            if h is not None:
+                try: h.close()
+                except Exception: pass
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description="Operate the X11 desktop in natural language.",
+        allow_abbrev=False,
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="show step details and results")
+    parser.add_argument("-1", "--one-shot", action="store_true",
+                        help="run the initial prompt once and exit (no REPL)")
+    parser.add_argument("words", nargs=argparse.REMAINDER,
+                        help="initial natural-language instruction")
+    args = parser.parse_args(argv[1:])
+
+    check_x11()
+
+    api_key = _read_api_key()
+    if not api_key:
+        die("no API key. Set $DEEPSEEK_API_KEY or write it to ~/.config/ai-bash/api-key")
+
+    initial = " ".join(args.words).strip() or None
+    return run_loop(initial, api_key, one_shot=args.one_shot, verbose=args.verbose)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
