@@ -13,7 +13,7 @@ OCR of the focused window) and replies with one of:
   QUIT                           end the REPL
 
 Step shapes (each is one object, exactly one action key):
-  {"observe"}                                       re-capture screen state
+  {"observe": true}                                 re-capture screen state
   {"exec":  "<bash>"}                               capture stdout/stderr
   {"launch": "<app>"}                               start an app in the background
   {"focus":  "<window-title-substring>"}            wmctrl -a
@@ -65,8 +65,10 @@ focused window. Use it to plan. Respond with EXACTLY one of:
   REFUSE: <short reason>
   QUIT
 
-Step shapes (each object has exactly one action key, plus optional "confirm"):
-  {"observe"}                                       re-capture screen state
+Step shapes (each object has exactly one action key, plus optional "confirm").
+All step objects MUST be valid JSON — every key needs a value (use `true`
+for `observe` if it has no other data):
+  {"observe": true}                                 re-capture screen state
   {"exec":  "<bash>"}                               run a shell command
   {"launch": "<app or .desktop name>"}              start an app (xdg-open / gtk-launch)
   {"focus":  "<window-title-substring>"}            raise+focus a window
@@ -101,6 +103,10 @@ Rules:
   with `"confirm": "send mail to <recipient>"`. Do NOT actually send
   without that confirm field.
 - Do not retry a failed step blindly. Re-observe and adjust.
+- "Send window to background" / "put behind" means lower it ONCE so other
+  windows cover it. Use `xdotool windowminimize` or focus a different window
+  — do NOT use `wmctrl -b add,below` / `add,hidden` / `add,sticky`, those set
+  persistent hints that strand the window (clicking it won't bring it back).
 - Conversational input → SAY.
 """
 
@@ -129,6 +135,14 @@ DESTRUCTIVE_EXEC_RE = re.compile(
     >\s*/dev/(sd|nvme|hd|mmc|loop)
     """,
     re.VERBOSE,
+)
+
+# wmctrl -b add,<hint> sets persistent window-manager hints. The "below" /
+# "hidden" / "sticky" / "shaded" hints are sticky across clicks and easy to
+# strand a window in (the user has to know to call `remove,<hint>` to undo).
+STICKY_WMCTRL_RE = re.compile(
+    r"\bwmctrl\b[^|;&]*\s-b\s+add\s*,\s*(below|hidden|sticky|shaded|above)\b",
+    re.IGNORECASE,
 )
 
 
@@ -373,6 +387,8 @@ def _step_needs_confirm(action: str, value: Any, step: dict[str, Any]) -> str | 
         return f"close window matching {value!r}"
     if action == "exec" and isinstance(value, str) and DESTRUCTIVE_EXEC_RE.search(value):
         return f"run destructive shell command: {value}"
+    if action == "exec" and isinstance(value, str) and STICKY_WMCTRL_RE.search(value):
+        return f"set a sticky window-manager hint (hard to undo): {value}"
     if action == "key" and isinstance(value, str) and DANGEROUS_KEY_RE.match(value):
         return f"send keystroke {value!r} (often closes/sends)"
     return None
