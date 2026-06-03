@@ -239,7 +239,10 @@ destructive commands always require an explicit `y`.
 
 ### Setting up the GPU backend
 
-The installer offers to do this for you. It will:
+The installer offers to do this for you. It first checks whether a Modal LLM
+server is **already deployed** (the repo's `ai-code-llm`, or an existing
+`llm-server`); if so it offers to **reuse** it — just paste that server's API
+key and you're done, no new deploy. Otherwise it will:
 
 1. install the [`modal`](https://modal.com) CLI if missing,
 2. authenticate you with Modal (`modal token new`; free signup),

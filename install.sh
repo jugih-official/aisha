@@ -204,25 +204,86 @@ fi
 # --- optional ai-code Modal GPU backend -------------------------------------
 # ai-code is an interactive coding agent (like Claude Code / Codex) that runs a
 # local open-weights LLM on your own Modal GPUs. The `ai-code` command is
-# already installed above; this step deploys and wires up its GPU backend.
+# already installed above; this step wires up its GPU backend — reusing an
+# already-deployed Modal LLM server if one exists, otherwise offering to deploy.
+
+# App name this repo deploys, plus other known LLM-server app names to reuse.
+CODE_APP_NAME="$(grep -oE 'modal\.App\("[^"]+"\)' "$SRC_MODAL" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/' | head -n1)"
+CODE_APP_NAME="${CODE_APP_NAME:-ai-code-llm}"
+CODE_APP_CANDIDATES=("$CODE_APP_NAME" "llm-server")
+
+# Write the ai-code endpoint ($1=base url without /v1) and key ($2) locally.
+write_code_cfg() {
+    mkdir -p "$CFG_DIR_USER"; chmod 700 "$CFG_DIR_USER"
+    printf '%s\n' "${1%/}/v1" > "$CODE_URL_USER"; chmod 600 "$CODE_URL_USER"
+    printf '%s\n' "$2"        > "$CODE_KEY_USER"; chmod 600 "$CODE_KEY_USER"
+    green "  ai-code backend configured: ${1}"
+    dim   "  saved to $CODE_URL_USER"
+}
+
 echo
 echo "ai-code is an interactive coding agent powered by an open-weights LLM"
-echo "running on your own Modal GPUs (deployed via 'modal'). Setting it up will"
-echo "deploy a vLLM server to Modal and may incur GPU cost while it serves"
-echo "(it scales to zero ~2 min after the last request)."
+echo "running on your own Modal GPUs (served via 'modal')."
 have_code_cfg=0
 [ -s "$CODE_URL_USER" ] && [ -s "$CODE_KEY_USER" ] && have_code_cfg=1
+code_done=0   # set once configured (reused or deployed) so we skip later steps
+
 if [ "$have_code_cfg" -eq 1 ]; then
     dim "  ai-code backend already configured ($CODE_URL_USER). Skipping."
+    code_done=1
 elif [ ! -f "$SRC_MODAL" ]; then
     dim "  modal/llm_modal.py not found in this checkout; skipping ai-code backend."
-else
-    read -r -p "Set up the ai-code GPU backend on Modal now? [y/N] " yn
+    code_done=1
+fi
+
+# 1) If Modal is already set up, look for an existing deployed LLM server and
+#    offer to reuse it instead of deploying a new one.
+if [ "$code_done" -eq 0 ] && command -v modal >/dev/null 2>&1 && modal profile current >/dev/null 2>&1; then
+    WS="$(modal profile current 2>/dev/null)"
+    FOUND_APP="$(modal app list --json 2>/dev/null | python3 -c '
+import sys, json
+try:
+    apps = json.load(sys.stdin)
+except Exception:
+    apps = []
+for cand in sys.argv[1:]:
+    for a in apps:
+        if a.get("Description") == cand and a.get("State") == "deployed":
+            print(cand); sys.exit(0)
+' "${CODE_APP_CANDIDATES[@]}" 2>/dev/null)"
+
+    if [ -n "$FOUND_APP" ] && [ -n "$WS" ]; then
+        FOUND_URL="https://${WS}--${FOUND_APP}-serve.modal.run"
+        green "Found an existing deployed Modal LLM server: '$FOUND_APP'."
+        read -r -p "Use it as the ai-code backend (no new deploy)? [Y/n] " yn
+        case "${yn,,}" in
+        n|no) dim "  not reusing it." ;;
+        *)
+            echo "  ai-code needs that server's API key (the VLLM_API_KEY in its"
+            echo "  Modal secret). Modal can't read secrets back, so paste it here."
+            read -r -s -p "  API key (or press Enter to deploy a fresh server instead): " REUSE_KEY; echo
+            if [ -n "$REUSE_KEY" ]; then
+                write_code_cfg "$FOUND_URL" "$REUSE_KEY"
+                code_done=1
+            else
+                dim "  no key entered; will offer to deploy a fresh server."
+            fi
+            ;;
+        esac
+    fi
+fi
+
+# 2) Nothing reusable (or user declined) → offer to deploy a fresh backend.
+if [ "$code_done" -eq 0 ]; then
+    echo "  Deploying a new server runs a vLLM GPU container on Modal and may"
+    echo "  incur GPU cost while it serves (it scales to zero ~2 min after the"
+    echo "  last request)."
+    read -r -p "Deploy the ai-code GPU backend ('$CODE_APP_NAME') on Modal now? [y/N] " yn
     case "${yn,,}" in
     y|yes)
         code_ok=1
 
-        # 1) Ensure the `modal` CLI is available (install via pipx or pip --user).
+        # Ensure the `modal` CLI is available (install via pipx or pip --user).
         if ! command -v modal >/dev/null 2>&1; then
             yellow "  'modal' CLI not found."
             read -r -p "  Install it now? [Y/n] " m
@@ -243,39 +304,35 @@ else
             esac
         fi
 
-        # 2) Ensure a Modal token exists (modal token new opens a browser).
+        # Ensure a Modal token exists (modal token new opens a browser).
         if [ "$code_ok" -eq 1 ] && ! modal profile current >/dev/null 2>&1; then
             yellow "  No Modal token found. Authenticating with Modal…"
             echo "  (this opens a browser; sign up free at https://modal.com if needed)"
             modal token new || { code_ok=0; yellow "  Modal authentication failed."; }
         fi
 
-        # 3) Generate an API key, store it as a Modal secret + locally.
+        # Generate an API key, store it as a Modal secret + locally.
         if [ "$code_ok" -eq 1 ]; then
             CODE_KEY="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
             echo "  Creating Modal secret 'ai-code-llm-key'…"
             modal secret create ai-code-llm-key "VLLM_API_KEY=$CODE_KEY" --force || code_ok=0
         fi
 
-        # 4) Deploy the vLLM server and capture its public URL.
+        # Deploy the vLLM server and capture its public URL.
         if [ "$code_ok" -eq 1 ]; then
             echo "  Deploying GPU server (modal deploy $SRC_MODAL)…"
             DEPLOY_LOG="$(mktemp)"
             if modal deploy "$SRC_MODAL" 2>&1 | tee "$DEPLOY_LOG"; then
-                CODE_URL="$(grep -oE 'https://[a-zA-Z0-9._-]+--ai-code-llm-serve\.modal\.run' "$DEPLOY_LOG" | head -n1)"
+                CODE_URL="$(grep -oE "https://[a-zA-Z0-9._-]+--${CODE_APP_NAME}-serve\.modal\.run" "$DEPLOY_LOG" | head -n1)"
             else
                 code_ok=0; yellow "  modal deploy failed."
             fi
             rm -f "$DEPLOY_LOG"
         fi
 
-        # 5) Persist the endpoint + key so ai-code can reach it.
+        # Persist the endpoint + key so ai-code can reach it.
         if [ "$code_ok" -eq 1 ] && [ -n "${CODE_URL:-}" ]; then
-            mkdir -p "$CFG_DIR_USER"; chmod 700 "$CFG_DIR_USER"
-            printf '%s\n' "${CODE_URL%/}/v1" > "$CODE_URL_USER"; chmod 600 "$CODE_URL_USER"
-            printf '%s\n' "$CODE_KEY"        > "$CODE_KEY_USER"; chmod 600 "$CODE_KEY_USER"
-            green "  ai-code backend ready at ${CODE_URL}"
-            dim   "  endpoint saved to $CODE_URL_USER"
+            write_code_cfg "$CODE_URL" "$CODE_KEY"
         elif [ "$code_ok" -eq 1 ]; then
             yellow "  Deployed, but couldn't auto-detect the URL. Find it with"
             yellow "  'modal app list' and write '<url>/v1' to $CODE_URL_USER (key in $CODE_KEY_USER)."
