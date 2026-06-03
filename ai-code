@@ -1,0 +1,760 @@
+#!/usr/bin/env python3
+"""ai-code — an interactive coding agent powered by your own LLM on Modal GPUs.
+
+Run it inside a project folder, like Claude Code or Codex:
+
+    cd my-project
+    ai-code                       # interactive REPL
+    ai-code "add type hints to utils.py and run the tests"   # one-shot
+
+It talks to an OpenAI-compatible vLLM server you deploy to Modal (see
+modal/llm_modal.py and install.sh). The model drives the session with a small
+line-prefixed protocol, so it can read files, edit them, and run commands in
+your project — then explain what it did.
+
+  READ <path>             read a file (contents fed back to the model)
+  LIST <path>             list a directory
+  RUN \\n <bash> \\n        run shell command(s) in the project; output fed back
+  WRITE <path> \\n <text>  create/overwrite a whole file
+  EDIT <path> \\n <blocks> apply search/replace edits
+  SAY <text>              say something to you (progress / explanation)
+  ASK <question>          ask you a question and wait for your answer
+  DONE <summary>          finished — hand control back to you
+
+Exactly one action per reply. WRITE/EDIT/RUN are confirmed before they touch
+your machine (toggle with /auto, or pass -y to auto-approve everything).
+
+Config (where the LLM lives) is read from, in order:
+    $AI_CODE_BASE_URL / $AI_CODE_API_KEY
+    ~/.config/ai-bash/code-url , ~/.config/ai-bash/code-key
+    /etc/ai-bash/code-url , /etc/ai-bash/code-key
+install.sh writes these for you after deploying the Modal backend.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+MODEL = os.environ.get("AI_CODE_MODEL", "default")
+DEBUG = os.environ.get("AI_CODE_DEBUG", "") not in ("", "0", "false")
+MAX_STEPS = int(os.environ.get("AI_CODE_MAX_STEPS", "60"))  # actions per request
+RUN_TIMEOUT = int(os.environ.get("AI_CODE_RUN_TIMEOUT", "180"))  # seconds
+OUTPUT_LIMIT = 8000   # chars of command output / file read fed back to model
+HISTORY_BUDGET = 90_000  # approx chars of history kept before trimming
+
+CFG_DIR_USER = os.path.expanduser("~/.config/ai-bash")
+URL_FILES = [os.path.join(CFG_DIR_USER, "code-url"), "/etc/ai-bash/code-url"]
+KEY_FILES = [os.path.join(CFG_DIR_USER, "code-key"), "/etc/ai-bash/code-key"]
+
+SYSTEM_PROMPT = r"""You are ai-code, an expert software engineer working directly inside the user's project directory from their terminal. You can read and edit files and run shell commands to accomplish coding tasks, then explain what you did — like a pair-programmer.
+
+You MUST reply with EXACTLY ONE action per message, and nothing else (no markdown fences around the whole reply). An action is one of:
+
+  READ <path>
+      Read a file. Its contents (with line numbers) come back to you. Always
+      READ a file before editing it.
+
+  LIST <path>
+      List a directory's entries. Use "." for the project root.
+
+  RUN
+  <shell command(s)>
+      Run in the project directory with bash. The exit code and combined
+      output come back to you. Chain steps with && or newlines. Use this to
+      build, run tests, grep, git, install deps, scaffold, etc.
+
+  WRITE <path>
+  <full file content>
+      Create a new file or completely overwrite an existing one. Everything
+      after the header line is the file body. Prefer EDIT for small changes to
+      existing files.
+
+  EDIT <path>
+  <<<<<<< SEARCH
+  exact existing lines to find
+  =======
+  replacement lines
+  >>>>>>> REPLACE
+      Apply one or more search/replace blocks to an existing file. The SEARCH
+      text must match the current file content EXACTLY (whitespace included).
+      Include several SEARCH/REPLACE blocks in one EDIT for multiple changes.
+
+  SAY <text>
+      Tell the user something (a short progress note or explanation). The
+      session continues — follow it with more actions or DONE.
+
+  ASK <question>
+      Ask the user a question when you are genuinely blocked or need a
+      decision. Their answer comes back to you. Use sparingly.
+
+  DONE <one-line summary>
+      You have completed the user's request. Hand control back to the user.
+
+CRITICAL FORMAT RULES:
+- Output the action and NOTHING ELSE. Do not add prose before or after it. The
+  reply must BEGIN with the action verb. No markdown fences around the action.
+- Exactly ONE action per reply. To do several things, take them one per turn.
+- For WRITE, the body is the COMPLETE file content — never a diff or a snippet.
+- For EDIT, the SEARCH text must be copied EXACTLY from the current file
+  (indentation and all). If an edit fails to match, READ the file again and
+  retry with the exact text.
+
+Examples of well-formed replies (each is a complete reply on its own):
+
+READ src/utils.py
+
+LIST .
+
+RUN
+python3 -m pytest -q
+
+WRITE test_calc.py
+import calc
+
+def test_add():
+    assert calc.add(2, 3) == 5
+
+EDIT calc.py
+<<<<<<< SEARCH
+def add(a, b):
+    return a + b
+=======
+def add(a, b):
+    return a + b
+
+
+def subtract(a, b):
+    return a - b
+>>>>>>> REPLACE
+
+SAY Running the tests now.
+
+DONE Added subtract() and tests; all tests pass.
+
+Working style:
+- Investigate before changing: READ/LIST/grep via RUN to understand the code.
+- Create files with WRITE; modify existing files with EDIT (READ them first).
+  Match the project's existing style and conventions.
+- Order matters: CREATE a file (WRITE) before you try to RUN it. Don't run a
+  test file you haven't written yet.
+- After changing code, verify it: RUN the tests / build / linter / the program
+  itself when feasible, and fix what you broke. Run plain test files with e.g.
+  `python3 test_calc.py`, not `python3 -m unittest <file>.py`.
+- NEVER emit DONE while the last command failed (non-zero exit) or a needed
+  file is missing. Fix it and re-run until it succeeds, THEN DONE.
+- Keep going autonomously until the task is done, then emit DONE. Don't stop to
+  ask for confirmation on routine steps — the terminal already confirms edits
+  and commands with the user.
+- If a request is ambiguous, pick the most reasonable interpretation and
+  proceed; only ASK when truly necessary.
+- Never run destructive commands (rm -rf /, mkfs, dd to a device, fork bombs).
+- Be concise in SAY/DONE. Use the user's language.
+"""
+
+
+# ---- colors / io -----------------------------------------------------------
+
+def c(code, s):
+    return f"\033[{code}m{s}\033[0m"
+
+
+def cyan(s):   return c("1;36", s)
+def green(s):  return c("1;32", s)
+def yellow(s): return c("1;33", s)
+def red(s):    return c("1;31", s)
+def dim(s):    return c("2", s)
+def bold(s):   return c("1", s)
+
+
+def die(msg, code=1):
+    print(red(f"ai-code: {msg}"), file=sys.stderr)
+    sys.exit(code)
+
+
+def tty_prompt(prompt):
+    """Read a line from the controlling terminal (works even if stdin is a pipe)."""
+    try:
+        tty = open("/dev/tty", "r+")
+    except OSError:
+        return None
+    try:
+        tty.write(prompt)
+        tty.flush()
+        return tty.readline()
+    except (OSError, KeyboardInterrupt):
+        print()
+        return None
+    finally:
+        tty.close()
+
+
+def confirm(prompt, default_yes=True):
+    suffix = "[Y/n]" if default_yes else "[y/N]"
+    line = tty_prompt(f"{prompt} {suffix} ")
+    if line is None:
+        return False
+    ans = line.strip().lower()
+    if ans == "":
+        return default_yes
+    return ans in ("y", "yes", "k", "kyllä")
+
+
+# ---- config ----------------------------------------------------------------
+
+def _first_file(paths):
+    for p in paths:
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                val = f.read().strip()
+            if val:
+                return val
+        except (FileNotFoundError, PermissionError):
+            continue
+    return None
+
+
+def resolve_config():
+    base = os.environ.get("AI_CODE_BASE_URL") or _first_file(URL_FILES)
+    key = os.environ.get("AI_CODE_API_KEY") or _first_file(KEY_FILES)
+    if not base:
+        die(
+            "no LLM endpoint configured.\n"
+            "  Set $AI_CODE_BASE_URL or write it to ~/.config/ai-bash/code-url\n"
+            "  (run ./install.sh to deploy the Modal GPU backend and configure this)."
+        )
+    if not key:
+        die("no API key configured. Set $AI_CODE_API_KEY or ~/.config/ai-bash/code-key.")
+    return base.rstrip("/"), key
+
+
+# ---- LLM call --------------------------------------------------------------
+
+def call_llm(base_url, api_key, messages):
+    payload = {
+        "model": MODEL,
+        "messages": messages,
+        "temperature": 0.2,
+        "max_tokens": 2048,
+        "stream": False,
+    }
+    req = urllib.request.Request(
+        f"{base_url}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        # Long timeout: the first request may wait through a Modal cold start
+        # (GPU boot + model load), which can take a couple of minutes.
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        die(f"LLM HTTP {e.code}: {body}")
+    except urllib.error.URLError as e:
+        die(f"network error reaching the LLM: {e.reason}")
+    try:
+        return data["choices"][0]["message"]["content"].strip()
+    except (KeyError, IndexError):
+        die(f"unexpected LLM response: {data}")
+
+
+# ---- protocol parsing ------------------------------------------------------
+
+VERBS = ("READ", "LIST", "RUN", "WRITE", "EDIT", "SAY", "ASK", "DONE")
+
+
+def strip_fences(text):
+    t = text.strip()
+    if t.startswith("```"):
+        lines = t.splitlines()
+        lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        t = "\n".join(lines).strip()
+    return t
+
+
+def _is_header(line):
+    """A header line starts with an UPPERCASE protocol verb (e.g. 'WRITE x')."""
+    parts = line.strip().split(None, 1)
+    if not parts:
+        return None
+    tok = parts[0].rstrip(":")
+    # Case-sensitive: the model emits uppercase verbs, so this avoids matching
+    # ordinary prose like "Read the file" or "run the tests".
+    if tok in VERBS:
+        return tok, parts[1].strip() if len(parts) > 1 else ""
+    return None
+
+
+def _body_terminator(line):
+    """True if `line` looks like a *second* action tacked onto a body, so the
+    body should end before it. Stricter than _is_header to avoid mistaking code
+    constants (LIST = [...], DONE = True) for actions."""
+    s = line.strip()
+    parts = s.split(None, 1)
+    if not parts:
+        return False
+    tok = parts[0].rstrip(":")
+    if tok not in VERBS:
+        return False
+    rest = parts[1] if len(parts) > 1 else ""
+    if tok in ("RUN", "DONE"):
+        return "=" not in rest  # bare, or DONE <summary> — not an assignment
+    if tok in ("READ", "LIST", "WRITE", "EDIT"):
+        # A path-like single token (no spaces, no assignment/call characters).
+        return bool(rest) and not any(ch in rest for ch in " =(")
+    return False  # SAY/ASK args are prose; don't terminate a body on them
+
+
+def parse_actions(text):
+    """Return a list of (verb, arg, body) actions in `text`. Tolerates prose
+    before the first action; bodies run until the next *real* action line so a
+    tacked-on action can't leak into a file/command. Falls back to one SAY."""
+    t = strip_fences(text)
+    lines = t.splitlines()
+    starts = []
+    for i, line in enumerate(lines):
+        if not starts:
+            if _is_header(line):  # first action may be SAY with prose
+                starts.append(i)
+        elif _body_terminator(line):  # subsequent actions: stricter, code-safe
+            starts.append(i)
+    if not starts:
+        return [("SAY", t, "")]
+    actions = []
+    for k, i in enumerate(starts):
+        end = starts[k + 1] if k + 1 < len(starts) else len(lines)
+        verb, arg = _is_header(lines[i])
+        body = "\n".join(lines[i + 1:end])
+        if body.strip().startswith("```"):
+            body = strip_fences(body)
+        actions.append((verb, arg, body))
+    return actions
+
+
+def parse_action(text):
+    """First action only (kept for convenience)."""
+    return parse_actions(text)[0]
+
+
+# ---- destructive guard -----------------------------------------------------
+
+DESTRUCTIVE_RE = re.compile(
+    r"""\b(rm|rmdir|shred|unlink|mkfs(\.[a-z0-9]+)?|wipefs|fdisk|parted|sfdisk)\b
+        | \bfind\b[^|;&]*\s-delete\b
+        | \bdd\b[^|;&]*\bof=/dev/
+        | >\s*/dev/(sd|nvme|hd|mmc|loop)""",
+    re.VERBOSE,
+)
+
+
+def looks_destructive(cmd):
+    return bool(DESTRUCTIVE_RE.search(cmd))
+
+
+# ---- helpers ---------------------------------------------------------------
+
+def truncate(s, limit=OUTPUT_LIMIT):
+    if len(s) <= limit:
+        return s
+    half = limit // 2
+    return s[:half] + f"\n…[truncated {len(s) - limit} chars]…\n" + s[-half:]
+
+
+def safe_path(path):
+    """Resolve a path and refuse to escape the project directory."""
+    root = os.path.realpath(os.getcwd())
+    full = os.path.realpath(os.path.join(root, path))
+    if full != root and not full.startswith(root + os.sep):
+        return None
+    return full
+
+
+# ---- action executors (return observation string for the model) ------------
+
+def do_read(arg):
+    full = safe_path(arg)
+    if full is None:
+        return f"refused: '{arg}' is outside the project directory"
+    try:
+        with open(full, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except FileNotFoundError:
+        return f"error: no such file: {arg}"
+    except IsADirectoryError:
+        return f"error: {arg} is a directory (use LIST)"
+    except OSError as e:
+        return f"error reading {arg}: {e}"
+    numbered = "\n".join(
+        f"{i:>5}\t{line}" for i, line in enumerate(content.splitlines(), 1)
+    )
+    return f"contents of {arg} ({content.count(chr(10)) + 1} lines):\n{truncate(numbered)}"
+
+
+def do_list(arg):
+    arg = arg or "."
+    full = safe_path(arg)
+    if full is None:
+        return f"refused: '{arg}' is outside the project directory"
+    if not os.path.exists(full):
+        return f"error: no such path: {arg}"
+    if os.path.isfile(full):
+        return f"{arg} is a file (use READ)"
+    try:
+        entries = sorted(os.listdir(full))
+    except OSError as e:
+        return f"error listing {arg}: {e}"
+    out = []
+    for name in entries:
+        if name == ".git":
+            out.append("  .git/  (skipped)")
+            continue
+        p = os.path.join(full, name)
+        out.append(f"  {name}/" if os.path.isdir(p) else f"  {name}")
+    listing = "\n".join(out) if out else "  (empty)"
+    return f"contents of {arg}/ ({len(entries)} entries):\n{truncate(listing)}"
+
+
+def do_run(body, auto):
+    """Returns (returncode, observation). returncode is None when not run."""
+    cmd = body.strip()
+    if not cmd:
+        return None, "error: empty RUN body"
+    print(cyan(f"$ {cmd}"), file=sys.stderr)
+    if looks_destructive(cmd):
+        print(red("! this command deletes or overwrites data"), file=sys.stderr)
+        if not confirm("run?", default_yes=False):
+            return None, "user declined to run this command"
+    elif not auto:
+        if not confirm("run?", default_yes=True):
+            return None, "user declined to run this command"
+    try:
+        proc = subprocess.run(
+            ["bash", "-c", cmd],
+            capture_output=True,
+            text=True,
+            timeout=RUN_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, f"command timed out after {RUN_TIMEOUT}s"
+    out = (proc.stdout or "") + (proc.stderr or "")
+    # Echo output to the user so the session feels live.
+    if out.strip():
+        print(dim(out.rstrip()), file=sys.stderr)
+    print(dim(f"[exit {proc.returncode}]"), file=sys.stderr)
+    return proc.returncode, f"exit={proc.returncode}\noutput:\n{truncate(out)}"
+
+
+def do_write(arg, body, auto):
+    full = safe_path(arg)
+    if full is None:
+        return f"refused: '{arg}' is outside the project directory"
+    exists = os.path.exists(full)
+    verb = "overwrite" if exists else "create"
+    nlines = body.count("\n") + 1 if body else 0
+    print(cyan(f"WRITE {arg}") + dim(f"  ({verb}, {nlines} lines)"), file=sys.stderr)
+    preview = "\n".join(body.splitlines()[:15])
+    print(dim(preview), file=sys.stderr)
+    if nlines > 15:
+        print(dim(f"… (+{nlines - 15} more lines)"), file=sys.stderr)
+    if not auto and not confirm(f"{verb} {arg}?", default_yes=True):
+        return f"user declined to {verb} {arg}"
+    try:
+        os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(body if body.endswith("\n") else body + "\n")
+    except OSError as e:
+        return f"error writing {arg}: {e}"
+    print(green(f"  {verb}d {arg}"), file=sys.stderr)
+    return f"ok: {verb}d {arg} ({nlines} lines)"
+
+
+EDIT_BLOCK_RE = re.compile(
+    r"<{3,}\s*SEARCH\s*\n(.*?)\n={3,}\s*\n(.*?)\n>{3,}\s*REPLACE",
+    re.DOTALL,
+)
+
+
+def do_edit(arg, body, auto):
+    full = safe_path(arg)
+    if full is None:
+        return f"refused: '{arg}' is outside the project directory"
+    if not os.path.exists(full):
+        return f"error: no such file: {arg} (use WRITE to create it)"
+    blocks = EDIT_BLOCK_RE.findall(body)
+    if not blocks:
+        return ("error: no SEARCH/REPLACE blocks found. Use the exact format:\n"
+                "<<<<<<< SEARCH\\n...\\n=======\\n...\\n>>>>>>> REPLACE")
+    try:
+        with open(full, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError as e:
+        return f"error reading {arg}: {e}"
+
+    new_content = content
+    applied = 0
+    failed = []
+    for search, replace in blocks:
+        if search == "":
+            failed.append("(empty SEARCH)")
+            continue
+        if search not in new_content:
+            failed.append(search.splitlines()[0] if search.splitlines() else search)
+            continue
+        new_content = new_content.replace(search, replace, 1)
+        applied += 1
+
+    if applied == 0:
+        return ("edit failed: no SEARCH block matched the file. The SEARCH text "
+                "must match the current contents exactly. READ the file again.\n"
+                f"unmatched: {failed}")
+
+    print(cyan(f"EDIT {arg}") + dim(f"  ({applied} change(s))"), file=sys.stderr)
+    if not auto and not confirm(f"apply edit to {arg}?", default_yes=True):
+        return f"user declined to edit {arg}"
+    try:
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(new_content)
+    except OSError as e:
+        return f"error writing {arg}: {e}"
+    print(green(f"  edited {arg} ({applied} change(s))"), file=sys.stderr)
+    msg = f"ok: applied {applied} edit(s) to {arg}"
+    if failed:
+        msg += f"; {len(failed)} block(s) did not match and were skipped: {failed}"
+    return msg
+
+
+# ---- history trimming ------------------------------------------------------
+
+def trim_history(messages):
+    """Keep the system prompt + most recent messages within a rough char budget."""
+    def total():
+        return sum(len(m["content"]) for m in messages)
+    while total() > HISTORY_BUDGET and len(messages) > 3:
+        # Drop the oldest non-system message (index 1).
+        del messages[1]
+    return messages
+
+
+# ---- one request ("turn" of the outer REPL) --------------------------------
+
+def project_overview():
+    try:
+        entries = sorted(os.listdir("."))
+    except OSError:
+        entries = []
+    shown = [e + ("/" if os.path.isdir(e) else "") for e in entries if e != ".git"][:40]
+    return "Top-level entries: " + (", ".join(shown) if shown else "(empty)")
+
+
+def _finish(actions):
+    """Print a DONE summary (if any) and signal completion."""
+    for v, a, _ in actions:
+        if v == "DONE":
+            print(green(f"✓ {a}" if a else "✓ done"))
+            return
+    print(green("✓ done"))
+
+
+def run_request(base_url, api_key, messages, user_text, auto):
+    messages.append({"role": "user", "content": user_text})
+    last_reply = None
+    last_run_failed = False   # did the most recent RUN exit non-zero?
+    pushbacks = 0             # times we've blocked a premature DONE
+    for _ in range(MAX_STEPS):
+        trim_history(messages)
+        reply = call_llm(base_url, api_key, messages)
+        actions = parse_actions(reply)
+        if DEBUG:
+            print(dim("─" * 60), file=sys.stderr)
+            print(dim(f"[raw reply]\n{reply}"), file=sys.stderr)
+            print(dim(f"[parsed] {[(v, a) for v, a, _ in actions]}"), file=sys.stderr)
+        messages.append({"role": "assistant", "content": reply})
+
+        # Safety net: an identical reply twice in a row means the model is
+        # stuck repeating itself — stop rather than burn the step budget.
+        if reply == last_reply:
+            _finish(actions)
+            return
+        last_reply = reply
+
+        # Execute EVERY action in the reply, in order. Models often batch
+        # several (e.g. EDIT + WRITE + RUN) into one message; running only the
+        # first would silently drop the rest.
+        observations = []
+        for verb, arg, body in actions:
+            if verb == "DONE":
+                # Block a premature DONE while the last command failed — the
+                # task isn't verified. Nudge the model to fix it (a few times).
+                if last_run_failed and pushbacks < 2:
+                    pushbacks += 1
+                    observations.append(
+                        "Not done yet: the last command exited non-zero, so the "
+                        "task isn't verified. Diagnose and fix it (create any "
+                        "missing files, correct errors), run the check again, and "
+                        "only DONE once it succeeds.")
+                    break  # ignore the rest of this reply; send the nudge back
+                _finish([(verb, arg, body)])
+                return
+
+            if verb == "SAY":
+                print(arg if arg else body)
+                continue
+
+            if verb == "ASK":
+                print(yellow(f"? {arg}"))
+                line = tty_prompt("your answer> ")
+                answer = (line or "").strip() or "(no answer; use your best judgement)"
+                observations.append(f"[ASK] user answered: {answer}")
+                continue
+
+            if verb == "READ":
+                obs = do_read(arg)
+            elif verb == "LIST":
+                obs = do_list(arg)
+            elif verb == "RUN":
+                rc, obs = do_run(body, auto)
+                if rc is not None:
+                    last_run_failed = rc != 0
+            elif verb == "WRITE":
+                obs = do_write(arg, body, auto)
+            elif verb == "EDIT":
+                obs = do_edit(arg, body, auto)
+            else:
+                obs = "error: unknown action"
+            label = f"{verb} {arg}".strip()
+            observations.append(f"[{label}]\n{obs}")
+
+        # Feed all observations from this reply back in one message. If the
+        # reply was pure narration (only SAY), nudge the model to continue.
+        if observations:
+            messages.append({"role": "user", "content": "\n\n".join(observations)})
+        else:
+            messages.append({"role": "user", "content": "(continue)"})
+
+    print(yellow("(reached step limit for this request; type more to continue)"))
+
+
+# ---- REPL ------------------------------------------------------------------
+
+HELP = """\
+Commands:
+  /help            show this help
+  /auto [on|off]   toggle auto-approve for edits & commands (currently: {auto})
+  /reset           clear the conversation history
+  /cwd             show the working directory
+  exit | quit      leave ai-code (Ctrl-D also works)
+Anything else is a coding request for the agent."""
+
+
+def repl(base_url, api_key, auto):
+    cwd = os.getcwd()
+    print(bold("ai-code") + dim(f"  ·  {MODEL}  ·  {cwd}"))
+    print(dim(f"connected to {base_url}"))
+    print(dim("Describe a coding task. /help for commands, Ctrl-D to quit.\n"))
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"Project directory: {cwd}\n{project_overview()}\n"
+                                     "Acknowledge with a one-line SAY, then wait for my request."},
+    ]
+    # Prime the model with the project context (one cheap turn).
+    primer = call_llm(base_url, api_key, messages)
+    pv, pa, _ = parse_action(primer)
+    messages.append({"role": "assistant", "content": primer})
+    if pv == "SAY" and pa:
+        print(dim(f"· {pa}\n"))
+
+    while True:
+        try:
+            line = input(cyan("code> "))
+        except EOFError:
+            print()
+            break
+        except KeyboardInterrupt:
+            print()
+            continue
+        text = line.strip()
+        if not text:
+            continue
+        if text in ("exit", "quit"):
+            break
+        if text == "/help":
+            print(HELP.format(auto="on" if auto else "off"))
+            continue
+        if text == "/cwd":
+            print(os.getcwd())
+            continue
+        if text == "/reset":
+            messages = messages[:1]
+            print(dim("(history cleared)"))
+            continue
+        if text.startswith("/auto"):
+            arg = text[5:].strip().lower()
+            auto = True if arg == "on" else False if arg == "off" else not auto
+            print(dim(f"auto-approve {'on' if auto else 'off'}"))
+            continue
+        try:
+            run_request(base_url, api_key, messages, text, auto)
+        except KeyboardInterrupt:
+            print(yellow("\n(interrupted)"))
+
+
+# ---- main ------------------------------------------------------------------
+
+def usage():
+    print(
+        "usage: ai-code [-y] [request]\n"
+        "\n"
+        "  (no request)   start the interactive coding REPL in the current dir\n"
+        "  request        run a single coding request, then exit\n"
+        "  -y, --auto     auto-approve edits and commands (no per-action prompt)\n"
+        "\n"
+        "config: $AI_CODE_BASE_URL / $AI_CODE_API_KEY, or files under\n"
+        "        ~/.config/ai-bash/ (written by install.sh after deploying Modal).\n"
+        "\n"
+        "examples:\n"
+        "  ai-code\n"
+        "  ai-code \"add a --json flag to cli.py and update the tests\"\n"
+        "  ai-code -y \"fix the failing test in test_parser.py\"\n",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
+def main(argv):
+    args = argv[1:]
+    auto = False
+    while args and args[0].startswith("-") and args[0] != "-":
+        flag = args.pop(0)
+        if flag in ("-y", "--auto"):
+            auto = True
+        elif flag in ("-h", "--help"):
+            usage()
+        else:
+            die(f"unknown flag: {flag}", 2)
+
+    base_url, api_key = resolve_config()
+
+    if args:
+        # One-shot mode.
+        messages = [{"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": f"Project directory: {os.getcwd()}\n"
+                                                   f"{project_overview()}"}]
+        run_request(base_url, api_key, messages, " ".join(args), auto)
+        return 0
+
+    repl(base_url, api_key, auto)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

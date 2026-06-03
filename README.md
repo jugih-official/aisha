@@ -31,8 +31,12 @@ The latest stable release of Python is 3.13.x (released Oct 2024).
 
 The installer:
 
-- copies `ai` to `/usr/local/bin/ai` (uses `sudo`),
+- copies `ai`, `ai-browser`, `ai-desktop`, and `ai-code` to
+  `/usr/local/bin/` (uses `sudo`),
 - optionally installs browser automation tools (Playwright + Chromium),
+- optionally sets up the **`ai-code`** coding agent's GPU backend on
+  [Modal](https://modal.com) (deploys a local open-weights LLM — see
+  [Coding agent](#coding-agent-ai-code) below),
 - if you don't already have a `DEEPSEEK_API_KEY` in your environment,
   prompts for one and saves it to `~/.config/ai-bash/api-key` (mode `600`),
 - optionally also writes `/etc/ai-bash/api-key` so `sudo ai ...` works
@@ -199,6 +203,88 @@ curl -s https://example.com/api | ai what fields does this response have?
 
 Stdin is capped at 50 KB; longer input is truncated head + tail with
 a `[…truncated N chars…]` marker.
+
+## Coding agent (ai-code)
+
+`ai-code` is an interactive coding agent — like Claude Code or Codex, but
+powered by an **open-weights LLM running on your own GPUs**. Instead of a
+hosted API, it talks to a [vLLM](https://docs.vllm.ai) server you deploy to
+[Modal](https://modal.com), which spins a GPU up on demand and scales it back
+to zero ~2 minutes after you stop (so you only pay while it's working).
+
+```sh
+cd my-project
+ai-code                                  # interactive coding REPL
+ai-code "add a --json flag to cli.py and update the tests"   # one-shot
+ai-code -y "fix the failing test in test_parser.py"          # auto-approve
+```
+
+Inside the REPL you just describe what you want; the agent reads files, edits
+them, and runs commands in the current project to get it done:
+
+```
+code> add docstrings to every function in utils.py, then run the tests
+$ pytest -q
+......                                                          [100%]
+✓ Added docstrings to 6 functions; tests still pass.
+code> /auto on        # stop confirming each edit/command
+code> exit
+```
+
+REPL commands: `/help`, `/auto [on|off]`, `/reset`, `/cwd`, `exit`.
+
+By default every file write/edit and every command is shown and confirmed
+(press Enter to accept). `/auto on` or `-y` runs without prompts. Truly
+destructive commands always require an explicit `y`.
+
+### Setting up the GPU backend
+
+The installer offers to do this for you. It will:
+
+1. install the [`modal`](https://modal.com) CLI if missing,
+2. authenticate you with Modal (`modal token new`; free signup),
+3. generate an API key and store it as a Modal secret (`ai-code-llm-key`),
+4. deploy `modal/llm_modal.py` — a vLLM OpenAI-compatible server,
+5. save the endpoint + key to `~/.config/ai-bash/code-url` and `code-key`.
+
+The default model is **Qwen2.5-32B-Instruct-AWQ** on an **L40S** GPU (48 GB) —
+the strongest model that fits comfortably. To use a different GPU/model, set
+env vars when deploying, e.g.:
+
+```sh
+LLM_GPU=A10 LLM_MODEL_NAME=Qwen/Qwen2.5-7B-Instruct \
+    modal deploy modal/llm_modal.py
+```
+
+The first request after an idle period pays a cold start (GPU boot + model
+load, ~1–2 min once weights are cached); `ai-code` waits through it
+automatically. Stop the backend any time with `modal app stop ai-code-llm`.
+
+`ai-code` itself is stdlib-only Python and reads its endpoint/key from
+`$AI_CODE_BASE_URL` / `$AI_CODE_API_KEY` or the files under
+`~/.config/ai-bash/`.
+
+### How ai-code drives the project
+
+The model emits one action per turn from a small protocol; `ai-code` runs it
+and feeds the result back:
+
+| Action          | Behavior                                             |
+|-----------------|------------------------------------------------------|
+| `READ <path>`   | Read a file (contents returned to the model).        |
+| `LIST <path>`   | List a directory.                                    |
+| `RUN` + cmd     | Run shell command(s) in the project; output fed back.|
+| `WRITE <path>`  | Create/overwrite a whole file.                       |
+| `EDIT <path>`   | Apply search/replace edits to a file.                |
+| `SAY <text>`    | Progress note / explanation to you.                  |
+| `ASK <q>`       | Ask you a question and wait.                          |
+| `DONE <summary>`| Finished — control returns to you.                   |
+
+File access is confined to the project directory, and the same destructive-
+command guard as `ai` applies.
+
+You can also just ask `ai` to start it: `ai help me code in this project`
+delegates to `ai-code`.
 
 ## How it works
 
