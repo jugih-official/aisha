@@ -660,22 +660,24 @@ def repl(base_url, api_key, auto):
     cwd = os.getcwd()
     print(bold("ai-code") + dim(f"  ·  {MODEL}  ·  {cwd}"))
     print(dim(f"connected to {base_url}"))
-    print(dim("Describe a coding task. /help for commands, Ctrl-D to quit.\n"))
+    print(dim("Describe a coding task. /help for commands, Ctrl-D to quit."))
+    print(dim("(the first request can take ~1–2 min while the GPU warms up.)\n"))
+    # Seed the project context directly — no LLM round-trip here, so the prompt
+    # appears immediately. (A blocking call before the first input() would make
+    # the terminal echo your keystrokes without ever submitting them.)
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Project directory: {cwd}\n{project_overview()}\n"
-                                     "Acknowledge with a one-line SAY, then wait for my request."},
+        {"role": "system", "content": f"Project directory: {cwd}\n{project_overview()}"},
     ]
-    # Prime the model with the project context (one cheap turn).
-    primer = call_llm(base_url, api_key, messages)
-    pv, pa, _ = parse_action(primer)
-    messages.append({"role": "assistant", "content": primer})
-    if pv == "SAY" and pa:
-        print(dim(f"· {pa}\n"))
 
     while True:
         try:
-            line = input(cyan("code> "))
+            # Write the colored prompt ourselves, then read a plain line. Passing
+            # ANSI codes straight to input() can confuse line editing on some
+            # terminals; this keeps Enter reliably submitting the line.
+            sys.stdout.write(cyan("code> "))
+            sys.stdout.flush()
+            line = input()
         except EOFError:
             print()
             break
@@ -694,7 +696,11 @@ def repl(base_url, api_key, auto):
             print(os.getcwd())
             continue
         if text == "/reset":
-            messages = messages[:1]
+            # Keep the leading system messages (prompt + project context).
+            keep = 0
+            while keep < len(messages) and messages[keep]["role"] == "system":
+                keep += 1
+            messages = messages[:keep]
             print(dim("(history cleared)"))
             continue
         if text.startswith("/auto"):
