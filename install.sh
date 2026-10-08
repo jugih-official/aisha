@@ -7,7 +7,7 @@ BROWSER_BIN_TARGET=/usr/local/bin/ai-browser
 DESKTOP_BIN_TARGET=/usr/local/bin/ai-desktop
 CODE_BIN_TARGET=/usr/local/bin/ai-code
 CFG_DIR_USER="$HOME/.config/ai-bash"
-CFG_KEY_USER="$CFG_DIR_USER/api-key"
+CFG_KEY_USER="$CFG_DIR_USER/anthropic-api-key"
 # ai-code (local-LLM coding agent) backend config, written after deploy.
 CODE_URL_USER="$CFG_DIR_USER/code-url"
 CODE_KEY_USER="$CFG_DIR_USER/code-key"
@@ -65,22 +65,22 @@ fi
 
 # --- API key handling -------------------------------------------------------
 have_key=0
-if [ -n "${DEEPSEEK_API_KEY:-}" ]; then
+if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
     have_key=1
-    dim "  \$DEEPSEEK_API_KEY is set in your environment."
+    dim "  \$ANTHROPIC_API_KEY is set in your environment."
 elif [ -s "$CFG_KEY_USER" ]; then
     have_key=1
     dim "  user key file already exists at $CFG_KEY_USER"
-elif [ -s /etc/ai-bash/api-key ]; then
+elif [ -s /etc/ai-bash/anthropic-api-key ]; then
     have_key=1
-    dim "  system key file already exists at /etc/ai-bash/api-key"
+    dim "  system key file already exists at /etc/ai-bash/anthropic-api-key"
 fi
 
 if [ "$have_key" -eq 0 ]; then
     echo
-    yellow "No DeepSeek API key found."
-    echo "Get one at https://platform.deepseek.com/  (starts with 'sk-')"
-    read -r -p "Paste your DeepSeek API key now (or press Enter to skip): " entered_key
+    yellow "No Anthropic API key found."
+    echo "Get one at https://platform.claude.com/  (starts with 'sk-ant-')"
+    read -r -p "Paste your Anthropic API key now (or press Enter to skip): " entered_key
     if [ -n "$entered_key" ]; then
         # user copy — readable by `ai` as your user
         mkdir -p "$CFG_DIR_USER"
@@ -91,19 +91,19 @@ if [ "$have_key" -eq 0 ]; then
 
         # system copy — readable only by root, so `sudo ai` works too
         echo
-        read -r -p "Also install key at /etc/ai-bash/api-key so 'sudo ai' works? [Y/n] " yn
+        read -r -p "Also install key at /etc/ai-bash/anthropic-api-key so 'sudo ai' works? [Y/n] " yn
         case "${yn,,}" in
             n|no) dim "  skipped system copy. Use 'sudo -E ai ...' to pass your env." ;;
             *)
                 sudo install -d -m 0755 /etc/ai-bash
-                printf '%s\n' "$entered_key" | sudo tee /etc/ai-bash/api-key >/dev/null
-                sudo chmod 600 /etc/ai-bash/api-key
-                sudo chown root:root /etc/ai-bash/api-key
-                green "  saved system key to /etc/ai-bash/api-key (root:root, mode 600)"
+                printf '%s\n' "$entered_key" | sudo tee /etc/ai-bash/anthropic-api-key >/dev/null
+                sudo chmod 600 /etc/ai-bash/anthropic-api-key
+                sudo chown root:root /etc/ai-bash/anthropic-api-key
+                green "  saved system key to /etc/ai-bash/anthropic-api-key (root:root, mode 600)"
                 ;;
         esac
     else
-        yellow "  skipped. Set \$DEEPSEEK_API_KEY or write the key to $CFG_KEY_USER later."
+        yellow "  skipped. Set \$ANTHROPIC_API_KEY or write the key to $CFG_KEY_USER later."
     fi
 fi
 
@@ -356,6 +356,6 @@ if [ -s "$CODE_URL_USER" ]; then
 fi
 echo
 dim "Notes:"
-dim "  - 'ai ...'      reads the key from \$DEEPSEEK_API_KEY or ~/.config/ai-bash/api-key"
-dim "  - 'sudo ai ...' reads the key from /etc/ai-bash/api-key (no need for 'sudo -E')"
+dim "  - 'ai ...'      reads the key from \$ANTHROPIC_API_KEY or ~/.config/ai-bash/anthropic-api-key"
+dim "  - 'sudo ai ...' reads the key from /etc/ai-bash/anthropic-api-key (no need for 'sudo -E')"
 dim "  - 'ai-code'     uses the Modal LLM endpoint in ~/.config/ai-bash/code-url"

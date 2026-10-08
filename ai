@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ai — natural-language bash assistant powered by DeepSeek.
+"""ai — natural-language bash assistant powered by Claude.
 
 The model speaks a tiny line-prefixed protocol:
 
@@ -21,19 +21,25 @@ import sys
 import urllib.request
 import urllib.error
 
-API_BASE_URL = "https://api.deepseek.com"
-API_URL = f"{API_BASE_URL}/chat/completions"
-MODEL = "deepseek-v4-flash"
+API_BASE_URL = "https://api.anthropic.com"
+API_URL = f"{API_BASE_URL}/v1/messages"
+API_VERSION = "2023-06-01"
+# Lets the API retry on another Claude model when a safety classifier
+# declines a request (the "fallbacks" field in the payload).
+API_BETA = "server-side-fallback-2026-07-01"
+MODEL = "claude-sonnet-5-5"
+EFFORT = "low"             # low | medium | high | xhigh | max
+MAX_TOKENS = 16000         # per-reply ceiling, thinking included
 MAX_TURNS = 8
 FETCH_OUTPUT_LIMIT = 8000  # chars of FETCH output sent back to the model
 STDIN_LIMIT = 50_000       # chars of piped stdin attached to the prompt
 
-# Where to look for the API key if $DEEPSEEK_API_KEY is unset. First
+# Where to look for the API key if $ANTHROPIC_API_KEY is unset. First
 # match wins. The user-scoped path is checked before the system one so
 # personal keys override a shared one.
 API_KEY_FILES = [
-    os.path.expanduser("~/.config/ai-bash/api-key"),
-    "/etc/ai-bash/api-key",
+    os.path.expanduser("~/.config/ai-bash/anthropic-api-key"),
+    "/etc/ai-bash/anthropic-api-key",
 ]
 
 SYSTEM_PROMPT = r"""You are a senior GNU/Linux bash and sysadmin expert helping the user from their terminal. You can both *execute* shell commands on their machine and *answer* questions by gathering information (including from the web). You can also operate remote systems via SSH and similar tools when requested.
@@ -236,21 +242,32 @@ def dim(s: str) -> str:
     return f"\033[2m{s}\033[0m"
 
 
-# ---- DeepSeek call ---------------------------------------------------------
+# ---- Claude call -----------------------------------------------------------
 
-def call_deepseek(messages, api_key: str) -> str:
+def call_claude(messages, api_key: str) -> str:
     payload = {
         "model": MODEL,
+        "max_tokens": MAX_TOKENS,
+        # The prompt is identical on every call, so let the API cache it.
+        "system": [
+            {
+                "type": "text",
+                "text": SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
         "messages": messages,
-        "temperature": 0.2,
-        "stream": False,
+        "output_config": {"effort": EFFORT},
+        "fallbacks": "default",
     }
     req = urllib.request.Request(
         API_URL,
         data=json.dumps(payload).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": API_VERSION,
+            "anthropic-beta": API_BETA,
+            "content-type": "application/json",
         },
         method="POST",
     )
@@ -259,13 +276,23 @@ def call_deepseek(messages, api_key: str) -> str:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        die(f"DeepSeek HTTP {e.code}: {body}")
+        die(f"Claude HTTP {e.code}: {body}")
     except urllib.error.URLError as e:
         die(f"network error: {e.reason}")
 
+    # A safety-classifier decline is an HTTP 200 with little or no content.
+    if data.get("stop_reason") == "refusal":
+        details = data.get("stop_details") or {}
+        reason = details.get("explanation") or details.get("category") or "declined by Claude"
+        print(f"refused: {reason}", file=sys.stderr)
+        sys.exit(3)
+
+    # content is a list of blocks; thinking blocks can precede the text.
     try:
-        return data["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError):
+        return "".join(
+            b["text"] for b in data["content"] if b.get("type") == "text"
+        ).strip()
+    except (KeyError, TypeError, AttributeError):
         die(f"unexpected response: {data}")
 
 
@@ -364,7 +391,7 @@ def usage():
         "  -v    verbose: also show FETCH steps, outputs, and stdin info\n"
         "\n"
         "env:\n"
-        "  DEEPSEEK_API_KEY   required\n"
+        "  ANTHROPIC_API_KEY  API key (else ~/.config/ai-bash/anthropic-api-key)\n"
         "\n"
         "stdin:\n"
         "  If data is piped in, it is attached to your prompt as context.\n"
@@ -405,11 +432,12 @@ def main(argv):
 
     prompt = " ".join(args)
 
-    api_key = os.environ.get("DEEPSEEK_API_KEY") or read_key_file()
+    api_key = os.environ.get("ANTHROPIC_API_KEY") or read_key_file()
     if not api_key:
         die(
-            "no API key found. Set $DEEPSEEK_API_KEY or write the key to "
-            "~/.config/ai-bash/api-key (or /etc/ai-bash/api-key)."
+            "no API key found. Set $ANTHROPIC_API_KEY or write the key to "
+            "~/.config/ai-bash/anthropic-api-key "
+            "(or /etc/ai-bash/anthropic-api-key)."
         )
 
     piped = read_piped_stdin()
@@ -428,12 +456,11 @@ def main(argv):
         user_content = prompt
 
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
     ]
 
     for turn in range(MAX_TURNS):
-        reply = call_deepseek(messages, api_key)
+        reply = call_claude(messages, api_key)
         kind, body = parse_action(reply)
 
         if kind == "REFUSE":

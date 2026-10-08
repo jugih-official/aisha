@@ -50,14 +50,20 @@ DEFAULT_UA = os.environ.get(
 DEFAULT_LOCALE = os.environ.get("AI_BROWSER_LOCALE", "en-US")
 DEFAULT_TIMEZONE = os.environ.get("AI_BROWSER_TZ", "Europe/Helsinki")
 
-# DeepSeek wiring for interactive (--interactive) steering — translates the
+# Claude wiring for interactive (--interactive) steering — translates the
 # user's natural-language instructions into more JSON steps that run on the
 # already-open page. Mirrors the key-file lookup used by `ai`.
-DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
-DEEPSEEK_MODEL = "deepseek-v4-flash"
+CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
+CLAUDE_API_VERSION = "2023-06-01"
+# Lets the API retry on another Claude model when a safety classifier
+# declines a request (the "fallbacks" field in the payload).
+CLAUDE_API_BETA = "server-side-fallback-2026-07-01"
+CLAUDE_MODEL = "claude-sonnet-5-5"
+CLAUDE_EFFORT = "low"      # low | medium | high | xhigh | max
+CLAUDE_MAX_TOKENS = 16000  # per-reply ceiling, thinking included
 API_KEY_FILES = [
-    os.path.expanduser("~/.config/ai-bash/api-key"),
-    "/etc/ai-bash/api-key",
+    os.path.expanduser("~/.config/ai-bash/anthropic-api-key"),
+    "/etc/ai-bash/anthropic-api-key",
 ]
 
 INTERACTIVE_SYSTEM_PROMPT = """You translate a user's natural-language instructions into JSON browser-automation steps that run on an already-open Chromium page.
@@ -93,13 +99,17 @@ class StepError(Exception):
     """Raised when a step is malformed. Caller decides whether to die or recover."""
 
 
+class ClaudeRefusal(Exception):
+    """Claude (or a safety classifier in front of it) declined the request."""
+
+
 def die(msg: str, code: int = 1) -> None:
     print(f"ai-browser: {msg}", file=sys.stderr)
     sys.exit(code)
 
 
 def _read_api_key() -> str | None:
-    key = os.environ.get("DEEPSEEK_API_KEY")
+    key = os.environ.get("ANTHROPIC_API_KEY")
     if key:
         return key
     for path in API_KEY_FILES:
@@ -113,25 +123,45 @@ def _read_api_key() -> str | None:
     return None
 
 
-def _call_deepseek(messages: list[dict[str, str]], api_key: str) -> str:
+def _call_claude(messages: list[dict[str, str]], api_key: str) -> str:
     payload = {
-        "model": DEEPSEEK_MODEL,
+        "model": CLAUDE_MODEL,
+        "max_tokens": CLAUDE_MAX_TOKENS,
+        # The prompt is identical on every call, so let the API cache it.
+        "system": [
+            {
+                "type": "text",
+                "text": INTERACTIVE_SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
         "messages": messages,
-        "temperature": 0.2,
-        "stream": False,
+        "output_config": {"effort": CLAUDE_EFFORT},
+        "fallbacks": "default",
     }
     req = urllib.request.Request(
-        DEEPSEEK_API_URL,
+        CLAUDE_API_URL,
         data=json.dumps(payload).encode("utf-8"),
         headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": CLAUDE_API_VERSION,
+            "anthropic-beta": CLAUDE_API_BETA,
+            "content-type": "application/json",
         },
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=120) as resp:
         data = json.loads(resp.read().decode("utf-8"))
-    return data["choices"][0]["message"]["content"].strip()
+    # A safety-classifier decline is an HTTP 200 with little or no content.
+    if data.get("stop_reason") == "refusal":
+        details = data.get("stop_details") or {}
+        raise ClaudeRefusal(
+            details.get("explanation") or details.get("category") or "declined by Claude"
+        )
+    # content is a list of blocks; thinking blocks can precede the text.
+    return "".join(
+        b["text"] for b in data["content"] if b.get("type") == "text"
+    ).strip()
 
 
 def _strip_fences(text: str) -> str:
@@ -316,9 +346,7 @@ def _interactive_loop(page, browser, api_key: str, timeout_ms: int) -> None:
         file=sys.stderr,
     )
 
-    history: list[dict[str, str]] = [
-        {"role": "system", "content": INTERACTIVE_SYSTEM_PROMPT}
-    ]
+    history: list[dict[str, str]] = []
 
     try:
         while True:
@@ -355,14 +383,21 @@ def _interactive_loop(page, browser, api_key: str, timeout_ms: int) -> None:
                 "content": f"{ctx}User instruction: {instruction}",
             })
             # Keep the trailing-turn window small so the request stays cheap.
-            if len(history) > 13:  # system + 12 turns
-                history = [history[0]] + history[-12:]
+            if len(history) > 12:  # trailing turns kept
+                history = history[-12:]
+                # The API requires the conversation to open with a user turn.
+                while history[0]["role"] != "user":
+                    history.pop(0)
 
             try:
-                reply = _call_deepseek(history, api_key)
+                reply = _call_claude(history, api_key)
+            except ClaudeRefusal as e:
+                tty.write(f"refused: {e}\n")
+                history.pop()
+                continue
             except urllib.error.HTTPError as e:
                 body = e.read().decode("utf-8", errors="replace")
-                tty.write(f"ai-browser: deepseek HTTP {e.code}: {body}\n")
+                tty.write(f"ai-browser: claude HTTP {e.code}: {body}\n")
                 history.pop()
                 continue
             except urllib.error.URLError as e:
@@ -472,8 +507,8 @@ def run_steps(
             api_key = _read_api_key()
             if not api_key:
                 print(
-                    "ai-browser: interactive mode needs $DEEPSEEK_API_KEY or "
-                    "~/.config/ai-bash/api-key — skipping steering REPL.",
+                    "ai-browser: interactive mode needs $ANTHROPIC_API_KEY or "
+                    "~/.config/ai-bash/anthropic-api-key — skipping steering REPL.",
                     file=sys.stderr,
                 )
             else:

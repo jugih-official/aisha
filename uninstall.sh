@@ -55,7 +55,7 @@ fi
 # want to keep for a future reinstall.
 echo
 if [ -e "$CFG_DIR_USER" ] || [ -e "$CFG_DIR_SYS" ]; then
-    yellow "Config files exist (DeepSeek key, and any ai-code endpoint/key)."
+    yellow "Config files exist (Anthropic key, and any ai-code endpoint/key)."
     [ -e "$CFG_DIR_USER" ] && echo "  - $CFG_DIR_USER"
     [ -e "$CFG_DIR_SYS"  ] && echo "  - $CFG_DIR_SYS"
     read -r -p "Delete them too? [y/N] " yn

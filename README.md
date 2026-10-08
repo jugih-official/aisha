@@ -1,7 +1,7 @@
 # ai.
 
 A tiny CLI that turns natural-language requests into bash actions using the
-DeepSeek API. It can:
+Claude API. It can:
 
 - run shell commands you describe in plain language (any language),
 - gather information from the web before answering,
@@ -37,23 +37,27 @@ The installer:
 - optionally sets up the **`ai-code`** coding agent's GPU backend on
   [Modal](https://modal.com) (deploys a local open-weights LLM — see
   [Coding agent](#coding-agent-ai-code) below),
-- if you don't already have a `DEEPSEEK_API_KEY` in your environment,
-  prompts for one and saves it to `~/.config/ai-bash/api-key` (mode `600`),
-- optionally also writes `/etc/ai-bash/api-key` so `sudo ai ...` works
+- if you don't already have an `ANTHROPIC_API_KEY` in your environment,
+  prompts for one and saves it to `~/.config/ai-bash/anthropic-api-key`
+  (mode `600`),
+- optionally also writes `/etc/ai-bash/anthropic-api-key` so `sudo ai ...` works
   without needing `sudo -E`.
 
 Requires Python 3.10+. The core tool uses stdlib only; browser automation
-optionally installs Playwright via `pip`. Get a DeepSeek key at
-<https://platform.deepseek.com/> (starts with `sk-`). API base is
-<https://api.deepseek.com>; default model is `deepseek-v4-flash`.
+optionally installs Playwright via `pip`. Get an Anthropic API key at
+<https://platform.claude.com/> (starts with `sk-ant-`). API base is
+<https://api.anthropic.com>; default model is `claude-sonnet-5-5`.
 
 ### Where the API key is read from
 
 The script checks, in order:
 
-1. `$DEEPSEEK_API_KEY`
-2. `~/.config/ai-bash/api-key` (your user)
-3. `/etc/ai-bash/api-key`       (root, for `sudo ai`)
+1. `$ANTHROPIC_API_KEY`
+2. `~/.config/ai-bash/anthropic-api-key` (your user)
+3. `/etc/ai-bash/anthropic-api-key`       (root, for `sudo ai`)
+
+Earlier versions used DeepSeek and read `api-key` from the same two
+directories; that file is no longer used.
 
 ### Update
 
@@ -153,7 +157,7 @@ browser> fill the search box with "lily of the valley" and press enter
 browser> exit
 ```
 
-Each instruction is translated to more JSON steps by DeepSeek and run on
+Each instruction is translated to more JSON steps by Claude and run on
 the already-open page. Type `exit` / `quit` (or Ctrl-D, or close the
 window) to end the session.
 
@@ -179,9 +183,10 @@ Flags:
 - `--no-stealth` — disable the anti-detection patches.
 - `--timeout MS` — per-step timeout (default 30 000 ms).
 
-The steering REPL needs the same `DEEPSEEK_API_KEY` as `ai` (or a key
-file under `~/.config/ai-bash/api-key` or `/etc/ai-bash/api-key`). With
-no key it just keeps the window open without the prompt.
+The steering REPL needs the same `ANTHROPIC_API_KEY` as `ai` (or a key
+file at `~/.config/ai-bash/anthropic-api-key` or
+`/etc/ai-bash/anthropic-api-key`). With no key it just keeps the window
+open without the prompt.
 
 Environment overrides: `AI_BROWSER_UA`, `AI_BROWSER_LOCALE`,
 `AI_BROWSER_TZ`.
@@ -316,5 +321,5 @@ capped at 8 turns.
 - The model is told to refuse truly dangerous requests, but treat that
   as a soft guardrail, not a guarantee. Use `-n` to dry-run anything
   you're unsure about.
-- Your `DEEPSEEK_API_KEY` is read from the environment and never
+- Your `ANTHROPIC_API_KEY` is read from the environment and never
   written to disk by this script.
