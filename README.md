@@ -325,15 +325,26 @@ run? [y/N]
 
 ### How a line is handled
 
-| Stage | What happens | Speed |
+No language model is needed. Every line goes through these steps and stops at
+the first that handles it:
+
+| Step | What happens | Speed |
 |---|---|---|
 | 1. Shell | A command on `PATH`, an alias or function, shell syntax (`for`, `f() {`, `X=1`), pipes or redirects run in bash unchanged. Everyday verbs that are also commands (`find big files`, `kill firefox`, `go up`, `install htop`, `edit x`) go to the rules when the rules are confident. | instant |
-| 2. Memory | A phrase whose LLM-written command you approved before is replayed without the model. | instant |
-| 3. Rules | The sentence is broken into slots — action, where, file types, size, age, owner, name/content keywords, sort, limit — and the command is built from those. The `→` line shows what it understood. Typos are retried once (`recursivly`, `oldr`, `fiels`). | < 2 ms |
-| 4. Local LLM | Only below the confidence threshold. The model gets the request, the OS, the installed tools, the folder listing and the rules' partial parse. Its command is always shown and confirmed. | ~1 s on CPU |
+| 2. Taught | Phrases you taught (or approved) replay, including taught templates: teach "frobnicate notes.md" once and "frobnicate other.md" works. | instant |
+| 3. Rules | The sentence is broken into slots — action, where, file types, size, age, owner, name/content keywords, sort, limit — plus ~140 recipes, and the command is built from those. Typos, synonyms ("erase", "relocate", "display") and a verb at the end ("README.md delete") are retried. The `→` line shows what it understood. | ~1 ms |
+| 4. Built-in model | If the rules are unsure, a small statistical model inside aisha (TF-IDF over words and character trigrams, 361 known request templates, no download) finds the closest known requests, fills in your file names, numbers and quoted text, and offers the ones the rules are sure of: pick a number. | ~2 ms |
+| 5. Teach | Nothing fits? Type the bash command once; aisha runs it and learns it, with your values as slots. Or `teach backup {dir} = tar -czf {dir}.tgz {dir}`. | — |
+| (optional) | A small language model, only if you set one up with `aisha --setup`. Off otherwise. | ~1 s |
 
 Questions — "how do I delete empty folders?" — show the command without
 running it.
+
+On phrasings that were not in its tests, aisha's rules and built-in model got
+23 of 30 right before tuning (77%) and returned nothing for the rest — a
+"don't know" rather than a wrong command in all but one case. Each miss
+became a general fix and a test; `tests/phrases.tsv` and
+`tests/suggestions.tsv` hold the requests it is checked against.
 
 ### What the rules understand
 
@@ -417,7 +428,7 @@ aisha                                   # interactive shell
 aisha show the 5 newest files here      # one line, then exit
 aisha -n delete log files older than 30 days   # show the command, run nothing
 aisha --lines < requests.txt            # several plain-language lines
-aisha --doctor                          # check tools, fallbacks and the model
+aisha --doctor                          # check tools, fallbacks, built-in model and optional LLM
 ```
 
 Inside the shell: `!cmd` forces bash, `?request` skips the rules and asks the
@@ -447,36 +458,36 @@ manage remembered phrases, `llm` checks the model, `help` lists examples.
   name is never executed.
 - `aisha -n …` and "how do I …" only show the command.
 
-### Local LLM (optional)
+### Optional language model
+
+aisha does not need one, and uses none unless you set it up:
 
 ```sh
-aisha --setup            # Qwen2.5-Coder 1.5B (1.1 GB)
-aisha --setup 0.5b       # smaller and faster (0.4 GB), simpler requests
-aisha --setup 3b         # better, slower (2 GB)
+aisha --setup            # Qwen2.5-Coder 0.5B (0.4 GB) + llama.cpp's own server (~30 MB)
+aisha --setup 1.5b       # better, 1.1 GB
+aisha --setup --ollama   # use Ollama instead, if you have it
+aisha --setup --url http://127.0.0.1:8080/v1   # any OpenAI-compatible server you run
+aisha --setup off        # never use a model
 aisha --setup remove     # delete the downloaded runtime and model
 ```
 
-`--setup` uses whatever is already there — a server answering at the
-configured URL, Ollama, or a `llama-server` on `PATH`. Otherwise it downloads
-llama.cpp's `llama-server` (MIT, ~30 MB) from GitHub and the model (Apache
-2.0) from Hugging Face into `~/.local/share/aisha`, with resumable downloads.
-aisha starts the model the first time the rules need help and stops it when
-aisha exits; nothing runs in the background otherwise.
+The default needs no Ollama: aisha downloads llama.cpp's `llama-server`
+(MIT) from GitHub and the model (Apache 2.0) from Hugging Face into
+`~/.local/share/aisha`, starts it the first time it is needed and stops it
+when aisha exits. When the rules and the built-in model are unsure, the model
+is offered as one more option (`?` at the prompt); its commands are always
+shown and confirmed.
 
 Settings live in `~/.config/ai-bash/aisha/config.json` or the environment:
 
 | Setting | Env var | Default |
 |---|---|---|
-| `llm_url` | `AISHA_LLM_URL` | `http://127.0.0.1:11434/v1` (Ollama); `--setup` sets its own |
-| `llm_model` | `AISHA_LLM_MODEL` | `qwen2.5-coder:1.5b` |
+| `llm` | `AISHA_LLM` | `auto` — use a model only once one is set up; `off` never |
+| `llm_url` | `AISHA_LLM_URL` | set by `--setup` |
+| `llm_model` | `AISHA_LLM_MODEL` | set by `--setup` |
 | `llm_server` / `llm_model_file` | `AISHA_LLM_SERVER` / `AISHA_LLM_MODEL_FILE` | set by `--setup` |
-| `llm_key` | `AISHA_LLM_KEY` | *(none)* |
-| `llm` | `AISHA_LLM` | `auto` (`off` disables the model) |
-| `threshold` | `AISHA_THRESHOLD` | `0.7` (rules below this go to the model) |
+| `threshold` | `AISHA_THRESHOLD` | `0.7` (rules below this are "unsure") |
 | `confirm` | `AISHA_CONFIRM` | `llm` (`always`, or `destructive` only) |
-
-Without a model, aisha still works: requests the rules don't understand get
-the rules' best guess with a confirmation, or a "don't know how yet".
 
 ### Install
 

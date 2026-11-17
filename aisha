@@ -49,7 +49,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 
 # ---- configuration ----------------------------------------------------------
 
@@ -112,6 +112,14 @@ def load_config() -> dict:
     cfg["llm_timeout"] = float(cfg["llm_timeout"])
     cfg["threshold"] = float(cfg["threshold"])
     cfg["banner"] = str(cfg["banner"]).lower() not in ("0", "false", "no", "off")
+    # A language model is used only when it was set up (aisha --setup) or named.
+    try:
+        with open(CFG_FILE) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        saved = {}
+    cfg["_configured"] = bool(any(k in saved for k in ("llm_url", "llm_server", "llm_model"))
+                              or any(os.environ.get(e) for e in ("AISHA_LLM_URL", "AISHA_LLM_MODEL", "AISHA_LLM_SERVER")))
     return cfg
 
 
@@ -216,6 +224,7 @@ and or also then so up out ok okay hey hi lets let want need wanna like look loo
 give get tell have has had only really actually currently exactly thing things stuff
 item items entries entry everything first one ones whole
 show display check tell see view give report but anything nothing instead list print find here
+around anywhere somewhere lying yo hmm right
 """.split())
 
 # Dates the rules do not parse. They must not become search keywords; they
@@ -633,7 +642,7 @@ def take_time(u: Utterance, spec: FindSpec) -> None:
 SORT_WORD = {
     "largest": ("size", True), "biggest": ("size", True), "heaviest": ("size", True),
     "huge": ("size", True), "big": ("size", True), "large": ("size", True),
-    "smallest": ("size", False), "tiniest": ("size", False),
+    "smallest": ("size", False), "tiniest": ("size", False), "tiny": ("size", False), "small": ("size", False),
     "newest": ("time", True), "latest": ("time", True), "recent": ("time", True),
     "oldest": ("time", False),
 }
@@ -649,11 +658,15 @@ def take_sort_limit(u: Utterance, spec: FindSpec) -> None:
         spec.limit = int(num(m.group(1), 10))
     words = r"largest|biggest|heaviest|smallest|tiniest|newest|latest|oldest"
     m = u.take(rf"\b{NUM}\s+({words}|{RECENT})\b")
+    m2 = None if m else u.take(rf"\b({words})\s+(\d+)\b")       # "the biggest 3 files"
     if m:
         spec.limit = int(num(m.group(1), 10))
         word = m.group(2)
+    elif m2:
+        spec.limit = int(m2.group(2))
+        word = m2.group(1)
     else:
-        m = u.take(rf"\b({words}|huge|big|large|{RECENT})\b")
+        m = u.take(rf"\b({words}|huge|big|large|tiny|small|{RECENT})\b")
         word = m.group(1) if m else None
     if word:
         key = "recent" if "recent" in word else word.split()[0]
@@ -1044,7 +1057,7 @@ kill run execute install send upload download print sort
 def absorb_keywords(u: Utterance, spec: FindSpec, mode: str, limit: int = 2) -> int:
     """Leftover nouns become name/content keywords ("find the budget pdf")."""
     words = [w for w in u.leftover() if w not in TIMEISH and w not in ACTION_WORDS
-             and w not in NEG_WORDS][:limit]
+             and w not in NEG_WORDS and not re.fullmatch(r"\d+", w)][:limit]   # a bare number is no search term
     if not words:
         return 0
     for w in words:
@@ -1255,9 +1268,14 @@ FIND_VERB = (r"\b(?:find|search(?:\s+for)?|look(?:ing)?\s+for|locate|show\s+me\s
 
 def h_find(u: Utterance) -> Plan | None:
     m = u.take(FIND_VERB)
+    verbless = False
     if not m:
-        return None
-    by_name = m.group(0).startswith(("where", "locate", "show me where"))
+        # "files bigger than 5 megabytes", "latest files": a description of files is a search
+        if not u.peek(r"\b(?:files?|stuff|things|items|folders?|pdfs?|images?|photos?|videos?|logs?|documents?)\b"):
+            return None
+        m, verbless = True, True
+        u.take(r"\b(?:stuff|things|items)\b")
+    by_name = False if verbless else m.group(0).startswith(("where", "locate", "show me where"))
     spec = FindSpec()
     dupes = u.take(r"\b(?:duplicates?|duplicated|identical|same)(?:\s+(?:content|contents))?\b")
     parse_filters(u, spec)
@@ -1268,9 +1286,13 @@ def h_find(u: Utterance) -> Plan | None:
         plan = Plan(cmd, "find duplicates", [where_label(spec, True)] + spec.why
                     + ["same content (md5), grouped"])
         return finish(u, plan, 0, spec)
+    if verbless and (not (spec.narrowed() or spec.sort) or u.leftover() or spec.unparsed):
+        return None          # only a pure description of files: "delete…", "convert…" are not searches
     guessed = absorb_keywords(u, spec, "name" if by_name else "any")
     cmd = render_find(spec)
     plan = Plan(cmd, "find", [where_label(spec, True)] + spec.why)
+    if verbless:
+        plan.confidence *= 0.95
     return finish(u, plan, guessed, spec)
 
 
@@ -1355,7 +1377,7 @@ def h_grep(u: Utterance) -> Plan | None:
     why = [f'text "{needle}"', "case-insensitive"]
     if target:
         tname = u.lit(target.strip())
-        file = resolve(tname, u.cwd, "file")
+        file = resolve(tname, u.cwd, "file") or unique_stem_below(tname, u.cwd)
         if file:
             return Plan(f"grep -niF -- {shlex.quote(needle)} {qpath(file)}", "search text",
                         why + [f"in {file}"])
@@ -1413,7 +1435,7 @@ def h_count(u: Utterance) -> Plan | None:
 
 def h_size(u: Utterance) -> Plan | None:
     # "what's eating my disk", "biggest folders"
-    hog = u.take(r"\b(?:taking|using|eating|hogging|consuming|filling)\s+(?:up\s+)?(?:the\s+most\s+|all\s+(?:the\s+|my\s+)?|so\s+much\s+|my\s+|the\s+)?"
+    hog = u.take(r"\b(?:taking|takes|take|using|uses|eating|eats|hogging|hogs|consuming|consumes|filling|occupies|occupying)\s+(?:up\s+)?(?:the\s+most\s+|all\s+(?:the\s+|my\s+)?|so\s+much\s+|my\s+|the\s+)?"
                  r"(?:disk\s+)?(?:space|room|storage|disk)\b")
     big_dirs = u.take(r"\b(?:largest|biggest|heaviest)\s+(?:sub-?)?(?:folders|directories|dirs)\b")
     if hog or big_dirs:
@@ -1424,10 +1446,14 @@ def h_size(u: Utterance) -> Plan | None:
         root = qpath(spec.root)
         cmd = f"du -h --max-depth=1 {root} 2>/dev/null | sort -hr | head -n {n + 1}"
         return finish(u, Plan(cmd, "disk usage", [f"biggest folders in {spec.root}", f"top {n}"]))
+    if u.peek(r"\bhow\s+much\s+(?:space|room|disk|storage)\s+(?:is\s+|do\s+i\s+have\s+)?(?:free|left|available|remaining)\b"):
+        u.take(r"\bhow\s+much\s+(?:space|room|disk|storage)\s+(?:is\s+|do\s+i\s+have\s+)?(?:free|left|available|remaining)\b")
+        return finish(u, Plan("df -h -x tmpfs -x devtmpfs -x squashfs", "disk space", ["free space on all drives"]))
     m = u.take(r"\b(?:how\s+(?:big|large|heavy)|how\s+much\s+(?:space|room|disk)|size\s+of|total\s+size|"
                r"disk\s+usage\s+of|space\s+used\s+by|du)\b")
     if not m:
-        m = u.take(r"\b(?:free|available|remaining|used)?\s*(?:disk|storage|drive)\s*(?:space|usage|capacity|left)?\b|"
+        m = u.take(r"\b(?:how\s+much\s+)?(?:free|available|remaining|used)?\s*(?:disk|storage|drive)\s*(?:space|usage|capacity)?"
+                   r"(?:\s+(?:is\s+|do\s+i\s+have\s+)?(?:left|free|available|remaining))?\b|"
                    r"\bfree\s+space\b|\bhow\s+full\b|\bspace\s+left\b")
         if not m:
             return None
@@ -1508,6 +1534,22 @@ def find_below(name: str, cwd: str, max_depth: int = 4, max_entries: int = 20000
         if seen > max_entries:
             break
     return sorted(hits, key=lambda p: (p.count(os.sep), p))
+
+
+def unique_stem_below(name: str, cwd: str) -> str | None:
+    """'notes' -> 'run1/notes.txt' when exactly one file below here has that stem."""
+    if not re.fullmatch(r"[\w-]+", name):
+        return None
+    hits, low = [], name.lower()
+    base_depth = cwd.rstrip(os.sep).count(os.sep)
+    for root, dirs, files in os.walk(cwd):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+        if root.count(os.sep) - base_depth >= 3:
+            dirs[:] = []
+        hits += [os.path.relpath(os.path.join(root, f), cwd) for f in files if os.path.splitext(f)[0].lower() == low]
+        if len(hits) > 1:
+            return None
+    return hits[0] if len(hits) == 1 else None
 
 
 def default_editor() -> tuple[str, str]:
@@ -1725,7 +1767,7 @@ def h_find_then(u: Utterance) -> Plan | None:
 
 
 def h_copy_move(u: Utterance) -> Plan | None:
-    m = u.peek(r"\b(copy|cp|duplicate|move|mv|rename)\s+(.+?)\s+(?:to|into|in|as|inside|over\s+to)\s+(.+)$")
+    m = u.peek(r"\b(copy|cp|duplicate|move|mv|rename|put|throw|stick|chuck|toss)\s+(.+?)\s+(?:to|into|in|as|inside|over\s+to)\s+(.+)$")
     mc = u.peek(r"\b(?:(?:make|create)\s+a\s+copy\s+of|^\s*duplicate)\s+(\S+)\s*$")
     if mc:
         srcs = resolve_sources(u, u.o(mc, 1))
@@ -1746,7 +1788,7 @@ def h_copy_move(u: Utterance) -> Plan | None:
         return Plan(f"cp -ai -- {src} {src}.bak", "backup", [f"copy {src} to {src}.bak"])
     if not m:
         return None
-    verb = m.group(1)
+    verb = {"put": "move", "throw": "move", "stick": "move", "chuck": "move", "toss": "move"}.get(m.group(1), m.group(1))
     srcs = resolve_sources(u, u.o(m, 2))
     if not srcs and verb in ("copy", "cp", "move", "mv"):
         # "move all csv files older than a week to archive"
@@ -1824,7 +1866,7 @@ def explicit_targets(u: Utterance) -> list | None:
 
 
 def h_delete(u: Utterance) -> Plan | None:
-    if not u.take(r"\b(?:delete|remove|rm|erase|trash|get\s+rid\s+of|clean\s+up|wipe|destroy)\b"):
+    if not u.take(r"\b(?:delete|remove|rm|erase|trash|get\s+rid\s+of|clean\s+(?:up|out)|wipe|destroy|throw\s+(?:away|out))\b"):
         return None
     # "find X and delete them" / "delete all X you can find"
     u.take(r"\b(?:find|search\s+for|look\s+for|locate|list|show(?:\s+me)?|get)\b")
@@ -1887,14 +1929,14 @@ CREATE_TAIL = (r"(?P<tail>\s+and\s+(?:go|cd|move|step|switch)\s+(?:in|into|to)\s
 
 
 def h_create(u: Utterance) -> Plan | None:
-    kinds = r"(?P<kind>folder|director(?:y|ie)|dir|file)s?"
+    kinds = r"(?P<kind>folder|director(?:y|ie)|dir|file|doc|document)s?"
     ftype = r"(?:(?P<ftype>" + "|".join(FILE_KIND_EXT) + r")\s+)?"
     m = (u.peek(CREATE_V + ftype + kinds + r"\s+(?:called\s+|named\s+|with\s+the\s+name\s+)?(?P<names>.+?)" + CREATE_TAIL)
          or u.peek(CREATE_V + r"(?P<names>\S+(?:\s*(?:,|\band\b)\s*\S+)*)\s+" + ftype + kinds + CREATE_TAIL)
          or u.peek(r"\b(?:create|make|new|touch|mkdir|mk)\s+(?:a\s+|an\s+)?(?:new\s+)?(?:empty\s+)?(?P<names>qlit\d+)" + CREATE_TAIL))
     if not m:
         return None
-    kind = (m.groupdict().get("kind") or "")
+    kind = (m.groupdict().get("kind") or "").replace("document", "file").replace("doc", "file")
     raw_names = []
     for item in split_items(u.o(m, "names")):          # names with spaces need quotes, as in bash
         words = item.split()
@@ -1994,7 +2036,8 @@ def h_archive(u: Utterance) -> Plan | None:
         if os.path.exists(os.path.join(u.cwd, os.path.expanduser(dest))):
             plan.destructive, plan.warning = True, f"! replaces the existing {dest}"
         return plan
-    m = u.peek(r"\b(?:extract|unzip|unpack|decompress|uncompress|untar|open\s+up)\s+(\S+)(?:\s+(?:to|into|in)\s+(\S+))?")
+    m = u.peek(r"\b(?:extract|unzip|unpack|decompress|uncompress|untar|open\s+up)\s+(?:the\s+)?(\S+)"
+               r"(?:\s+(?:archive|file|zip|tarball))?(?:\s+(?:to|into|in)\s+(\S+))?")
     if not m:
         return None
     src = resolve(u.lit(u.o(m, 1)), u.cwd, "file")
@@ -2092,7 +2135,7 @@ SYSTEM = [  # (pattern, command or alternatives, label)
      "uname -a && grep -E '^PRETTY_NAME=' /etc/os-release && echo \"cpus: $(nproc)\" && "
      "grep -E '^(MemTotal|MemAvailable):' /proc/meminfo && uptime", "system summary"),
     (r"\b(?:check|test)\s+(?:the\s+|my\s+)?(?:internet|network)(?:\s+(?:connection|connectivity|access))?\b|"
-     r"\bam\s+i\s+(?:online|connected)\b|\bis\s+(?:the\s+)?(?:internet|network)\s+(?:up|working|down)\b|"
+     r"\b(?:am\s+i|are\s+we|is\s+(?:this|the)\s+(?:computer|machine))\s+(?:online|connected)\b|\bis\s+(?:the\s+)?(?:internet|network)\s+(?:up|working|down)\b|"
      r"\bdo\s+i\s+have\s+internet\b",
      [("ping", "ping -c 3 1.1.1.1"),
       (None, "python3 -c 'import urllib.request as u; u.urlopen(\"https://deb.debian.org\", timeout=10); print(\"online\")'")],
@@ -2138,9 +2181,10 @@ SYSTEM = [  # (pattern, command or alternatives, label)
     (r"\b(?:all\s+|the\s+|list\s+of\s+)?(?:user\s+accounts|users)\b(?!\s+(?:logged|online))", "cut -d: -f1 /etc/passwd",
      "user accounts"),
     (r"\b(?:my\s+)?(?:crontab|cron\s+jobs|scheduled\s+(?:jobs|tasks))\b", "crontab -l", "your cron jobs"),
-    (r"\bwhat\s+day\s+is\s+(?:it|today)\b|\b(?:the\s+)?(?:date|time)(?:\s+is\s+it)?\b|\btoday's\s+date\b", "date", "date and time"),
+    (r"\bwhat\s+day\s+is\s+(?:it|today)\b|\bday\s+(?:is\s+it\s+)?today\b|\bwhich\s+day\b|\b(?:the\s+)?(?:date|time)(?:\s+is\s+it)?\b|\btoday's\s+date\b", "date", "date and time"),
     (r"\bcalendar\b", [("cal", "cal"), (None, "python3 -m calendar $(date '+%Y %-m')")], "calendar"),
-    (r"\bhost\s*name\b|\b(?:computer|machine)\s+name\b", "hostname", "hostname"),
+    (r"\bhost\s*name\b|\b(?:computer|machine|pc)\s+name\b|\bwhat\s+is\s+(?:this|the|my)\s+(?:computer|machine|pc|system)\s+called\b",
+     "hostname", "hostname"),
     (r"\b(?:usb\s+)?(?:drives|disks|partitions|block\s+devices|usb\s+sticks?)\b|\bmounted\s+(?:drives|disks|file\s*systems)\b|\bwhat\s+is\s+mounted\b",
      "lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT", "drives and partitions"),
     (r"\$?path\s+(?:variable|entries|dirs|directories)\b|\bwhat\s+is\s+in\s+(?:my\s+)?\$?path\b|\bmy\s+\$?path\b",
@@ -2730,7 +2774,7 @@ RECIPES = [
                             r"\bopen\s+(?:the\s+|a\s+)?file\s+(?:manager|browser|explorer)(?:\s+here)?\b"],
            "xdg-open .", needs=("xdg-open",), gui=True),
     Recipe("archive contents", [r"\b(?:what(?:\s+is|'s)\s+in(?:side)?|list\s+(?:the\s+)?(?:contents?\s+of|files\s+in)|show\s+(?:the\s+)?contents?\s+of|"
-                                r"contents?\s+of|look\s+inside|peek\s+(?:in|into)|list)\s+(?:the\s+)?(?:archive\s+|zip\s+|tarball\s+)?"
+                                r"contents?\s+of|look\s+inside|peek\s+(?:in|into|at|inside)|list)\s+(?:the\s+)?(?:archive\s+|zip\s+|tarball\s+)?"
                                 r"(?P<file>qlit\d+)"],
            _archive_list),
 
@@ -3117,6 +3161,25 @@ def _interpret_fixing(text: str, cwd: str) -> Plan | None:
     best = _interpret(text, cwd)
     if best is not None and best.confidence >= 0.999:
         return best
+    m = re.match(r"^(.+?)\s+(create|make|delete|remove|erase|show|open|edit|find|list|copy|move|rename|extract|"
+                 r"compress|zip|count|search)(?:\s+(?:it|them|please|pls|now))*\s*[?!.]?$", text, re.I)
+    if m and not re.match(r"^\s*(?:create|make|delete|remove|show|open|edit|find|list|copy|move|rename|how|what|which)\b",
+                          text, re.I):
+        again = _interpret(f"{m.group(2)} {m.group(1)}", cwd)
+        if again and (best is None or again.confidence > best.confidence):
+            again.why.append(f"read as: {m.group(2)} {m.group(1)}")
+            best = again
+            if best.confidence >= 0.999:
+                return best
+    syn, swaps = apply_synonyms(text)
+    if swaps:
+        again = _interpret(syn, cwd)
+        if again and (best is None or again.confidence > best.confidence):
+            again.why.append("read " + ", ".join(swaps))
+            best = again
+            if best.confidence >= 0.999:
+                return best
+        text = syn
     fixed, fixes = fix_typos(text)
     if fixes:
         again = _interpret(fixed, cwd)
@@ -3138,6 +3201,617 @@ def _interpret(text: str, cwd: str) -> Plan | None:
         if plan and (best is None or plan.confidence > best.confidence):
             best = plan
     return best
+
+
+# ---- built-in intent model ----------------------------------------------------------
+# A small statistical model inside aisha: no download, no language model. It
+# scores the request against the requests the test suite checks (as templates
+# with {file}, {dir}, {n}, {text}, {host}, {url} slots), using TF-IDF over
+# words, word pairs and character trigrams, with synonyms folded together. The
+# closest templates are filled with the request's own names, numbers and
+# quoted text and handed to the rules; only ones the rules are sure of are
+# offered. It can't invent new commands, but it is deterministic, instant and
+# tolerant of word order, synonyms and typos.
+
+INTENT_BANK = """
+list files
+show me what's here
+what's in this folder
+list everything including hidden files
+list only folders
+list files by date
+show the {n} most recent files
+list all pdf files
+show files in {dir}
+show me hidden files
+show the biggest files in this folder
+find all python files
+find files named config
+find files containing todo
+find files bigger than 100mb
+find large files over {n} gb
+find empty files
+find files modified in the last hour
+find files changed in the last {n} minutes
+find files modified this week
+find files older than {n} days
+find files older than a year
+find recursively files older that {n} months from this folder
+find recently modified files
+find all images
+find log files larger than 50mb
+locate the file called {file}
+find folders named node_modules
+find all .log files in {dir}
+find files owned by root
+find executable files
+find broken symlinks
+find files with spaces in their names
+find files on this folder that has the measurement data
+which files mention {text}
+find files in {dir} modified today
+search for {text} in all log files
+grep for todo in this project
+which files contain the word password
+show lines containing error in {file}
+find todo in python files
+count lines in all python files
+how many files are here
+how many folders are in this directory
+count lines in {file}
+how big is this folder
+size of {dir}
+what's taking up space
+how much free disk space do i have
+biggest folders here
+total size of all pdfs
+show {file}
+print the first {n} lines of {file}
+last {n} lines of {file}
+follow {file}
+watch the log {file}
+open {file}
+edit {file}
+edit {file} with micro
+edit {file} using nano
+open {file} in vim
+copy {file} to {file}
+move {file} into {dir}
+rename {file} to {file}
+delete {file}
+remove the {dir} folder
+delete all empty folders
+delete files older than {n} months
+find logs older than {n} months and move them to {dir}
+make a folder called {dir}
+create directories a, b and c
+create an empty file {file}
+make {file} executable
+compress {dir} into src.tar.gz
+zip up {dir}
+back up {file}
+download {url}
+rename all .jpeg files to .jpg
+go to the parent folder
+go back
+go home
+cd into {dir}
+open the {dir} folder
+where am i
+how much ram do i have
+what's using all my memory
+top processes by cpu
+show running processes
+is ssh running
+kill process {n}
+restart the nginx service
+what's my ip address
+what is my public ip
+which ports are open
+what linux version is this
+what kernel am i running
+how long has the computer been up
+how many cpu cores
+show cpu info
+list usb drives
+show mounted drives
+who am i
+what time is it
+what's today's date
+show calendar
+show environment variables
+what's in my path
+clear the screen
+install htop
+update the system
+uninstall htop
+find duplicate files
+what is the weather
+please list the files
+can you show me all files here
+i want to see the files in {dir}
+display the contents of this directory
+list files with their sizes
+how many lines does {file} have
+how many lines are in {file}
+count the files in {dir}
+search all files for {text}
+look for the word error in {dir}
+find all files called {file}
+find any csv files under {dir}
+find files bigger than {n} gigs
+find files smaller than {n} kb
+find files between 1mb and 10mb
+show pdfs modified yesterday
+find files i changed today
+delete all log files older than {n} days
+remove all .pyc files
+copy all pdfs to {dir}
+make a directory named {dir}
+create a new folder {dir}
+show me the last lines of {file}
+display the end of {file}
+what's in {file}
+read {file}
+open {file} with less
+go into {dir}
+change directory to {dir}
+go up one level
+take me home
+what's the current directory
+show free memory
+memory usage
+show disk space
+how full is my disk
+what is using the cpu
+list processes
+show my ip
+what's my hostname
+show system info
+check internet connection
+how many processes are running
+restart the computer
+shut down the computer
+what version of python do i have
+what version of bash is this
+is python3 installed
+do i have git
+could you please list all the files in this folder
+i'd like to see the biggest files
+show me everything in my home folder
+find all the mp3s on my computer
+find photos taken this month
+search my documents for budget
+what files did i change today
+get rid of all the .bak files
+clean up temp files
+make a copy of {file}
+duplicate {file}
+what's the size of {dir}
+how much space does {dir} take
+whats eating my disk space
+show hidden files in my home
+list the contents of {dir}
+i need to edit {file}
+can you open {file} in nano
+show me the first {n} lines of {file}
+tail {file}
+make a zip of {dir}
+kill the process named sleep
+end all python processes
+what is listening on port {n}
+which process is using port {n}
+how much battery is left
+what's the cpu temperature
+when did the computer boot
+list installed packages
+search for a package called htop
+don't delete anything, just show me old files
+list old files but do not remove them
+find big files without deleting them
+find tmp files, don't remove them
+find all files except python files
+list everything except pdfs
+find files excluding .log files
+find folders that are not empty
+find non-empty files
+remind me in {n} minutes
+compare {file} and {file}
+what's the difference between {file} and {file}
+replace hello with goodbye in {file}
+replace {text} with {text} in all python files
+what is 2+2
+calculate (12*7)/3
+how much is 2^10
+show all users
+what groups am i in
+show my crontab
+how many words are in {file}
+find the {n} largest pdf files modified this year
+show the newest csv file in {dir}
+list the {n} oldest log files
+find python files bigger than 1kb changed in the last {n} weeks
+find empty folders in {dir} and delete them
+count pdf files in my downloads
+find large videos in my home folder
+search for todo in python files under {dir}
+find files owned by root that are bigger than 10mb
+which txt files contain error
+find files named {text} modified yesterday
+show the {n} biggest files on my computer
+total size of all log files
+how many images are in this folder
+find hidden files bigger than 1mb
+list files modified in the last {n} minutes
+find scripts that are executable
+delete pdfs older than a year in my downloads
+move all csv files older than a week to {dir}
+list files in ~home
+list files in $home
+list files in home
+find big files in ~home
+list files in nosuchdir
+show file tree
+show the folder structure
+show the directory tree of {dir}
+details of {file}
+when was {file} last modified
+what kind of file is {file}
+permissions of {file}
+who owns {file}
+sha256 checksum of {file}
+md5 of {file}
+show line {n} of {file}
+lines {n} to {n} of {file}
+show {file} with line numbers
+sort the lines in {file}
+unique lines in {file}
+remove duplicate lines from {file}
+how many times does error appear in {file}
+reverse {file}
+pretty print {file}
+show {file} as a table
+append {text} to {file}
+write {text} to {file}
+empty {file}
+empty the trash
+move {file} to the trash
+create a symlink to {file}
+list the contents of {file}
+base64 encode {text}
+decode {text}
+convert {text} to uppercase
+generate a strong password
+generate a password with {n} characters
+generate a uuid
+pick a random number between {n} and {n}
+roll a dice
+flip a coin
+current unix timestamp
+what date is it {n} days from now
+what day was it {n} weeks ago
+what day is tomorrow
+what week is it
+what time is it in tokyo
+what time is it in new york
+what is my timezone
+set a timer for {n} minutes
+remind me to stretch in {n} minutes
+system load
+how busy is the cpu
+what architecture is this
+which shell am i using
+swap usage
+show inodes
+what file systems do i have
+what gpu do i have
+list usb devices
+hardware info
+screen resolution
+kernel messages
+show system errors
+am i root
+what is my locale
+keyboard layout
+shut down in {n} minutes
+cancel the shutdown
+check for updates
+remove old packages
+info about the package bash
+which package provides bash
+what did i install recently
+what is $home
+set editor to micro
+make an alias ll for ls -la
+what does grep do
+how do i use tar
+help for find
+run uptime every {n} seconds
+time how long sleep {n} takes
+run sleep {n} in the background
+run apt update as root
+is {host} reachable
+what is the ip of {host}
+is port {n} open on {host}
+headers of {url}
+weather in helsinki
+what's my default gateway
+show dns servers
+what's my mac address
+sync {dir} to {dir}
+what changed
+show recent commits
+which branch am i on
+list branches
+switch to branch dev
+create a new branch called feature-x
+commit everything with message {text}
+push my changes
+pull the latest changes
+undo the last commit
+discard my changes to {file}
+show the changes in {file}
+who changed {file}
+stash my changes
+clone ggml-org/llama.cpp
+add a user called bob
+add me to the docker group
+change my password
+become root
+google how to bake bread
+cpu usage
+how much memory is firefox using
+how long has sshd been running
+follow the system log
+today's logs
+count files by extension
+what kinds of files are here
+back up this folder
+create {file} file
+create {file}
+new file {file}
+create a markdown file called testi
+create a python file named hello
+create {file} with hello world in it
+create {file} and open it
+create {dir} folder
+"""
+
+# Words that mean the same to aisha. Used by the model, and to retry the rules.
+SYNONYMS = {
+    "produce": "create", "generate": "create", "erase": "delete", "wipe": "delete", "destroy": "delete",
+    "purge": "delete", "nuke": "delete", "del": "delete", "relocate": "move", "transfer": "move", "shift": "move",
+    "replicate": "copy", "dup": "copy", "display": "show", "output": "show", "reveal": "show", "dump": "show",
+    "present": "show", "seek": "find", "hunt": "find", "discover": "find", "lookup": "find", "retitle": "rename",
+    "modify": "edit", "alter": "edit", "tweak": "edit", "catalog": "folder", "catalogue": "folder",
+    "huge": "big", "giant": "big", "bulky": "big", "heavy": "big", "massive": "big", "enormous": "big",
+    "ancient": "old", "stale": "old", "outdated": "old", "aged": "old", "tally": "count", "execute": "run",
+    "launch": "run", "terminate": "kill", "decompress": "extract", "unpack": "extract", "untar": "extract",
+    "retrieve": "download", "directory": "folder", "directories": "folders", "dir": "folder", "dirs": "folders",
+}
+# Folded together only when comparing with the bank (too loose for the rules).
+MODEL_SYNONYMS = dict(SYNONYMS, make="create", new="create", touch="create", remove="delete", rm="delete",
+                      view="show", print="show", see="show", ram="memory", storage="space", room="space",
+                      programs="processes", program="process", apps="processes", largest="big", biggest="big",
+                      latest="new", newest="new", recent="new", photos="images", pictures="images", docs="documents",
+                      doc="file", document="file", cd="go", enter="go", directories="folders", megabytes="mb",
+                      gigabytes="gb", kilobytes="kb", gigs="gb", megs="mb")
+MODEL_STOP = set("a an the of to for in on at by with is are was be my me i you it this that please pls can could "
+                 "would will just some any all".split())
+SLOT_TOKENS = ("{file}", "{dir}", "{n}", "{text}", "{host}", "{url}")
+
+
+def _model_words(text: str) -> list[str]:
+    out = []
+    for w in re.findall(r"\{\w+\}|[a-z0-9]+", text.lower()):
+        if w.startswith("{"):
+            out.append(w)
+            continue
+        w = MODEL_SYNONYMS.get(w, w)
+        if w not in MODEL_STOP:
+            out.append(stem(w))
+    return out
+
+
+def _model_features(text: str) -> dict:
+    words = _model_words(text)
+    f: dict = {}
+    for w in words:
+        f["w:" + w] = f.get("w:" + w, 0) + 1.0
+        if not w.startswith("{"):
+            padded = f"#{w}#"
+            for i in range(len(padded) - 2):
+                k = "c:" + padded[i:i + 3]
+                f[k] = f.get(k, 0) + 0.3
+    for a_, b_ in zip(words, words[1:]):
+        f["b:" + a_ + "_" + b_] = f.get("b:" + a_ + "_" + b_, 0) + 1.0
+    return f
+
+
+class IntentModel:
+    def __init__(self, phrases: list[str]):
+        import math
+        self.phrases = phrases
+        feats = [_model_features(p) for p in phrases]
+        df: dict = {}
+        for f in feats:
+            for k in f:
+                df[k] = df.get(k, 0) + 1
+        n = len(phrases)
+        self.idf = {k: math.log((n + 1) / (d + 1)) + 1 for k, d in df.items()}
+        self.vecs = [self._norm(f) for f in feats]
+
+    def _norm(self, f: dict) -> dict:
+        import math
+        v = {k: (1 + math.log(x)) * self.idf[k] for k, x in f.items() if k in self.idf and x > 0}
+        length = math.sqrt(sum(x * x for x in v.values())) or 1.0
+        return {k: x / length for k, x in v.items()}
+
+    def rank(self, text: str, k: int = 10) -> list[tuple[float, str]]:
+        q = self._norm(_model_features(text))
+        scores = [(sum(q.get(key, 0) * x for key, x in v.items()), p) for v, p in zip(self.vecs, self.phrases)]
+        return sorted((s_, p) for s_, p in scores if s_ > 0)[::-1][:k]
+
+
+_MODEL: IntentModel | None = None
+
+
+def intent_model() -> IntentModel:
+    global _MODEL
+    if _MODEL is None:
+        _MODEL = IntentModel([l.strip() for l in INTENT_BANK.strip().splitlines() if l.strip()])
+    return _MODEL
+
+
+def request_values(text: str, cwd: str) -> tuple[str, list[tuple[str, str]]]:
+    """'create testi.md file' -> ('create {file} file', [('{file}', 'testi.md')])."""
+    u = Utterance(text, cwd)
+    words, vals = [], []
+    for low, orig, _ in u.remaining():
+        lit = u.lit(orig)
+        kind = None
+        if low.startswith("qlit") or re.fullmatch(r"\d+(?:\.\d+)?", low) or "/" in lit:
+            if re.match(r"(?:https?|ftp)://", lit):
+                kind = "{url}"
+            elif re.fullmatch(r"\d+(?:\.\d+)?", lit):
+                kind = "{n}"
+            elif re.fullmatch(r"[A-Za-z0-9][\w-]*(?:\.[\w-]+)*\.(?:com|org|net|io|fi|dev|de|uk|eu)|\d{1,3}(?:\.\d{1,3}){3}", lit) \
+                    and not os.path.exists(os.path.join(cwd, lit)):
+                kind = "{host}"
+            elif os.path.isdir(os.path.join(cwd, os.path.expanduser(lit))) or lit.endswith("/"):
+                kind = "{dir}"
+            elif is_pathlike(lit) or os.path.isfile(os.path.join(cwd, os.path.expanduser(lit))):
+                kind = "{file}"
+            else:
+                kind = "{text}"
+        elif low not in FILLER and resolve(lit, cwd):
+            kind = "{dir}" if os.path.isdir(os.path.join(cwd, lit)) else "{file}"
+        if kind:
+            words.append(kind)
+            vals.append((kind, lit))
+        else:
+            words.append(low)
+    return " ".join(words), vals
+
+
+SLOT_FITS = {"{file}": ("{file}", "{text}", "{dir}"), "{dir}": ("{dir}", "{text}", "{file}"), "{n}": ("{n}",),
+             "{text}": ("{text}", "{file}", "{host}", "{dir}", "{n}"), "{url}": ("{url}", "{host}"), "{host}": ("{host}", "{url}")}
+
+
+def fill_template(template: str, vals: list[tuple[str, str]]) -> tuple[str, int] | None:
+    """Put the request's values into a template's slots, by type. -> (text, values left unused)."""
+    used = [False] * len(vals)
+    out = []
+    for tok in template.split():
+        if tok not in SLOT_FITS:
+            out.append(tok)
+            continue
+        pick = None
+        for fit in SLOT_FITS[tok]:
+            for i, (kind, _) in enumerate(vals):
+                if not used[i] and kind == fit:
+                    pick = i
+                    break
+            if pick is not None:
+                break
+        if pick is None:
+            return None
+        used[pick] = True
+        v = vals[pick][1]
+        if tok == "{text}" or re.search(r"\s", v):
+            v = '"' + v.replace('"', "") + '"' if '"' in v or "'" not in v else "'" + v + "'"
+        out.append(v)
+    return " ".join(out), used.count(False)
+
+
+SUGGEST_MIN = 0.3
+
+
+def suggest(text: str, cwd: str, threshold: float = DEFAULTS["threshold"], limit: int = 3) -> list[tuple[str, Plan, float]]:
+    """Closest requests aisha knows, filled with this request's values, that the rules are sure of."""
+    masked, vals = request_values(text, cwd)
+    out, seen = [], set()
+    for score, template in intent_model().rank(masked, k=12):
+        if score < SUGGEST_MIN:
+            break
+        filled = fill_template(template, vals)
+        if not filled:
+            continue
+        phrase, unused = filled
+        plan = _interpret_fixing(phrase, cwd)
+        if not plan or plan.confidence < threshold or plan.command in seen:
+            continue
+        seen.add(plan.command)
+        out.append((phrase, plan, score * (0.8 ** unused)))
+        if len(out) >= limit:
+            break
+    return sorted(out, key=lambda x: -x[2])
+
+
+def apply_synonyms(text: str) -> tuple[str, list[str]]:
+    changed, out = [], []
+    for tok in text.split(" "):
+        low = tok.lower()
+        if low in SYNONYMS and not low.startswith(("dir",)):
+            out.append(SYNONYMS[low])
+            changed.append(f"{low}→{SYNONYMS[low]}")
+        else:
+            out.append(tok)
+    return " ".join(out), changed
+
+
+# ---- teaching: phrase templates learned from examples ---------------------------------
+
+def _clean_phrase(phrase: str) -> str:
+    return " ".join(phrase.strip().rstrip("?!.").split())
+
+
+def _is_slot_value(v: str, quoted: bool) -> bool:
+    if quoted or re.search(r"[./~@:\d]", v):
+        return True
+    low = v.lower()
+    return v.isidentifier() and low not in FILLER and low not in VOCAB and low not in ACTION_WORDS and \
+        low not in MODEL_STOP and len(v) > 1
+
+
+def make_template(phrase: str, command: str) -> tuple[str, str]:
+    """('frobnicate notes.md', 'touch notes.md') -> ('frobnicate {1}', 'touch {1}')."""
+    ptoks = re.findall(r'"[^"]*"|\'[^\']*\'|\S+', _clean_phrase(phrase))
+    try:
+        ctoks = shlex.split(command)
+    except ValueError:
+        ctoks = command.split()
+    slots: dict = {}
+    out = []
+    for t in ptoks:
+        quoted = t[:1] in "\"'" and len(t) > 1
+        v = t[1:-1] if quoted else t.rstrip(",;")
+        if v and v in ctoks and _is_slot_value(v, quoted):
+            out.append("{%d}" % slots.setdefault(v, len(slots) + 1))
+        else:
+            out.append(t.lower())
+    template = command
+    for v, n in sorted(slots.items(), key=lambda kv: -len(kv[0])):
+        template = re.sub(r"""(['"]?)(?<![\w./-])""" + re.escape(v) + r"""(?![\w./-])\1""", "{%d}" % n, template)
+    return " ".join(out), template
+
+
+def template_regex(pattern: str):
+    parts = [r"""("[^"]*"|'[^']*'|\S+)""" if re.fullmatch(r"\{\d+\}", t) else re.escape(t) for t in pattern.split()]
+    return re.compile(r"\s+".join(parts), re.I)
+
+
+def fill_command(template: str, pattern: str, values: tuple) -> str | None:
+    order = [int(n) for n in re.findall(r"\{(\d+)\}", pattern)]
+    got: dict = {}
+    for n, v in zip(order, values):
+        v = v[1:-1] if v[:1] in "\"'" and len(v) > 1 else v
+        if got.setdefault(n, v) != v:
+            return None
+    try:
+        return re.sub(r"\{(\d+)\}", lambda m: shlex.quote(got[int(m.group(1))]), template)
+    except KeyError:
+        return None
 
 
 # ---- deciding shell vs words ----------------------------------------------------
@@ -3163,14 +3837,14 @@ newest oldest recent empty hidden old big
 # Real commands that are also everyday English verbs ("go up", "kill firefox",
 # "find big files"). For these, a confident rules parse wins over bash.
 AMBIGUOUS_FIRST = {"go", "kill", "find", "open", "make", "which", "who", "file", "install", "compare",
-                   "base64", "convert", "set", "sync", "ssh", "clone", "add", "pull", "push",
+                   "base64", "convert", "set", "sync", "ssh", "clone", "add", "pull", "push", "display",
                    "du", "df", "free", "locate", "look", "see", "show", "cd", "zip", "unzip", "head",
                    "tail", "touch", "less"}
 
 
 # On Debian `edit` is run-mailcap and `open` is openvt: nobody typing
 # "edit logs.txt" means those, so the rules always get first go.
-PREFER_RULES = {"edit", "open", "view", "read"}
+PREFER_RULES = {"edit", "open", "view", "read", "display"}
 
 
 def looks_like_shell(line: str, path_env: str | None = None, cwd: str | None = None,
@@ -3423,7 +4097,12 @@ class LLM:
 
     @property
     def enabled(self) -> bool:
-        return str(self.cfg["llm"]).lower() not in ("off", "0", "no", "false", "none")
+        mode = str(self.cfg["llm"]).lower()
+        if mode in ("off", "0", "no", "false", "none"):
+            return False
+        if mode in ("on", "1", "yes", "true"):
+            return True
+        return bool(self.cfg.get("_configured"))      # auto: only once set up
 
     @property
     def label(self) -> str:
@@ -3580,11 +4259,55 @@ class Memory:
         self.data[k] = entry
         self._save()
 
-    def forget(self, phrase: str) -> bool:
-        if self.data.pop(self.key(phrase), None) is None:
-            return False
+    def match(self, phrase: str) -> str | None:
+        """An exact remembered phrase, or a taught template ('frobnicate {1}') it fits."""
+        hit = self.get(phrase)
+        if hit:
+            return hit
+        clean = _clean_phrase(phrase)
+        for entry in self.data.values():
+            pat = entry.get("pattern")
+            if pat:
+                m = template_regex(pat).fullmatch(clean)
+                if m:
+                    cmd = fill_command(entry["command"], pat, m.groups())
+                    if cmd:
+                        return cmd
+        return None
+
+    def learn(self, phrase: str, command: str) -> tuple[str, str]:
+        """Remember phrase -> command, generalised: values in both become slots."""
+        pattern, template = make_template(phrase, command)
+        if re.search(r"\{\d+\}", template):
+            return self._store_pattern(pattern, template)
+        self.remember(phrase, command)
+        return self.key(phrase), command
+
+    def teach(self, phrase: str, command: str) -> tuple[str, str]:
+        """'teach make thing {name} = mkdir -p {name}': explicit slots, or learn() from the example."""
+        names = list(dict.fromkeys(re.findall(r"\{(\w+)\}", phrase)))
+        if not names:
+            return self.learn(phrase, command)
+        num = {n: i + 1 for i, n in enumerate(names)}
+        pattern = re.sub(r"\{(\w+)\}", lambda m: "{%d}" % num[m.group(1)], _clean_phrase(phrase).lower())
+        template = re.sub(r"\{(\w+)\}", lambda m: "{%d}" % num[m.group(1)] if m.group(1) in num else m.group(0), command)
+        return self._store_pattern(pattern, template)
+
+    def _store_pattern(self, pattern: str, template: str) -> tuple[str, str]:
+        k = "pattern: " + pattern
+        entry = self.data.get(k, {"uses": 0})
+        entry.update(pattern=pattern, command=template, saved=time.strftime("%Y-%m-%d %H:%M"))
+        entry["uses"] = entry.get("uses", 0) + 1
+        self.data[k] = entry
         self._save()
-        return True
+        return pattern, template
+
+    def forget(self, phrase: str) -> bool:
+        for k in (self.key(phrase), "pattern: " + _clean_phrase(phrase).lower()):
+            if self.data.pop(k, None) is not None:
+                self._save()
+                return True
+        return False
 
     def _save(self) -> None:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
@@ -3622,8 +4345,12 @@ Shell features: pipes, loops, aliases, functions, Ctrl-Z/jobs/fg/bg, Tab complet
 aisha commands:
   !<command>         force plain bash             ?<request>         ask the LLM directly
   explain <request>  show what would run          again              repeat the last line
-  learned / forget   remembered LLM answers       llm                check the local LLM
-  exit               leave (or Ctrl-D)            aisha --setup      add the local LLM
+  teach <what you say> = <command>               e.g. teach backup {dir} = tar -czf {dir}.tgz {dir}
+  learned / forget   what aisha was taught        llm                check the optional language model
+  exit               leave (or Ctrl-D)            aisha --setup      add an optional small language model
+
+When aisha isn't sure, it offers the closest requests it knows (pick a number), or you type the
+command once and it learns it — with your file names as slots, so it works for other files too.
 """
 
 
@@ -3801,9 +4528,17 @@ class Shell:
             return self.handle(self.last_line)
         if line == "learned":
             for k, v in sorted(self.memory.data.items()):
-                say(f"{cyan(k)}\n  $ {v['command']}  {dim('(used %d×)' % v.get('uses', 1))}")
+                say(f"{cyan(v.get('pattern', k))}\n  $ {v['command']}  {dim('(used %d×)' % v.get('uses', 1))}")
             if not self.memory.data:
                 say(dim("nothing learned yet"))
+            return 0
+        if word == "teach":
+            m = re.match(r"teach\s+(.+?)\s+=\s+(.+)$", line)
+            if not m:
+                say("usage: teach <what you say> = <bash command>   e.g. teach backup {dir} = tar -czf {dir}.tgz {dir}")
+                return 1
+            pattern, template = self.memory.teach(m.group(1), m.group(2))
+            say(f"learned: “{pattern}” → {template}")
             return 0
         if word == "forget":
             say("forgotten" if self.memory.forget(line[6:].strip()) else dim("not in memory"))
@@ -3828,6 +4563,8 @@ class Shell:
         if line.startswith("?"):
             self.rc = self.via_llm(line[1:].strip(), interpret(line[1:].strip(), self.cwd))
             return self.rc
+        if self.memory.match(line):           # what you taught wins over guessing (! still forces bash)
+            return self.natural(line)
         if looks_like_shell(line, self.env.get("PATH"), self.cwd, self.cfg["threshold"], self.names):
             return self.shell_line(line)
         self.rc = self.natural(line)
@@ -3884,22 +4621,61 @@ class Shell:
         return self.run(line)
 
     def natural(self, line: str) -> int:
-        remembered = self.memory.get(line)
+        remembered = self.memory.match(line)
         if remembered:
-            plan = Plan(remembered, "remembered", ["you approved this before"], source="learned",
+            plan = Plan(remembered, "remembered", ["you taught or approved this"], source="learned",
                         destructive=needs_care(remembered))
             return self.execute(plan)
         plan = interpret(line, self.cwd)
         if plan and plan.confidence >= self.cfg["threshold"]:
             return self.execute(plan)
-        if self.llm.enabled:
-            return self.via_llm(line, plan)
-        if plan:
-            say(yellow("not sure I understood — best guess:"))
-            plan.source = "guess"
-            return self.execute(plan)
-        say(yellow("I don't know how to do that yet.") + dim(" (no LLM set up: aisha --setup)"))
-        return 1
+        return self.unsure(line, plan)
+
+    def unsure(self, line: str, partial: Plan | None) -> int:
+        """The rules are not sure: offer the built-in model's closest matches, the
+        rules' guess, the language model (if set up), or teaching by example."""
+        options = suggest(line, self.cwd, self.cfg["threshold"])
+        choices = [(phrase, plan) for phrase, plan, _ in options]
+        if partial and partial.command not in [p.command for _, p in choices] and partial.confidence >= 0.4:
+            partial.source = "guess"
+            choices.append(("(best guess) " + partial.rationale(), partial))
+        if not choices and self.llm.enabled and not self.dry_run:
+            return self.via_llm(line, partial)
+        if choices:
+            say(yellow("Not sure — closest things I know:"))
+            for i, (phrase, plan) in enumerate(choices, 1):
+                say(f"  {bold(str(i))}) {phrase}")
+                say(dim(f"     $ {plan.command}"))
+        else:
+            say(yellow("I don't know that one yet."))
+        if self.dry_run:
+            return 1
+        hint = ((f"1–{len(choices)} to run, " if len(choices) > 1 else "1 to run, ") if choices else "") + \
+            "type the bash command to teach me"
+        hint += ", ? to ask the language model" if self.llm.enabled else ""
+        ans = ask(f"{hint}, or Enter to skip: ")
+        if ans is None or not ans.strip():
+            return 1
+        ans = ans.strip()
+        if ans == "?" and self.llm.enabled:
+            return self.via_llm(line, partial)
+        if ans.isdigit() and 1 <= int(ans) <= len(choices):
+            plan = choices[int(ans) - 1][1]
+            plan.source = "rules"
+            rc = self.execute(plan)
+            if rc == 0:
+                self._learned(line, plan.command)
+            return rc
+        rc = self.run_line(ans)
+        if rc == 0:
+            self._learned(line, ans)
+        else:
+            say(dim("(not learned: the command failed)"))
+        return rc
+
+    def _learned(self, phrase: str, command: str) -> None:
+        pattern, template = self.memory.learn(phrase, command)
+        say(dim(f"learned: “{pattern}” → {template}"))
 
     def via_llm(self, line: str, partial: Plan | None) -> int:
         if not self.llm.enabled:
@@ -4219,7 +4995,7 @@ class Shell:
     # -- misc builtins
     def llm_status(self) -> int:
         if not self.llm.enabled:
-            say("LLM: off")
+            say("No language model set up; aisha uses its rules and built-in model. Add one with: aisha --setup")
             return 1
         say(f"LLM: {self.llm.label}")
         try:
@@ -4276,8 +5052,8 @@ class Shell:
         except ImportError:
             readline = None
         if self.cfg["banner"]:
-            llm = self.llm.label if self.llm.enabled else "off"
-            say(dim(f"aisha {VERSION} — type bash or plain words. 'help' for examples. LLM fallback: {llm}"))
+            llm = f"; language model: {self.llm.label}" if self.llm.enabled else ""
+            say(dim(f"aisha {VERSION} — type bash or plain words. 'help' for examples{llm}"))
         code = None
         while code is None:
             self.reap()
@@ -4556,19 +5332,27 @@ def confirm(question: str, yes: bool) -> bool:
 def setup(args: list[str]) -> int:
     cfg = load_config()
     yes = "--yes" in args or "-y" in args
-    size = next((a for a in args if a in MODELS), "1.5b")
+    size = next((a for a in args if a in MODELS), "0.5b")
     if "remove" in args:
         shutil.rmtree(DATA_DIR, ignore_errors=True)
         save_config({"llm_server": None, "llm_model_file": None, "llm_url": None, "llm_model": None})
         say(f"removed {DATA_DIR} and the local model settings")
         return 0
-    say(bold("aisha: local LLM setup"))
-    say(dim("The rules work without a model; the model only helps with requests they don't understand."))
-    managed = bool(cfg.get("llm_server"))
-    if not managed and "--download" not in args and server_answers(cfg["llm_url"]):
-        say(f"An LLM server is already answering at {cfg['llm_url']}; using it.")
+    say(bold("aisha: optional language model"))
+    say(dim("aisha works without one (rules + built-in model). This adds a small language model for the rest,"))
+    say(dim("run by llama.cpp's own server, which aisha starts when needed and stops on exit. No Ollama needed."))
+    if "--url" in args:                      # use a server you already run
+        i = args.index("--url")
+        url = args[i + 1] if i + 1 < len(args) else ""
+        if not server_answers(url):
+            say(red(f"nothing answers at {url}"))
+            return 1
+        save_config({"llm_url": url, "llm_server": None, "llm_model_file": None})
         return Shell(load_config()).llm_status()
-    if not managed and "--download" not in args and shutil.which("ollama"):
+    if "--ollama" in args:
+        if not shutil.which("ollama"):
+            say(red("ollama is not installed"))
+            return 1
         model = f"qwen2.5-coder:{size}"
         say(f"Ollama is installed: aisha can use it with {model}.")
         if confirm(f"Pull {model} with ollama now?", yes):
@@ -4579,6 +5363,10 @@ def setup(args: list[str]) -> int:
                          "llm_server": None, "llm_model_file": None})
             return Shell(load_config()).llm_status()
         return 1
+    if "off" in args:
+        save_config({"llm": "off"})
+        say("language model turned off")
+        return 0
     try:
         server = cfg.get("llm_server") if cfg.get("llm_server") and os.path.isfile(cfg["llm_server"]) else None
         server = server or shutil.which("llama-server") or find_server(os.path.join(DATA_DIR, "llama"))
@@ -4645,11 +5433,18 @@ def doctor() -> int:
     line(True, f"config: {CFG_FILE}", "exists" if os.path.exists(CFG_FILE) else "defaults (no file yet)")
     rc = [f for f in RC_FILES if os.path.isfile(os.path.expanduser(f))]
     line(True, "startup files: " + (", ".join(rc) if rc else "none"), "aliases, functions, exports")
-    line(True, f"remembered phrases: {len(Memory(LEARNED_FILE).data)}")
-    say(bold("local model"))
+    say(bold("built-in model"))
+    line(True, f"intent model: {len(intent_model().phrases)} known requests, no download")
+    learned = Memory(LEARNED_FILE).data
+    line(True, f"taught phrases: {sum(1 for v in learned.values() if v.get('pattern'))} patterns, "
+               f"{sum(1 for v in learned.values() if not v.get('pattern'))} exact")
+    say(bold("language model (optional)"))
     llm = LLM(cfg)
     if not llm.enabled:
-        line(None, "off (AISHA_LLM=off)")
+        if str(cfg["llm"]).lower() in ("off", "0", "no", "false", "none"):
+            line(None, "turned off")
+        else:
+            line(None, "not set up", "not needed; 'aisha --setup' adds a 0.5B model run by llama.cpp")
     elif llm.runtime.configured:
         good, msg = check_server(cfg["llm_server"])
         line(good, f"llama-server: {cfg['llm_server']}", msg)
@@ -4658,7 +5453,7 @@ def doctor() -> int:
     elif server_answers(cfg["llm_url"]):
         line(True, f"server answering at {cfg['llm_url']}", cfg["llm_model"])
     else:
-        line(None, "none set up", "the rules still work; 'aisha --setup' adds a model")
+        line(False, f"configured for {cfg['llm_url']}, but nothing answers there", "run 'aisha --setup' again")
     say(green("all good") if ok else red("something aisha needs is missing"))
     return 0 if ok else 1
 
@@ -4671,8 +5466,9 @@ USAGE = """usage: aisha                        interactive shell
        aisha -c '<line>' [args]      like bash -c (plain words still work)
        aisha script.sh [args]        run a script with bash
        aisha --lines < file          handle stdin line by line, words included
-       aisha --setup [0.5b|1.5b|3b] [--yes] [--download]
-                                     set up the local LLM fallback
+       aisha --setup [0.5b|1.5b|3b] [--yes]
+                                     add an optional small language model (llama.cpp, no Ollama)
+       aisha --setup --ollama | --url URL | off
        aisha --setup remove          delete the downloaded runtime and model
        aisha --doctor                check what aisha relies on
        aisha --version

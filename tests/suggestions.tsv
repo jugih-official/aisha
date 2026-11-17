@@ -1,0 +1,11 @@
+# phrase	expected fragments: the built-in model must offer a command containing them
+the tree of this project please	tree || sed -e
+running programs	ps aux
+who am i logged in as	whoami
+gimme all the python files	-iname '*.py'
+anything changed today?	-daystart -mtime 0
+put README.md into src	mv -i -- README.md src
+programs eating cpu	--sort=-%cpu
+pack src into a zip	zip
+how long since reboot	uptime
+text in README.md	cat README.md

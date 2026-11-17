@@ -430,3 +430,86 @@ create a python file named hello	touch -- hello.py
 create notes.txt with hello world in it	printf '%s\n' 'hello world' > notes.txt
 create testi.md and open it	touch -- testi.md && 
 create reports folder	mkdir -p -- reports
+
+# -- unseen paraphrases the rules now handle (word order, no verb, synonyms, typos)
+testi.md create	touch -- testi.md
+i need a new empty doc called plan.md	touch -- plan.md
+please produce a file named a.txt	touch -- a.txt
+display README.md	cat README.md
+give me the file layout	tree || sed -e
+how many lines are there in README.md	wc -l
+which folder takes the most room	du -h --max-depth=1
+largest stuff in here	sort -nr || ls -lhS
+files bigger than 5 megabytes	-size +5M
+stuff modified in the past 2 days	-mtime -2
+relocate README.md to src	mv -i -- README.md src
+duplicate README.md to backup.md	cp
+whats my ram	free -h || meminfo
+show me the memory	free -h || meminfo
+how much storage is left	df -h
+ip address please	ip -br addr || hostname -I
+unzip the backup.zip archive	backup.zip
+show what is inside backup.zip	-l backup.zip
+README.md lines count	wc -l
+number of lines in README.md	wc -l
+open README.md with nano	nano README.md
+README.md delete	rm -- README.md
+make folder called projects	mkdir -p -- projects
+folder named projects create	mkdir -p -- projects
+list the pdfs	*.pdf
+tell me the date	date
+what time is it now	date
+check disk	df -h
+latest files	sort -r || ls -lht
+where did i save report.pdf	report.pdf
+whats taking up all the room	du -h --max-depth=1
+how full is the disk	df -h
+my ip	ip -br addr || hostname -I
+ram usage	free -h || meminfo
+files over 1 gig	-size +1G
+tiny files	sort -n
+logs from last week	-mtime -7 ;; *.log
+pdfs larger than 2mb	*.pdf ;; -size +2M
+the biggest 3 files	head -n 3
+search notes for pressure	pressure
+look inside data.tar.gz	tar -tvf data.tar.gz
+get rid of empty folders	-empty ;; -delete
+folders that are empty	-type d ;; -empty
+README.md show	cat README.md
+README.md open in nano	nano README.md
+new folder test2	mkdir -p -- test2
+make a copy of logs.txt	cp -ai -- logs.txt
+whats the time	date
+day today	date
+computer name	hostname
+list hidden stuff	-name '.*'
+size of everything here	du -sh || du -h
+yo what files are in here	ls -lh || find .
+show everything sorted by size	ls -lhS || sort -nr
+which files did i touch this week	-mtime -7
+find me pictures	*.jpg
+any big videos around	*.mp4 ;; sort -nr
+README.md how big	du -sh README.md || stat
+clean out the tmp files	*.tmp ;; -delete
+open up README.md	cat README.md || README.md
+throw README.md in src	mv -i -- README.md src
+what's this computer called	hostname
+my username	whoami
+are we online	ping || urlopen
+how much space is free	df -h
+which disk is full	df -h
+check the memory	free -h || meminfo
+kill python	pkill -- python
+stop firefox process	pkill -- firefox
+how many cores	nproc
+cpu model	lscpu
+list services	systemctl list-units
+show me README.md please	cat README.md
+peek at data.tar.gz	tar -tvf data.tar.gz
+make logs folder	mkdir -p -- logs
+new dir called build	mkdir -p -- build
+go to the src dir	cd -- src
+back up README.md	cp -ai -- README.md README.md.bak
+lines with error in app.log	grep ;; error ;; app.log
+find hello in README.md	grep ;; hello ;; README.md
+count the words in README.md	wc -w

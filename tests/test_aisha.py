@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import re
+import shutil
 import unittest
 import warnings
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -380,7 +381,7 @@ class TestShellSession(LabTest):
         aisha.LEARNED_FILE = os.path.join(self.home.name, "learned.json")
         self.server = HTTPServer(("127.0.0.1", 0), _MockLLM)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
-        cfg = dict(aisha.DEFAULTS, llm_url=f"http://127.0.0.1:{self.server.server_port}/v1",
+        cfg = dict(aisha.DEFAULTS, llm="on", llm_url=f"http://127.0.0.1:{self.server.server_port}/v1",
                    llm_timeout=5.0, threshold=0.7)
         self.sh = aisha.Shell(cfg)
         self.sh.cwd = self.lab
@@ -1145,3 +1146,103 @@ class TestModelMissing(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+class TestBuiltinModel(unittest.TestCase):
+    """The intent model inside aisha: no download, no language model."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.lab = self.tmp.name
+        make_corpus(self.lab)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_bank_templates_still_work(self):
+        sample = {"{file}": "README.md", "{dir}": "src", "{n}": "3", "{text}": '"hello"',
+                  "{url}": "https://example.com", "{host}": "example.com"}
+        bad = []
+        for tmpl in aisha.INTENT_BANK.strip().splitlines():
+            filled = " ".join(sample.get(w, w) for w in tmpl.split())
+            p = aisha.interpret(filled, self.lab)
+            if not p or p.confidence < aisha.DEFAULTS["threshold"]:
+                bad.append(tmpl)
+        self.assertEqual(bad, [], "bank templates the rules no longer handle (regenerate INTENT_BANK)")
+
+    def test_suggestions(self):
+        misses = []
+        with open(os.path.join(HERE, "suggestions.tsv")) as f:
+            for line in f:
+                if line.startswith("#") or not line.strip():
+                    continue
+                phrase, expected = line.rstrip("\n").split("\t")
+                cmds = [p.command for _, p, _ in aisha.suggest(phrase, self.lab)]
+                if not any(all(any(x in c for x in frag.split(" || ")) for frag in expected.split(" ;; ")) for c in cmds):
+                    misses.append(f"{phrase}: {cmds}")
+        self.assertEqual(misses, [])
+
+    def test_nothing_for_nonsense(self):
+        for phrase in ["purple monkey dishwasher", "translate this poem to french"]:
+            self.assertEqual(aisha.suggest(phrase, self.lab), [], phrase)
+
+    def test_synonyms_and_word_order(self):
+        for phrase, frag in [("erase README.md", "rm -- README.md"), ("relocate README.md to src", "mv -i -- README.md src"),
+                             ("README.md delete", "rm -- README.md"), ("folder named projects create", "mkdir -p -- projects")]:
+            p = aisha.interpret(phrase, self.lab)
+            self.assertIn(frag, p.command, phrase)
+
+
+class TestTeaching(LabTest):
+    def shell(self):
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        aisha.LEARNED_FILE = os.path.join(home, "learned.json")
+        sh = aisha.Shell(dict(aisha.DEFAULTS, llm="off"))
+        sh.cwd = self.lab
+        return sh
+
+    def test_templates(self):
+        self.assertEqual(aisha.make_template("frobnicate notes.md", "touch notes.md"), ("frobnicate {1}", "touch {1}"))
+        self.assertEqual(aisha.make_template("add me to docker group", "sudo usermod -aG docker me"),
+                         ("add me to {1} group", "sudo usermod -aG {1} me"))
+        self.assertEqual(aisha.make_template("say 'hi there' to bob", "echo 'hi there' bob"),
+                         ("say {1} to {2}", "echo {1} {2}"))
+
+    def test_teach_by_example_generalises(self):
+        sh = self.shell()
+        answers = ["touch zz1.md"]
+        aisha.ask = lambda prompt: answers.pop(0) if answers else None
+        sh.handle("frobnicate zz1.md")
+        self.assertTrue(os.path.exists(os.path.join(self.lab, "zz1.md")))
+        sh.handle("frobnicate 'other file.md'")          # learned: no question this time
+        self.assertTrue(os.path.exists(os.path.join(self.lab, "other file.md")))
+
+    def test_teach_command(self):
+        sh = self.shell()
+        sh.handle("teach make thing {name} = mkdir -p {name}")
+        sh.handle("make thing alpha")
+        self.assertTrue(os.path.isdir(os.path.join(self.lab, "alpha")))
+        sh.handle("forget make thing {1}")
+        self.assertIsNone(sh.memory.match("make thing beta"))
+
+    def test_picking_a_suggestion_runs_and_is_learned(self):
+        sh = self.shell()
+        answers = ["1"]
+        aisha.ask = lambda prompt: answers.pop(0) if answers else None
+        rc = sh.handle("zz2.md create")   # rules handle it now; force the model path with an odd phrasing
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(os.path.join(self.lab, "zz2.md")))
+
+    def test_language_model_is_off_unless_set_up(self):
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        env = dict(os.environ, AISHA_HOME=home)
+        for k in ("AISHA_LLM", "AISHA_LLM_URL", "AISHA_LLM_MODEL", "AISHA_LLM_SERVER"):
+            env.pop(k, None)
+        r = subprocess.run([sys.executable, "-c", f"""
+import sys, importlib.machinery as m, importlib.util as u
+l = m.SourceFileLoader("aisha", {AISHA!r}); sp = u.spec_from_loader("aisha", l)
+a = u.module_from_spec(sp); sys.modules["aisha"] = a; l.exec_module(a)
+print(a.LLM(a.load_config()).enabled)"""], env=env, capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), "False", r.stderr)
