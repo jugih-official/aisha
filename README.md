@@ -338,13 +338,17 @@ running it.
 ### What the rules understand
 
 Listing; finding by type, name, content, size (incl. ranges), age, owner,
-emptiness, broken links, duplicates; text search; counting; sizes and disk
-usage; showing, following and editing files; copy/move/rename/delete, also
-"find … and delete/move/copy them"; bulk extension renames; creating files
-and folders; `chmod`; zip/tar/extract; downloads; `cd`/`pwd`; memory, CPU,
-processes, OS, IP, ports, drives, internet check, versions, "is X
-installed"; services, packages, reboot/shutdown. `tests/phrases.tsv` lists
-the 180+ requests the test suite checks.
+emptiness, broken links, duplicates, with exclusions ("except python
+files"); text search; counting; sizes and disk usage; showing, following and
+editing files; comparing files; replacing text in files;
+copy/move/rename/delete, also "find … and delete/move/copy them"; bulk
+extension renames; creating files and folders; `chmod`; zip/tar/extract;
+downloads; `cd`/`pwd`; arithmetic; memory, CPU, temperature, battery,
+processes, ports, OS, IP, drives, boot time, internet check, users, groups,
+crontab, versions, "is X installed"; services, packages, reboot/shutdown.
+Actions you rule out ("find tmp files, don't remove them") are never run.
+`tests/phrases.tsv` lists the 240 requests the test suite checks, including
+ones the rules must leave to the model.
 
 | You type | aisha runs |
 |---|---|
@@ -356,6 +360,8 @@ the 180+ requests the test suite checks.
 | `find duplicate files` | `find … -print0 \| xargs -0 -r md5sum \| sort \| uniq -w32 --all-repeated=separate` |
 | `rename all .jpeg files to .jpg` | `for f in *.jpeg; do mv -i -- "$f" "${f%.jpeg}.jpg"; done` (preview, `[y/N]`) |
 | `what's using all my memory` | `ps aux --sort=-%mem \| head -n 11` |
+| `replace "foo bar" with "baz" in all python files` | `find … -iname '*.py' -exec grep -IqiF -e 'foo bar' {} \; -exec sed -i 's/foo bar/baz/g' {} +` (preview, `[y/N]`) |
+| `find all files except python files` | `find … -type f -not -iname '*.py' -print` |
 
 Where a tool might be missing on a minimal system, aisha falls back to
 Python's standard library or `/proc`: zip/unzip → `python3 -m zipfile`,
@@ -379,6 +385,7 @@ aisha                                   # interactive shell
 aisha show the 5 newest files here      # one line, then exit
 aisha -n delete log files older than 30 days   # show the command, run nothing
 aisha --lines < requests.txt            # several plain-language lines
+aisha --doctor                          # check tools, fallbacks and the model
 ```
 
 Inside the shell: `!cmd` forces bash, `?request` skips the rules and asks the
