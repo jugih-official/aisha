@@ -1043,3 +1043,26 @@ class TestRuleReview(LabTest):
         self.assertIn("-not -name '*.*'", self.sure("find files without an extension").command)
         p = self.plan("remove the app folder")
         self.assertFalse(p and "apt" in p.command)
+
+
+class TestPlaces(LabTest):
+    def test_home_spellings(self):
+        for phrase in ["list files in ~home", "list files in home", "list files in $HOME", "list files in my home",
+                       "list files in home folder", "list files in ~"]:
+            self.assertEqual(self.cmd(phrase), "ls -lh -- ~", phrase)
+        self.assertTrue(self.cmd("find big files in ~home").startswith("find ~ "))
+
+    def test_missing_folder_is_kept_not_searched_for(self):
+        for phrase, root in [("list files in nosuchdir", "nosuchdir"), ("list files in ~/nonexistent", "~/nonexistent"),
+                             ("list files in the nosuchdir folder", "nosuchdir")]:
+            p = self.plan(phrase)
+            self.assertEqual(p.command, f"ls -lh -- {aisha.qpath(root)}", phrase)
+            self.assertIn("no folder", p.rationale())
+        os.makedirs(os.path.join(self.lab, "Downloads"))
+        self.assertIn("did you mean Downloads", self.plan("list files in Downlods").rationale())
+        self.assertIn('"${PROJECT}"/src', self.cmd("find files in $PROJECT/src"))
+
+    def test_in_still_means_other_things(self):
+        self.assertIn("measur", self.cmd("find files with measurement data in them"))
+        self.assertIn("--include='*.py'", self.cmd("find TODO in python files"))
+        self.assertIn("-mtime -3", self.cmd("find files modified in the last 3 days"))

@@ -49,7 +49,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 # ---- configuration ----------------------------------------------------------
 
@@ -346,6 +346,9 @@ def qpath(p: str) -> str:
         return "~"
     if p.startswith("~/"):
         return "~/" + shlex.quote(p[2:])
+    m = re.fullmatch(r"\$\{?([A-Za-z_]\w*)\}?(/.*)?", p)
+    if m:                                   # "$PROJECT/src": let bash expand the variable
+        return f'"${{{m.group(1)}}}"' + (shlex.quote(m.group(2)) if m.group(2) else "")
     return shlex.quote(p)
 
 
@@ -724,15 +727,26 @@ def _take_location(u: Utterance, spec: FindSpec) -> None:
         if u.take(pat):
             spec.root = root
             return
-    # "in Downloads", "under the src folder", "in ~/data"
+    # "in Downloads", "under the src folder", "in ~/data", "in ~home", "in $PROJECT"
     pat = (rf"\b{LOC_PREP}\s+(?:the\s+|my\s+)?(?:(?:folder|directory|dir)\s+(?:called\s+|named\s+)?)?"
            r"(\S+)(?:\s+(?:folder|directory|dir)\b)?")
     for m in re.finditer(pat, u.text):
         tok = u.lit(u.o(m, 1))
-        path = resolve(tok, u.cwd, "dir")
+        path = home_alias(tok, u.cwd) or resolve(tok, u.cwd, "dir")
         if path:
             u.blank(m.start(), m.end())
             spec.root = path
+            return
+        named_folder = bool(re.search(r"\b(?:folder|directory|dir)\b", m.group(0)))
+        if named_folder or looks_like_place(tok, m.group(1)):
+            # A folder that isn't there: keep it as the place, so the command says
+            # "No such file or directory" instead of quietly searching for the word.
+            u.blank(m.start(), m.end())
+            spec.root = tok
+            expanded = os.path.expanduser(os.path.expandvars(tok))
+            if "$" not in expanded and not os.path.isdir(os.path.join(u.cwd, expanded)):
+                near = close_folders(tok, u.cwd)
+                spec.why.append(f"no folder {tok} here" + (f"; did you mean {' or '.join(near)}?" if near else ""))
             return
     # a bare path: "find big files ~/videos"
     for low, orig, start in u.remaining():
@@ -741,6 +755,53 @@ def _take_location(u: Utterance, spec: FindSpec) -> None:
             u.blank(start, start + len(orig))
             spec.root = tok
             return
+
+
+def home_alias(tok: str, cwd: str) -> str | None:
+    """'~home', '$HOME', 'home', 'homedir' -> '~' (unless a user or a folder here has that name)."""
+    low = tok.lower().rstrip("/")
+    if low in ("$home", "${home}", "homedir", "home-dir", "~/"):
+        return "~"
+    if low == "~home":
+        try:
+            import pwd
+            pwd.getpwnam("home")
+            return None              # there really is a user called home
+        except (KeyError, ImportError):
+            return "~"
+    if low == "home" and not os.path.isdir(os.path.join(cwd, tok)):
+        return "~"
+    return None
+
+
+# Words after "in" that are not folders ("in them", "in python files", "in total").
+NOT_PLACES = {"them", "it", "its", "their", "there", "total", "order", "detail", "details", "general",
+              "particular", "size", "use", "case", "full", "short", "summary", "bytes", "words", "lines"}
+
+
+def looks_like_place(tok: str, low: str) -> bool:
+    if re.search(r"[/~$]", tok) or low.startswith("qlit"):
+        return True
+    return bool(re.fullmatch(r"[\w.-]+", low)) and not (
+        low in FILLER or low in GENERIC or low in NOT_PLACES or low in TIMEISH or low in NEG_WORDS
+        or type_word(low) or low.isdigit())
+
+
+def close_folders(name: str, cwd: str) -> list[str]:
+    import difflib
+    try:
+        here = [e for e in os.listdir(cwd) if os.path.isdir(os.path.join(cwd, e))]
+    except OSError:
+        here = []
+    home = os.path.expanduser("~")
+    try:
+        homes = ["~/" + e for e in os.listdir(home) if os.path.isdir(os.path.join(home, e)) and not e.startswith(".")]
+    except OSError:
+        homes = []
+    base = os.path.basename(name.rstrip("/")) or name
+    pool = {c: os.path.basename(c) for c in here + homes}
+    hits = difflib.get_close_matches(base.lower(), [v.lower() for v in pool.values()], n=2, cutoff=0.75)
+    return [c for c, v in pool.items() if v.lower() in hits][:2]
 
 
 def add_exts(spec: FindSpec, exts, label: str | None = None) -> None:
