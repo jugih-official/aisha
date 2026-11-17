@@ -1345,3 +1345,16 @@ class TestRuntimeSources(unittest.TestCase):
         finally:
             llm.runtime.stop()
             aisha.DATA_DIR = saved
+
+
+class TestPrompt(LabTest):
+    def test_branch_is_labelled_and_can_be_hidden(self):
+        with open(os.path.join(self.lab, ".git", "HEAD"), "w") as f:
+            f.write("ref: refs/heads/aisha\n")
+        sh = aisha.Shell(dict(aisha.DEFAULTS, llm="off"))
+        sh.cwd = self.lab
+        self.assertIn(" git:aisha ", sh.prompt())
+        self.assertTrue(sh.prompt().startswith("aisha "))
+        sh.cfg["prompt_git"] = False
+        self.assertNotIn("git:", sh.prompt())
+        self.assertEqual(sh.prompt().count("aisha"), 1)

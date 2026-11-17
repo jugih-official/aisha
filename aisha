@@ -49,7 +49,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 
 # ---- configuration ----------------------------------------------------------
 
@@ -67,6 +67,7 @@ DEFAULTS = {
     "threshold": 0.7,                       # rules below this confidence go to the LLM
     "confirm": "llm",                       # llm | always | destructive
     "banner": True,                         # one-line greeting when the shell starts
+    "prompt_git": True,                     # show the git branch in the prompt
     "llm_server": "",                       # llama-server binary aisha starts on demand
     "llm_model_file": "",                   # .gguf model for llm_server
 }
@@ -79,6 +80,7 @@ ENV_KEYS = {
     "threshold": "AISHA_THRESHOLD",
     "confirm": "AISHA_CONFIRM",
     "banner": "AISHA_BANNER",
+    "prompt_git": "AISHA_PROMPT_GIT",
     "llm_server": "AISHA_LLM_SERVER",
     "llm_model_file": "AISHA_LLM_MODEL_FILE",
 }
@@ -112,6 +114,7 @@ def load_config() -> dict:
     cfg["llm_timeout"] = float(cfg["llm_timeout"])
     cfg["threshold"] = float(cfg["threshold"])
     cfg["banner"] = str(cfg["banner"]).lower() not in ("0", "false", "no", "off")
+    cfg["prompt_git"] = str(cfg["prompt_git"]).lower() not in ("0", "false", "no", "off")
     # A language model is used only when it was set up (aisha --setup) or named.
     try:
         with open(CFG_FILE) as f:
@@ -5053,12 +5056,12 @@ class Shell:
         if len(where) > 40:
             where = "…/" + "/".join(where.rstrip("/").split("/")[-2:])
         mark = "❯" if self.rc == 0 else "✗"
-        branch = git_branch(self.cwd)
+        branch = git_branch(self.cwd) if self.cfg.get("prompt_git", True) else ""
         if not (sys.stdout.isatty() and not os.environ.get("NO_COLOR")):
-            return f"aisha {where}{' (' + branch + ')' if branch else ''} {mark} "
+            return f"aisha {where}{' git:' + branch if branch else ''} {mark} "
         # \001..\002 tell readline the escapes take no width
         c = lambda code, s: f"\001\033[{code}m\002{s}\001\033[0m\002"
-        git = f" {c('35', branch)}" if branch else ""
+        git = f" {c('2', 'git:')}{c('35', branch)}" if branch else ""
         return f"{c('36', 'aisha')} {c('34', where)}{git} {c('32' if self.rc == 0 else '31', mark)} "
 
     def repl(self) -> int:
