@@ -931,8 +931,12 @@ class TestRuleReview(LabTest):
             "hey, how do i delete files containing milk?"]
         for phrase in phrases:
             p = self.plan(phrase)
-            if p and aisha.needs_care(p.command):
+            if p and aisha.needs_care(p.command) and not p.checked:
                 self.assertTrue(p.destructive, f"{phrase}: {p.command}")
+
+    def test_create_with_content_asks_only_before_replacing(self):
+        self.assertFalse(self.plan("create fresh.txt with hello").destructive)
+        self.assertTrue(self.plan("create README.md with hello").destructive)
 
     def test_question_after_greeting_is_only_shown(self):
         p = self.plan("hey, how do i delete files containing milk?")
@@ -1110,3 +1114,34 @@ class TestShellWords(LabTest):
             for t in tmpls:
                 names = {f for _, f, _, _ in string.Formatter().parse(t) if f}
                 t.format(**{n: "X" for n in names})
+
+
+class TestModelMissing(unittest.TestCase):
+    def test_message_names_setup_and_existing_models(self):
+        class FakeOllama(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b'{"error":{"message":"model \\"qwen2.5-coder:1.5b\\" not found"}}')
+
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps({"models": [{"name": "llama3.2:3b"}]}).encode())
+
+        srv = HTTPServer(("127.0.0.1", 0), FakeOllama)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            llm = aisha.LLM(dict(aisha.DEFAULTS, llm_url=f"http://127.0.0.1:{srv.server_port}/v1", llm_timeout=5.0))
+            with self.assertRaises(aisha.LLMError) as cm:
+                llm.command_for("x", tempfile.gettempdir(), "")
+            msg = str(cm.exception)
+            self.assertIn("aisha --setup", msg)
+            self.assertIn("llama3.2:3b", msg)
+        finally:
+            srv.shutdown()
+            srv.server_close()

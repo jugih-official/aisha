@@ -420,3 +420,13 @@ today's logs	journalctl --since today
 count files by extension	uniq -c
 what kinds of files are here	uniq -c
 back up this folder	tar -czf ../ ;; date +%F
+
+# -- creating files, any word order
+create testi.md file	touch -- testi.md
+create testi.md	touch -- testi.md
+new file testi.md	touch -- testi.md
+create a markdown file called testi	touch -- testi.md
+create a python file named hello	touch -- hello.py
+create notes.txt with hello world in it	printf '%s\n' 'hello world' > notes.txt
+create testi.md and open it	touch -- testi.md && 
+create reports folder	mkdir -p -- reports

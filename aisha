@@ -49,7 +49,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 # ---- configuration ----------------------------------------------------------
 
@@ -1201,6 +1201,7 @@ class Plan:
     keywords: list = field(default_factory=list)    # words used as search terms
     show_only: bool = False                         # "how do I ...": print, don't run
     runs_on_question: bool = False                  # "how do I use tar": the answer is to run it
+    checked: bool = False                           # the rule already decided whether to ask
     source: str = "rules"           # rules | learned | llm
 
     def rationale(self) -> str:
@@ -1874,31 +1875,75 @@ def h_delete(u: Utterance) -> Plan | None:
     return plan
 
 
+# "a markdown file called notes" -> notes.md
+FILE_KIND_EXT = {"markdown": "md", "md": "md", "text": "txt", "txt": "txt", "python": "py", "shell": "sh",
+                 "bash": "sh", "json": "json", "yaml": "yaml", "csv": "csv", "html": "html", "css": "css",
+                 "javascript": "js", "js": "js", "typescript": "ts", "c": "c", "rust": "rs", "go": "go",
+                 "java": "java", "ruby": "rb", "php": "php", "sql": "sql", "toml": "toml", "ini": "ini", "xml": "xml"}
+CREATE_V = r"\b(?:create|make|new|add|touch|mk|generate|start)\s+(?:me\s+)?(?:a\s+|an\s+|the\s+|some\s+|two\s+|three\s+)?(?:new\s+)?(?:empty\s+|blank\s+)?"
+CREATE_TAIL = (r"(?P<tail>\s+and\s+(?:go|cd|move|step|switch)\s+(?:in|into|to)\s+it|\s+and\s+enter\s+it|"
+               r"\s+and\s+(?:open|edit)\s+it(?:\s+(?:in|with)\s+\S+)?|"
+               r"\s+(?:with|containing|that\s+contains|that\s+says|saying)\s+(?:the\s+(?:text|line|words?)\s+)?(?P<content>.+?)(?:\s+in\s+it)?)?\s*$")
+
+
 def h_create(u: Utterance) -> Plan | None:
-    m = u.peek(r"\b(?:create|make|new|add)\s+(?:a\s+|an\s+|some\s+|two\s+|three\s+)?(?:new\s+)?(?:empty\s+)?(folder|director(?:y|ie)|dir|file)s?"
-               r"\s+(?:called\s+|named\s+|with\s+the\s+name\s+)?(.+?)"
-               r"(\s+and\s+(?:go|cd|move|step|switch)\s+(?:in|into|to)\s+it|\s+and\s+(?:enter|open)\s+it)?$")
+    kinds = r"(?P<kind>folder|director(?:y|ie)|dir|file)s?"
+    ftype = r"(?:(?P<ftype>" + "|".join(FILE_KIND_EXT) + r")\s+)?"
+    m = (u.peek(CREATE_V + ftype + kinds + r"\s+(?:called\s+|named\s+|with\s+the\s+name\s+)?(?P<names>.+?)" + CREATE_TAIL)
+         or u.peek(CREATE_V + r"(?P<names>\S+(?:\s*(?:,|\band\b)\s*\S+)*)\s+" + ftype + kinds + CREATE_TAIL)
+         or u.peek(r"\b(?:create|make|new|touch|mkdir|mk)\s+(?:a\s+|an\s+)?(?:new\s+)?(?:empty\s+)?(?P<names>qlit\d+)" + CREATE_TAIL))
     if not m:
-        m = u.peek(r"\b(?:mkdir|create|make)\s+(folder|directory|dir)?\s*(\S+)()$") if u.peek(r"\bmkdir\b") else None
-        if not m:
-            return None
-    kind = "file" if (m.group(1) or "").startswith("file") else "folder"
-    names = []
-    for item in split_items(u.o(m, 2)):   # names with spaces need quotes, as in bash
+        return None
+    kind = (m.groupdict().get("kind") or "")
+    raw_names = []
+    for item in split_items(u.o(m, "names")):          # names with spaces need quotes, as in bash
         words = item.split()
         if len(words) > 1 and words[0].lower() == "the":
             words = words[1:]
-        names += [u.lit(w) for w in words]
-    if not names or len(names) > 8:
+        raw_names += words
+    names = [u.lit(w) for w in raw_names]
+    if not names or len(names) > 8 or any(w.lower() in ("it", "them", "this", "that", "these", "those", "something", "one")
+                                          for w in raw_names):
         return None
+    if not kind:                         # "create testi.md": a name with an extension is a file
+        if all(n.endswith("/") for n in names):
+            kind = "folder"
+        elif all(re.search(r"\.[A-Za-z0-9]{1,8}$", n) for n in names):
+            kind = "file"
+        else:
+            return None
+    ext = FILE_KIND_EXT.get((m.groupdict().get("ftype") or "").lower())
+    if kind.startswith("file") and ext:
+        names = [n if re.search(r"\.[A-Za-z0-9]{1,8}$", n) else f"{n}.{ext}" for n in names]
+    tail = (m.groupdict().get("tail") or "").strip().lower()
+    content = m.groupdict().get("content")
     u.text = " " * len(u.text)
-    q = " ".join(qpath(n) for n in names)
-    if kind == "file":
-        return Plan(f"touch -- {q}", "create file", names)
+    q = " ".join(qpath(n.rstrip("/") if kind != "file" else n) for n in names)
+    if kind.startswith("file"):
+        why = list(names)
+        if content and len(names) == 1:
+            text = " ".join(u.lit(w) for w in u.o(m, "content").split())
+            plan = Plan(f"printf '%s\\n' {shlex.quote(text)} > {q}", "create file", why + [f'with "{text}"'], checked=True)
+            if os.path.exists(os.path.join(u.cwd, os.path.expanduser(names[0]))):
+                plan.destructive, plan.warning = True, f"! {names[0]} exists; this replaces its contents"
+            return plan
+        cmd = f"touch -- {q}"
+        if re.match(r"and\s+(?:open|edit)\s+it", tail) and len(names) == 1:
+            prog = re.search(r"(?:in|with)\s+(\S+)$", tail)
+            editor = EDITORS.get(prog.group(1))[0] if prog and prog.group(1) in EDITORS else default_editor()[0]
+            cmd += f" && {editor} {q}"
+            why.append(f"and open it in {editor}")
+        existing = [n for n in names if os.path.exists(os.path.join(u.cwd, os.path.expanduser(n)))]
+        if existing:
+            why.append(f"already exists: {', '.join(existing)} (touch only updates its time)")
+        return Plan(cmd, "create file", why)
+    if content:
+        return None
     cmd = f"mkdir -p -- {q}"
-    if m.group(3) and len(names) == 1:
-        cmd += f" && cd -- {qpath(names[0])}"
-    return Plan(cmd, "create folder", names + (["and go into it"] if m.group(3) else []))
+    if tail and re.match(r"and\s+(?:go|cd|move|step|switch|enter)", tail) and len(names) == 1:
+        cmd += f" && cd -- {qpath(names[0].rstrip('/'))}"
+        return Plan(cmd, "create folder", names + ["and go into it"])
+    return Plan(cmd, "create folder", names)
 
 
 def h_chmod(u: Utterance) -> Plan | None:
@@ -3062,7 +3107,7 @@ def interpret(text: str, cwd: str) -> Plan | None:
             plan.why.append("shown, not run: you asked how")
     else:
         plan = _interpret_fixing(text, cwd)
-    if plan and not plan.destructive and needs_care(plan.command):
+    if plan and not plan.destructive and not plan.checked and needs_care(plan.command):
         plan.destructive = True      # whatever built it: changing things always asks
     return plan
 
@@ -3350,6 +3395,16 @@ class Runtime:
         self.proc = None
 
 
+def ollama_models(url: str) -> list[str]:
+    """Models an Ollama server has, via its /api/tags (empty if it isn't Ollama)."""
+    base = re.sub(r"/v1/?$", "", url.rstrip("/"))
+    try:
+        with url_open(base + "/api/tags", timeout=3) as r:
+            return [m["name"] for m in json.load(r).get("models", [])]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+
+
 def tail_file(path: str, n: int = 8) -> str:
     try:
         with open(path, errors="replace") as f:
@@ -3406,8 +3461,11 @@ class LLM:
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")[:300]
             if e.code == 404 and "model" in detail.lower():
-                raise LLMError(f"model {self.cfg['llm_model']} is not installed "
-                               f"(try: ollama pull {self.cfg['llm_model']})") from None
+                have = ollama_models(self.cfg["llm_url"])
+                hint = (f" Models you have: {', '.join(have)} (use one with AISHA_LLM_MODEL=<name>, "
+                        f"or in {CFG_FILE})." if have else "")
+                raise LLMError(f"the model {self.cfg['llm_model']} is not downloaded yet. Run: aisha --setup "
+                               f"(or: ollama pull {self.cfg['llm_model']}).{hint}") from None
             raise LLMError(f"LLM server returned HTTP {e.code}: {detail}") from None
         except ValueError as e:              # 200 but not JSON
             raise LLMError(f"the LLM server sent something that is not JSON ({e})") from None
@@ -3862,6 +3920,8 @@ class Shell:
                 say(yellow("falling back to the rules' best guess:"))
                 partial.source = "guess"
                 return self.execute(partial)
+            say(yellow("The rules don't know this request yet either.") +
+                dim(" Rephrase it, type the bash command, or paste it to the aisha project so it can be added."))
             return 1
         if not cmd:
             say(yellow("that does not look like something a shell command can do."))
