@@ -1830,6 +1830,10 @@ SYSTEM = [  # (pattern, command or alternatives, label)
      [("ss", "ss -tulpn"), (None, PORTS_PY)], "listening ports"),
     (r"\bwho\s+am\s+i\b|\bmy\s+(?:user\s*name|user|login)\b|\bwhich\s+user\b|\bcurrent\s+user\b", "whoami", "current user"),
     (r"\bwho\s+(?:else\s+)?is\s+(?:logged\s+in|online|on)\b|\blogged[- ]in\s+users\b", "who", "logged-in users"),
+    (r"\b(?:what|which)\s+groups\b|\bmy\s+groups\b|\bgroups\s+am\s+i\s+in\b", "groups", "your groups"),
+    (r"\b(?:all\s+|the\s+|list\s+of\s+)?(?:user\s+accounts|users)\b(?!\s+(?:logged|online))", "cut -d: -f1 /etc/passwd",
+     "user accounts"),
+    (r"\b(?:my\s+)?(?:crontab|cron\s+jobs|scheduled\s+(?:jobs|tasks))\b", "crontab -l", "your cron jobs"),
     (r"\bwhat\s+day\s+is\s+(?:it|today)\b|\b(?:the\s+)?(?:date|time)(?:\s+is\s+it)?\b|\btoday's\s+date\b", "date", "date and time"),
     (r"\bcalendar\b", [("cal", "cal"), (None, "python3 -m calendar $(date '+%Y %-m')")], "calendar"),
     (r"\bhost\s*name\b|\b(?:computer|machine)\s+name\b", "hostname", "hostname"),
@@ -2047,8 +2051,73 @@ def h_pkg_search(u: Utterance) -> Plan | None:
     return Plan(f"{verb} {name}", "packages", [f"search {pm} for {u.lit(u.o(m, 1))}"])
 
 
+def h_compare(u: Utterance) -> Plan | None:
+    m = u.peek(r"\b(?:compare|diff|(?:the\s+)?differences?\s+between|what\s+changed\s+between)\s+(\S+)\s+"
+               r"(?:and|with|to|vs\.?|versus|against)\s+(\S+)\s*$")
+    if not m:
+        return None
+    a, b = resolve(u.lit(u.o(m, 1)), u.cwd), resolve(u.lit(u.o(m, 2)), u.cwd)
+    if not a or not b:
+        return None
+    u.text = " " * len(u.text)
+    rec = os.path.isdir(os.path.join(u.cwd, os.path.expanduser(a)))
+    return Plan(f"diff -u{'r' if rec else ''} -- {qpath(a)} {qpath(b)}", "compare", [f"{a} vs {b}"])
+
+
+def sed_escape(text: str, replacement: bool = False) -> str:
+    chars = "\\/&\n" if replacement else "\\/.*[]^$\n"
+    return "".join("\\" + c if c in chars else c for c in text).replace("\\\n", "\\n")
+
+
+def h_replace(u: Utterance) -> Plan | None:
+    m = u.peek(r"\b(?:replace|substitute|change|swap)\s+(?:all\s+|every\s+)?(?:the\s+(?:word|text|string)\s+)?(\S+)\s+"
+               r"(?:with|by|to|into|for)\s+(\S+)\s+(?:in|inside|within|across|throughout)\s+(.+)$")
+    if not m:
+        return None
+    old, new = u.lit(u.o(m, 1)), u.lit(u.o(m, 2))
+    if not old:
+        return None
+    expr = shlex.quote(f"s/{sed_escape(old)}/{sed_escape(new, True)}/g")
+    target = u.lit(u.o(m, 3).strip())
+    u.text = " " * len(u.text)
+    file = resolve(target, u.cwd, "file")
+    why = [f'"{old}" → "{new}"', "every occurrence"]
+    if file:
+        return Plan(f"sed -i {expr} -- {qpath(file)}", "replace", why + [file], destructive=True,
+                    preview=f"grep -nF -- {shlex.quote(old)} {qpath(file)}",
+                    warning=f"! changes {file} in place")
+    sub = Utterance(u.o(m, 3), u.cwd, u.literals)
+    spec = FindSpec()
+    parse_filters(sub, spec)
+    if not spec.exts and not spec.names:
+        return None   # never rewrite every file under here from a vague target
+    spec.ftype = "f"
+    spec.content.append(("content", old, f'"{old}"'))
+    cmd = render_find(spec, f"exec:sed -i {expr}")
+    plan = Plan(cmd, "replace", why + [where_label(spec, True)] + spec.why, destructive=True,
+                preview=render_find(spec), warning="! changes the files listed above in place")
+    return finish(sub, plan, 0, spec)
+
+
+def h_calc(u: Utterance) -> Plan | None:
+    text = " ".join(u.lit(t) for t in u.orig.split())
+    m = re.match(r"^\s*(?:what\s+is|what's|calculate|compute|how\s+much\s+is|evaluate|solve)?\s*"
+                 r"([\d\s.+\-*/()%^x×÷]+?)\s*\??\s*$", text, re.I)
+    if not m or not re.search(r"\d", m.group(1)) or not re.search(r"\d\s*[-+*/%^x×÷]\s*[\d(]", m.group(1)):
+        return None
+    if re.fullmatch(r"\s*[\d\s]+\s*", m.group(1)):
+        return None
+    expr = re.sub(r"\s+", "", m.group(1)).replace("^", "**").replace("×", "*").replace("x", "*").replace("÷", "/")
+    try:
+        compile(expr, "<calc>", "eval")
+    except SyntaxError:
+        return None
+    u.text = " " * len(u.text)
+    return Plan(f"python3 -c {shlex.quote(f'print({expr})')}", "calculate", [expr])
+
+
 HANDLERS = [h_system, h_power, h_version, h_installed, h_port, h_pkg_search, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
-            h_find_then, h_reext, h_download, h_copy_move, h_delete, h_read, h_grep, h_count, h_size, h_find, h_list]
+            h_find_then, h_reext, h_download, h_compare, h_replace, h_calc, h_copy_move, h_delete, h_read, h_grep, h_count, h_size, h_find, h_list]
 
 
 # Words the rules key on. A leftover word one typo away from one of these is
@@ -2173,7 +2242,7 @@ newest oldest recent empty hidden old big
 
 # Real commands that are also everyday English verbs ("go up", "kill firefox",
 # "find big files"). For these, a confident rules parse wins over bash.
-AMBIGUOUS_FIRST = {"go", "kill", "find", "sort", "open", "make", "which", "who", "file", "install",
+AMBIGUOUS_FIRST = {"go", "kill", "find", "sort", "open", "make", "which", "who", "file", "install", "compare",
                    "time", "du", "df", "free", "locate", "look", "see", "show", "cd", "zip",
                    "unzip", "watch", "head", "tail", "touch", "less", "more", "split"}
 

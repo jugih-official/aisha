@@ -673,3 +673,37 @@ class TestDoctor(unittest.TestCase):
         r = subprocess.run([sys.executable, AISHA, "--doctor"], capture_output=True, text=True, env=env, timeout=30)
         self.assertIn("doctor", r.stderr)
         self.assertIn(r.returncode, (0, 1))
+
+
+class TestEditingCommands(LabTest):
+    def test_replace_special_characters(self):
+        path = os.path.join(self.lab, "cfg.txt")
+        with open(path, "w") as f:
+            f.write("url=a.b/c*\nkeep=axb/c\n")
+        cmd = self.cmd('replace "a.b/c*" with "x&y\\\\z" in cfg.txt')
+        subprocess.run(["bash", "-c", cmd], cwd=self.lab, check=True)
+        with open(path) as f:
+            self.assertEqual(f.read(), "url=x&y\\\\z\nkeep=axb/c\n")
+
+    def test_replace_across_files_only_touches_matches(self):
+        for name, text in {"a.py": "old = 1\n", "b.py": "new = 2\n", "c.txt": "old\n"}.items():
+            with open(os.path.join(self.lab, name), "w") as f:
+                f.write(text)
+        b_mtime = os.path.getmtime(os.path.join(self.lab, "b.py"))
+        p = self.plan("replace old with fresh in all python files")
+        self.assertTrue(p.destructive)
+        subprocess.run(["bash", "-c", p.command], cwd=self.lab, check=True)
+        read = lambda n: open(os.path.join(self.lab, n)).read()
+        self.assertEqual(read("a.py"), "fresh = 1\n")
+        self.assertEqual(read("c.txt"), "old\n")
+        self.assertEqual(os.path.getmtime(os.path.join(self.lab, "b.py")), b_mtime)
+
+    def test_calculator(self):
+        for q, out in [("what is 2+2", "4"), ("calculate (12*7)/3", "28.0"), ("how much is 2^10", "1024")]:
+            r = subprocess.run(["bash", "-c", self.cmd(q)], capture_output=True, text=True)
+            self.assertEqual(r.stdout.strip(), out, q)
+
+    def test_compare(self):
+        r = subprocess.run(["bash", "-c", self.cmd("compare README.md and run1/notes.txt")],
+                           cwd=self.lab, capture_output=True, text=True)
+        self.assertIn("+Sensor log", r.stdout)

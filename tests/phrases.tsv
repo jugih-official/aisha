@@ -253,3 +253,21 @@ list everything except pdfs	-not ;; *.pdf
 find files excluding .log files	-not ;; *.log
 find folders that are not empty	-type d ;; -not -empty
 find non-empty files	-not -empty
+
+# -- compare, replace, calculate, accounts; and requests that belong to the model
+summarize this log file	!LLM
+write a script that backs up my home folder	!LLM
+play some music	!LLM
+remind me in 10 minutes	!LLM
+make a new python script called hello.py	!LLM
+compare README.md and logs.txt	diff -u -- README.md logs.txt
+what's the difference between README.md and logs.txt	diff -u -- README.md logs.txt
+replace hello with goodbye in README.md	sed -i ;; s/hello/goodbye/g ;; README.md
+replace "foo bar" with "baz" in all python files	-iname '*.py' ;; sed -i ;; s/foo bar/baz/g
+what is 2+2	print(2+2)
+calculate (12*7)/3	print((12*7)/3)
+how much is 2^10	print(2**10)
+show all users	/etc/passwd
+what groups am i in	groups
+show my crontab	crontab -l
+how many words are in README.md	wc -w < README.md
