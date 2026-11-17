@@ -93,7 +93,7 @@ zip up run1	run1.zip
 extract data.tar.gz	-xf data.tar.gz
 extract backup.zip	backup.zip
 extract data.tar.gz into out	-C out
-back up README.md	cp -a -- README.md README.md.bak
+back up README.md	cp -ai -- README.md README.md.bak
 download https://example.com/file.zip	https://example.com/file.zip ;; file.zip
 rename all .jpeg files to .jpg	for f in *.jpeg ;; .jpg
 
@@ -219,8 +219,8 @@ search my documents for budget	~/Documents ;; budget
 what files did i change today	-daystart -mtime 0
 get rid of all the .bak files	*.bak ;; -delete
 clean up temp files	*.tmp ;; -delete
-make a copy of README.md	cp -a -- README.md README-copy.md
-duplicate README.md	cp -a -- README.md README-copy.md
+make a copy of README.md	cp -ai -- README.md README-copy.md
+duplicate README.md	cp -ai -- README.md README-copy.md
 what's the size of run1	du -sh run1
 how much space does src take	du -sh src
 whats eating my disk space	du -h --max-depth=1

@@ -395,11 +395,28 @@ Inside the shell: `!cmd` forces bash, `?request` skips the rules and asks the
 LLM, `explain <request>` shows what would run, `learned` / `forget <request>`
 manage remembered phrases, `llm` checks the model, `help` lists examples.
 
-Commands that delete or overwrite data always ask `[y/N]` first, and deletes
-and bulk moves show the matching files before asking. The rules never build
-a delete from a vague sentence ("clean up", "delete everything"). Model
-commands with `sudo`, recursive `chmod`, `curl | sh`, service stops and the
-like also ask `[y/N]`.
+### Safety
+
+- Anything that deletes, moves in bulk, rewrites or overwrites files asks
+  `[y/N]`, whoever wrote the command (rules, model or memory). Deletes,
+  bulk moves and replacements first list exactly the files they will touch.
+- Model commands also ask `[Y/n]`; ones with `sudo`, `sed -i`,
+  `rsync --delete`, `git push --force`/`reset`/`clean`, `> file`,
+  recursive `chmod`, `curl | sh`, `kill -9`, service or package changes
+  ask `[y/N]`.
+- The rules never guess a delete: "clean up" or "delete everything" get
+  no plan; "the empty file" without a name gets no plan; a named file that
+  isn't there gets no plan; "the largest files" without a count goes to the
+  model. Places ("in ~/") are never targets, and home, `/` and system
+  folders are never deleted from words. Folder deletes keep the folder they
+  start in.
+- Actions you rule out ("find tmp files, don't remove them") never run, and
+  a "not" the rules can't place sends the request to the model.
+- Extraction never replaces existing files; copies and backups ask before
+  overwriting.
+- Names and search terms are always quoted, so text like `$(…)` in a file
+  name is never executed.
+- `aisha -n …` and "how do I …" only show the command.
 
 ### Local LLM (optional)
 

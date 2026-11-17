@@ -49,7 +49,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 # ---- configuration ----------------------------------------------------------
 
@@ -1671,7 +1671,7 @@ def h_copy_move(u: Utterance) -> Plan | None:
         src = u.lit(u.o(mc, 1)) if not srcs[0].startswith("'") else srcs[0].strip("'")
         stem_, ext = os.path.splitext(src.rstrip("/"))
         dest = f"{stem_}-copy{ext}"
-        return Plan(f"cp -a -- {qpath(src)} {qpath(dest)}", "copy", [f"{src} → {dest}"])
+        return Plan(f"cp -ai -- {qpath(src)} {qpath(dest)}", "copy", [f"{src} → {dest}"])
     mb = u.peek(r"\b(?:back\s*up|make\s+a\s+backup\s+of|create\s+a\s+backup\s+of)\s+(.+)$")
     if mb:
         srcs = resolve_sources(u, u.o(mb, 1))
@@ -1679,7 +1679,7 @@ def h_copy_move(u: Utterance) -> Plan | None:
             return None
         u.text = " " * len(u.text)
         src = srcs[0]
-        return Plan(f"cp -a -- {src} {src}.bak", "backup", [f"copy {src} to {src}.bak"])
+        return Plan(f"cp -ai -- {src} {src}.bak", "backup", [f"copy {src} to {src}.bak"])
     if not m:
         return None
     verb = m.group(1)
