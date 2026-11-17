@@ -40,6 +40,32 @@ def make_lab(root):
             f.write(text)
 
 
+def make_corpus(root):
+    """The lab plus the files tests/phrases.tsv talks about."""
+    import tarfile
+    import zipfile
+    make_lab(root)
+    os.makedirs(os.path.join(root, "var", "log"))
+    for path, text in {"var/log/app.log": "error: disk\n", "run.sh": "echo hi\n", "logs.txt": "x\n",
+                       ".hidden": ""}.items():
+        with open(os.path.join(root, path), "w") as f:
+            f.write(text)
+    with zipfile.ZipFile(os.path.join(root, "backup.zip"), "w") as z:
+        z.writestr("a.txt", "a")
+    with tarfile.open(os.path.join(root, "data.tar.gz"), "w:gz") as t:
+        t.add(os.path.join(root, "README.md"), "README.md")
+
+
+def load_phrases():
+    out = []
+    with open(os.path.join(HERE, "phrases.tsv")) as f:
+        for line in f:
+            if line.strip() and not line.startswith("#"):
+                phrase, expected = line.rstrip("\n").split("\t")
+                out.append((phrase, expected))
+    return out
+
+
 class LabTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -149,6 +175,40 @@ class TestRules(LabTest):
         cmd = self.cmd("how many files are in this project")
         self.assertEqual(self.run_cmd(cmd), ["6"])
         self.assertEqual(self.cmd("count lines in README.md"), "wc -l < README.md")
+
+
+class TestPhraseCorpus(unittest.TestCase):
+    """Every line of tests/phrases.tsv."""
+
+    def test_corpus(self):
+        with tempfile.TemporaryDirectory() as lab:
+            make_corpus(lab)
+            failures = []
+            for phrase, expected in load_phrases():
+                problem = check_phrase(phrase, expected, lab)
+                if problem:
+                    failures.append(f"{phrase!r}: {problem}")
+            self.assertEqual(failures, [], "\n" + "\n".join(failures))
+
+
+def check_phrase(phrase, expected, lab):
+    threshold = aisha.DEFAULTS["threshold"]
+    if expected == "!SHELL":
+        return None if aisha.looks_like_shell(phrase, None, lab) else "should run as bash"
+    if aisha.looks_like_shell(phrase, None, lab):
+        return "went to bash"
+    plan = aisha.interpret(phrase, lab)
+    if expected == "!LLM":
+        if plan and plan.confidence >= threshold:
+            return f"rules too sure ({plan.confidence:.2f}): {plan.command}"
+        return None
+    if not plan:
+        return "no plan"
+    if plan.confidence < threshold:
+        return f"low confidence {plan.confidence:.2f}: {plan.rationale()} :: {plan.command}"
+    missing = [frag for frag in expected.split(" ;; ")
+               if not any(alt in plan.command for alt in frag.split(" || "))]
+    return f"missing {missing} in: {plan.command}" if missing else None
 
 
 class TestEverydayPhrases(LabTest):

@@ -1,0 +1,155 @@
+# phrase	expected
+# expected: fragments the command must contain, separated by " ;; "
+#   !LLM    the rules must not be confident (the model, or "don't know", takes it)
+#   !SHELL  the line must run in bash unchanged
+# Runs against the fixture in test_aisha.make_corpus().
+
+# -- listing
+list files	ls -lh
+show me what's here	ls -lh
+what's in this folder	ls -lh
+list everything including hidden files	ls -lhA
+list only folders	ls -lhd -- */
+list files by date	ls -lht
+show the 10 most recent files	head -n 10
+list all pdf files	*.pdf
+show files in src	ls -lh -- src
+show me hidden files	-name '.*' ;; -maxdepth 1
+show the biggest files in this folder	ls -lhS
+
+# -- finding
+find all python files	-iname '*.py'
+find files named config	-iname '*config*'
+find files containing TODO	-exec grep -IqiF -e todo
+find files bigger than 100mb	-size +100M
+find large files over 1 gb	-size +1G
+find empty files	-type f ;; -empty
+find files modified in the last hour	-mmin -60
+find files changed in the last 10 minutes	-mmin -10
+find files modified this week	-mtime -7
+find files older than 30 days	-mtime +30
+find files older than a year	-mtime +365
+find recursively files older that 2 months from this folder	-mtime +60
+find recently modified files	sort -r
+find all images	-iname '*.jpg'
+find log files larger than 50mb	-iname '*.log' ;; -size +50M
+locate the file called report.pdf	-iname report.pdf
+find folders named node_modules	-type d ;; node_modules
+find all .log files in /var/log	find /var/log ;; *.log
+find files owned by root	-user root
+find executable files	-executable
+find broken symlinks	-xtype l
+find files with spaces in their names	'* *'
+find files on this folder that has the measurement data	-iname '*measur*' ;; grep -IqiF -e measur
+which files mention "invoice"	-e invoice
+find files in run1 modified today	find run1 ;; -daystart -mtime 0
+
+# -- text search
+search for "error" in all log files	--include='*.log' ;; error
+grep for TODO in this project	grep -rniIF ;; TODO
+which files contain the word password	-e password
+show lines containing error in app.log	grep ;; error ;; app.log
+find TODO in python files	--include='*.py' ;; TODO
+
+# -- counting and sizes
+count lines in all python files	xargs -0 cat | wc -l
+how many files are here	wc -l
+how many folders are in this directory	-type d ;; wc -l
+count lines in README.md	wc -l < README.md
+how big is this folder	du -sh .
+size of src	du -sh src
+what's taking up space	du -h --max-depth=1
+how much free disk space do I have	df -h
+biggest folders here	du -h --max-depth=1
+total size of all pdfs	du -ch
+
+# -- reading and editing
+show README.md	cat README.md
+print the first 20 lines of notes.txt	head -n 20 run1/notes.txt
+last 50 lines of app.log	tail -n 50 var/log/app.log
+follow app.log	tail -f var/log/app.log
+watch the log app.log	tail -f var/log/app.log
+open README.md	cat README.md
+edit README.md	README.md
+edit logs.txt with micro	micro logs.txt
+edit logs.txt using nano	nano logs.txt
+open notes.txt in vim	vim run1/notes.txt
+
+# -- file operations
+copy README.md to backup.md	cp -i -- README.md backup.md
+move README.md into src	mv -i -- README.md src
+rename README.md to readme.txt	mv -i -- README.md readme.txt
+delete old.tmp	rm -- old.tmp
+remove the src folder	rm -r -- src
+delete all empty folders	-type d ;; -empty ;; -delete
+delete files older than 2 months	-mtime +60 ;; -delete
+find logs older than 2 months and move them to archive	-mtime +60 ;; -exec mv -i -t archive
+make a folder called test	mkdir -p -- test
+create directories a, b and c	mkdir -p -- a b c
+create an empty file notes.md	touch -- notes.md
+make run.sh executable	chmod +x -- run.sh
+compress src into src.tar.gz	tar -czf src.tar.gz src
+zip up run1	run1.zip
+extract data.tar.gz	tar -xf data.tar.gz
+extract backup.zip	backup.zip
+extract data.tar.gz into out	-C out
+back up README.md	cp -a -- README.md README.md.bak
+download https://example.com/file.zip	https://example.com/file.zip ;; file.zip
+rename all .jpeg files to .jpg	for f in *.jpeg ;; .jpg
+
+# -- navigation
+go to the parent folder	cd ..
+go back	cd -
+go home	cd ~
+cd into run1	cd -- run1
+open the src folder	cd -- src
+where am i	pwd
+
+# -- system
+how much ram do i have	free -h || /proc/meminfo
+what's using all my memory	--sort=-%mem
+top processes by cpu	--sort=-%cpu
+show running processes	ps aux
+is ssh running	pgrep -a -- ssh
+kill process 1234	kill 1234
+restart the nginx service	systemctl restart nginx
+what's my ip address	ip -br addr || hostname -I
+what is my public ip	ifconfig.me
+which ports are open	ss -tulpn || /proc/net/tcp
+what linux version is this	os-release
+what kernel am i running	uname
+how long has the computer been up	uptime
+how many cpu cores	nproc
+show cpu info	lscpu
+list usb drives	lsblk
+show mounted drives	lsblk
+who am i	whoami
+what time is it	date
+what's today's date	date
+show calendar	cal || calendar
+show environment variables	env | sort
+what's in my path	PATH
+clear the screen	clear
+install htop	install htop
+update the system	apt update
+uninstall htop	remove htop
+
+# -- the model's job
+translate this to french	!LLM
+find duplicate files	md5sum ;; uniq -w32
+make a gif from video.mp4	!LLM
+what is the weather	!LLM
+find the file with the invoice from last tuesday	!LLM
+send an email to my boss	!LLM
+
+# -- plain bash
+ls -la	!SHELL
+git log --oneline	!SHELL
+grep -rn foo .	!SHELL
+cat README.md | wc -l	!SHELL
+sudo apt update	!SHELL
+python3 --version	!SHELL
+echo hello	!SHELL
+cd /tmp	!SHELL
+FOO=1 ./run.sh	!SHELL
+for f in *.txt; do echo $f; done	!SHELL

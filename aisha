@@ -482,10 +482,12 @@ class FindSpec:
     why: list = field(default_factory=list)
     unparsed: list = field(default_factory=list)    # words seen but not understood
     exclude: list = field(default_factory=list)     # -not -path patterns
+    owner: str | None = None
+    broken: bool = False
 
     def narrowed(self) -> bool:
-        return bool(self.exts or self.names or self.hidden or self.empty
-                    or self.executable or self.size or self.time or self.content)
+        return bool(self.exts or self.names or self.hidden or self.empty or self.executable
+                    or self.size or self.time or self.content or self.owner or self.broken)
 
 
 MOD = r"(?:(?:modified|changed|edited|created|updated|touched|saved|made|written)\s+)?"
@@ -684,6 +686,9 @@ def take_ext(u: Utterance, spec: FindSpec) -> None:
 
 
 def take_name(u: Utterance, spec: FindSpec) -> None:
+    if u.take(r"\bwith\s+(?:a\s+)?(?:spaces?|blanks?)\s+in\s+(?:the|their|its)\s+(?:file\s*)?names?\b"):
+        spec.names.append("* *")
+        spec.why.append("name has a space")
     rules = [
         (r"\bwhose\s+(?:file)?names?\s+(?:(contains?|includes?|has|have|is|are|matches|match)|(starts?\s+with|begins?\s+with)|(ends?\s+with))\s+(\S+)", None),
         (r"\bwith\s+(?:a\s+)?(?:file)?names?\s+(?:(containing|including|like|matching|that\s+contains?)|(starting\s+with|beginning\s+with)|(ending\s+with))\s+(\S+)", None),
@@ -778,8 +783,23 @@ def take_content(u: Utterance, spec: FindSpec) -> None:
         return
 
 
+def take_owner(u: Utterance, spec: FindSpec) -> None:
+    m = u.take(r"\b(?:owned|created|made)\s+by\s+(\S+)|\b(?:that|which)\s+belongs?\s+to\s+(\S+)|"
+               r"\bwhose\s+owner\s+is\s+(\S+)")
+    if m:
+        who = next(g for g in m.groups() if g)
+        if who in ("me", "myself", "i"):
+            import getpass
+            who = getpass.getuser()
+        spec.owner = u.lit(who)
+        spec.why.append(f"owner {spec.owner}")
+
+
 def take_types(u: Utterance, spec: FindSpec) -> None:
     found = []
+    if u.take(r"\b(?:broken|dangling|dead)\s+(?:sym(?:bolic\s+)?)?links?\b"):
+        spec.broken = True
+        spec.why.append("broken symlinks")
     for pat, (label, exts) in TYPE_PHRASES:
         if u.take(pat):
             found.append((label, exts))
@@ -824,6 +844,7 @@ def parse_filters(u: Utterance, spec: FindSpec) -> None:
     take_sort_limit(u, spec)
     take_location(u, spec)
     take_ext(u, spec)
+    take_owner(u, spec)
     take_name(u, spec)
     take_content(u, spec)
     take_types(u, spec)
@@ -878,6 +899,10 @@ def find_tests(spec: FindSpec) -> list[str]:
             for e in spec.exts:
                 grp += (["-o"] if grp else []) + ["-iname", shlex.quote("*." + e)]
             t += ["\\("] + grp + ["\\)"]
+    if spec.broken:
+        t += ["-xtype", "l"]
+    if spec.owner:
+        t += ["-user", shlex.quote(spec.owner)]
     if spec.hidden:
         t += ["-name", "'.*'"]
     if spec.empty:
@@ -1021,7 +1046,15 @@ def h_find(u: Utterance) -> Plan | None:
         return None
     by_name = m.group(0).startswith(("where", "locate", "show me where"))
     spec = FindSpec()
+    dupes = u.take(r"\b(?:duplicates?|duplicated|identical|same)(?:\s+(?:content|contents))?\b")
     parse_filters(u, spec)
+    if dupes:
+        spec.ftype = "f"
+        cmd = (render_find(spec).replace(" -print", " -print0", 1)
+               + " | xargs -0 -r md5sum | sort | uniq -w32 --all-repeated=separate")
+        plan = Plan(cmd, "find duplicates", [where_label(spec, True)] + spec.why
+                    + ["same content (md5), grouped"])
+        return finish(u, plan, 0, spec)
     guessed = absorb_keywords(u, spec, "name" if by_name else "any")
     cmd = render_find(spec)
     plan = Plan(cmd, "find", [where_label(spec, True)] + spec.why)
@@ -1035,6 +1068,7 @@ LIST_V = (r"\b(?:list|ls|show(?:\s+me)?|display|view|see|sort|what\s+do\s+(?:i|w
 def h_list(u: Utterance) -> Plan | None:
     if not u.take(LIST_V):
         return None
+    with_hidden = bool(u.take(r"\b(?:including|incl|with|plus|and|also)\s+(?:the\s+)?hidden(?:\s+(?:ones|files|items|folders))?\b"))
     spec = FindSpec()
     parse_filters(u, spec)
     u.take(r"\b(?:contents?|everything|entries)\b")
@@ -1044,7 +1078,7 @@ def h_list(u: Utterance) -> Plan | None:
             return None  # an existing file: that's a read, not a list
         spec.root = path
     guessed = absorb_keywords(u, spec, "name")
-    show_all = bool(re.search(r"\ball\b", u.low))
+    show_all = with_hidden or bool(re.search(r"\ball\b", u.low))
     rich = (spec.size or spec.time or spec.content or spec.names or spec.hidden
             or spec.empty or spec.executable or spec.rec or len(spec.exts) > 1
             or (spec.ftype == "f" and spec.limit))
@@ -1507,17 +1541,21 @@ def h_delete(u: Utterance) -> Plan | None:
 
 
 def h_create(u: Utterance) -> Plan | None:
-    m = u.peek(r"\b(?:create|make|new|add)\s+(?:a\s+|an\s+)?(?:new\s+)?(?:empty\s+)?(folder|directory|dir|file)s?"
+    m = u.peek(r"\b(?:create|make|new|add)\s+(?:a\s+|an\s+|some\s+|two\s+|three\s+)?(?:new\s+)?(?:empty\s+)?(folder|director(?:y|ie)|dir|file)s?"
                r"\s+(?:called\s+|named\s+|with\s+the\s+name\s+)?(.+?)"
                r"(\s+and\s+(?:go|cd|move|step|switch)\s+(?:in|into|to)\s+it|\s+and\s+(?:enter|open)\s+it)?$")
     if not m:
         m = u.peek(r"\b(?:mkdir|create|make)\s+(folder|directory|dir)?\s*(\S+)()$") if u.peek(r"\bmkdir\b") else None
         if not m:
             return None
-    kind = m.group(1) or "folder"
-    names = [u.lit(n) for n in split_items(u.o(m, 2))]
-    names = [re.sub(r"^(?:the|a|an)\s+", "", n) for n in names]
-    if not names or any(" " in n and not n.startswith("qlit") and len(n.split()) > 3 for n in names):
+    kind = "file" if (m.group(1) or "").startswith("file") else "folder"
+    names = []
+    for item in split_items(u.o(m, 2)):   # names with spaces need quotes, as in bash
+        words = item.split()
+        if len(words) > 1 and words[0].lower() == "the":
+            words = words[1:]
+        names += [u.lit(w) for w in words]
+    if not names or len(names) > 8:
         return None
     u.text = " " * len(u.text)
     q = " ".join(qpath(n) for n in names)
@@ -1603,7 +1641,7 @@ def h_archive(u: Utterance) -> Plan | None:
 
 def h_cd(u: Utterance) -> Plan | None:
     m = u.take(r"\b(?:go|cd|change\s+(?:directory|folder|dir)|move|switch|navigate|jump|take\s+me|step|enter|"
-               r"open\s+(?:the\s+)?(?:folder|directory))\b")
+               r"open\s+(?:the\s+)?(?:folder|directory)|open(?=\s+(?:the\s+|my\s+)?\S+\s+(?:folder|directory|dir)\b))\b")
     if not m:
         return None
     if m.group(0) == "move" and not u.peek(r"^\s*(?:back|up|to|into|in)\b"):
@@ -1669,7 +1707,7 @@ SYSTEM = [  # (pattern, command or alternatives, label)
     (r"\b(?:public|external)\s+ip\b", "python3 -c 'import urllib.request as u; print(u.urlopen(\"https://ifconfig.me/ip\", timeout=10).read().decode())'",
      "public IP (asks ifconfig.me)"),
     (r"\b(?:my\s+|the\s+|local\s+)?ip(?:\s+address(?:es)?)?\b|\bnetwork\s+interfaces?\b", [("ip", "ip -br addr"), (None, "hostname -I")], "network addresses"),
-    (r"\b(?:open|listening|used)\s+ports?\b|\bports?\s+(?:that\s+are\s+)?(?:open|listening|in\s+use)\b|\bwhat\s+is\s+listening\b",
+    (r"\b(?:open|listening|used)\s+ports?\b|\bports?\s+(?:that\s+are\s+|are\s+)?(?:open|listening|in\s+use)\b|\bwhat\s+is\s+listening\b",
      [("ss", "ss -tulpn"), (None, PORTS_PY)], "listening ports"),
     (r"\bwho\s+am\s+i\b|\bmy\s+(?:user\s*name|user|login)\b|\bwhich\s+user\b|\bcurrent\s+user\b", "whoami", "current user"),
     (r"\bwho\s+(?:else\s+)?is\s+(?:logged\s+in|online|on)\b|\blogged[- ]in\s+users\b", "who", "logged-in users"),
@@ -1683,7 +1721,8 @@ SYSTEM = [  # (pattern, command or alternatives, label)
     (r"\b(?:environment|env)\s*(?:variables|vars)\b|\benv\s+vars?\b", "env | sort", "environment variables"),
     (r"\bclear(?:\s+the)?\s+(?:screen|terminal)\b", "clear", "clear screen"),
 ]
-SYSTEM_FILLER = r"\b(?:show|list|display|check|print|tell|what|whats|is|are|the|my|current|me|how|much|give|see|get|all)\b"
+SYSTEM_FILLER = (r"\b(?:show|list|display|check|print|tell|what|whats|is|are|the|my|current|me|how|much|give|see|"
+                 r"get|all|running|which|do|i|have|now|right)\b")
 
 
 def h_system(u: Utterance) -> Plan | None:
@@ -1742,7 +1781,7 @@ def require(plan: Plan, reqs: list) -> Plan:
 
 
 def h_process(u: Utterance) -> Plan | None:
-    m = u.peek(r"\bis\s+(\S+)\s+(?:running|up|alive|active)\b")
+    m = u.peek(r"\bis\s+(\S+)\s+(?:running|up|alive|active)(?:\s+(?:now|right\s+now))?\s*$")
     if m:
         u.text = " " * len(u.text)
         name = u.lit(u.o(m, 1))
@@ -1788,8 +1827,45 @@ def h_package(u: Utterance) -> Plan | None:
     return None
 
 
+def h_download(u: Utterance) -> Plan | None:
+    m = u.peek(r"\b(?:download|fetch|get|grab|save)\s+(?:the\s+file\s+)?(qlit\d+)(?:\s+(?:to|into|as)\s+(\S+))?\s*$")
+    if not m:
+        return None
+    url = u.lit(u.o(m, 1))
+    if not re.match(r"(?:https?|ftp)://", url):
+        return None
+    u.text = " " * len(u.text)
+    dest = u.lit(u.o(m, 2)) if m.group(2) else (
+        os.path.basename(urllib.parse.urlsplit(url).path.rstrip("/")) or "index.html")
+    q, d = shlex.quote(url), qpath(dest)
+    cmd = first_available([
+        ("curl", f"curl -fL -o {d} {q}"),
+        ("wget", f"wget -O {d} {q}"),
+        (None, f"python3 -c 'import sys, urllib.request as u; u.urlretrieve(sys.argv[1], sys.argv[2])' {q} {d}"),
+    ])
+    return Plan(cmd, "download", [f"{url} → {dest}"])
+
+
+def h_reext(u: Utterance) -> Plan | None:
+    """'rename all .jpeg files to .jpg' -> change the extension in bulk."""
+    m = u.peek(r"\b(?:rename|change|convert)\s+(?:the\s+extension\s+of\s+)?(?:all\s+)?(?:the\s+|my\s+)?"
+               r"(?:\*?\.([a-z0-9]{1,8})\s+files|([a-z0-9]{1,8})\s+files|files\s+(?:ending\s+(?:in|with)\s+)?\.([a-z0-9]{1,8}))"
+               r"\s+(?:to|into|as)\s+\.?([a-z0-9]{1,8})(?:\s+files)?\s*$")
+    if not m:
+        return None
+    old = next(g for g in m.groups()[:3] if g)
+    new = m.group(4)
+    if old == new or (m.group(2) and not type_word(old) and old not in CODE_EXTS):
+        return None
+    u.text = " " * len(u.text)
+    cmd = f'for f in *.{old}; do mv -i -- "$f" "${{f%.{old}}}.{new}"; done'
+    return Plan(cmd, "rename", [f"*.{old} → *.{new}", "this folder", "asks before overwriting"],
+                destructive=True, preview=f"ls -1d -- *.{old}",
+                warning=f"! renames the .{old} files listed above")
+
+
 HANDLERS = [h_system, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
-            h_find_then, h_copy_move, h_delete, h_read, h_grep, h_count, h_size, h_find, h_list]
+            h_find_then, h_reext, h_download, h_copy_move, h_delete, h_read, h_grep, h_count, h_size, h_find, h_list]
 
 
 # Words the rules key on. A leftover word one typo away from one of these is
@@ -1895,7 +1971,7 @@ newest oldest recent empty hidden old big
 
 # Real commands that are also everyday English verbs ("go up", "kill firefox",
 # "find big files"). For these, a confident rules parse wins over bash.
-AMBIGUOUS_FIRST = {"go", "kill", "find", "sort", "open", "make", "which", "who", "file",
+AMBIGUOUS_FIRST = {"go", "kill", "find", "sort", "open", "make", "which", "who", "file", "install",
                    "time", "du", "df", "free", "locate", "look", "see", "show", "cd", "zip",
                    "unzip", "watch", "head", "tail", "touch", "less", "more", "split"}
 
@@ -1931,6 +2007,11 @@ def looks_like_shell(line: str, path_env: str | None = None, cwd: str | None = N
     return True
 
 
+SHELL_KEYWORDS = {"for", "while", "until", "if", "case", "select", "function", "time", "coproc", "!"}
+# Pipes, lists, substitutions and redirections, but not "files > 10mb".
+SHELL_OPERATORS = re.compile(
+    r"\|\||&&|[|;`]|\$\(|>>|\d?>&|(?<![<>])[<>]\s*(?!\d+(?:\.\d+)?\s*(?:[kmgt]i?b?|bytes?)\b)\S", re.I)
+
 SHELL_SYNTAX = re.compile(
     r"""^\s*(?: function\s+[\w.:-]+      # function f
               | [\w.:-]+\s*\(\)\s*\{?  # f() {
@@ -1952,11 +2033,12 @@ def _looks_like_shell(line: str, path_env: str | None = None, known: set = froze
     first = toks[0]
     if first.startswith(("./", "/", "~/", "../")):
         return True
-    if first in known:
+    if first in known or first in SHELL_KEYWORDS:
         return True
     if first not in SHELL_BUILTINS and not shutil.which(first, path=path_env):
         return False
-    if first in TEXT_COMMANDS:
+    if first in TEXT_COMMANDS or SHELL_OPERATORS.search(line):
+        return True
         return True
     rest = toks[1:]
     if not rest:
