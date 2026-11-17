@@ -500,33 +500,118 @@ class TestRuntime(unittest.TestCase):
         with self.assertRaises(OSError):
             aisha.extract_archive(z, os.path.join(self.dir, "out"))
 
-    def test_download_resumes(self):
-        payload = bytes(range(256)) * 400
-
+    def _range_server(self, payload, etag='"v1"'):
         class RangeHandler(BaseHTTPRequestHandler):
             def log_message(self, *a):
                 pass
 
             def do_GET(self):
-                rng = self.headers.get("Range")
-                start = int(rng.split("=")[1].rstrip("-")) if rng else 0
+                rng, if_range = self.headers.get("Range"), self.headers.get("If-Range")
+                start = int(rng.split("=")[1].rstrip("-")) if rng and (not if_range or if_range == etag) else 0
+                if start > len(payload):
+                    self.send_response(416)
+                    self.end_headers()
+                    return
                 body = payload[start:]
-                self.send_response(206 if rng else 200)
+                self.send_response(206 if start else 200)
                 self.send_header("Content-Length", str(len(body)))
+                self.send_header("ETag", etag)
                 self.end_headers()
                 self.wfile.write(body)
 
         srv = HTTPServer(("127.0.0.1", 0), RangeHandler)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return f"http://127.0.0.1:{srv.server_port}/model.gguf"
+
+    def _partial(self, dest, data, tag):
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest + ".part", "wb") as f:
+            f.write(data)
+        if tag is not None:
+            with open(dest + ".part.tag", "w") as f:
+                f.write(tag)
+
+    def test_download_resumes_same_file(self):
+        payload = bytes(range(256)) * 400
+        url = self._range_server(payload)
+        dest = os.path.join(self.dir, "m", "model.gguf")
+        self._partial(dest, payload[:1000], '"v1"')
+        aisha.download(url, dest, "model")
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), payload)
+        self.assertFalse(os.path.exists(dest + ".part"))
+        self.assertFalse(os.path.exists(dest + ".part.tag"))
+
+    def test_download_restarts_when_file_changed_or_part_too_big(self):
+        payload = b"new" * 5000
+        url = self._range_server(payload, etag='"v2"')
+        dest = os.path.join(self.dir, "m", "model.gguf")
+        self._partial(dest, b"OLD" * 100, '"v1"')            # different version on the server
+        aisha.download(url, dest, "model")
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), payload)
+        self._partial(dest, b"x" * (len(payload) + 10), '"v2"')   # bigger than the file: 416
+        aisha.download(url, dest, "model")
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), payload)
+
+    def test_tar_symlink_chain_cannot_escape(self):
+        import io
+        import tarfile
+        tpath = os.path.join(self.dir, "evil.tar.gz")
+        with tarfile.open(tpath, "w:gz") as tf:
+            for name, link in [("a/b", ".."), ("a/b/c", "..")]:
+                ti = tarfile.TarInfo(name)
+                ti.type, ti.linkname = tarfile.SYMTYPE, link
+                tf.addfile(ti)
+            ti = tarfile.TarInfo("a/b/c/escaped.txt")
+            ti.size = 2
+            tf.addfile(ti, io.BytesIO(b"hi"))
+        out = os.path.join(self.dir, "deep", "out")
+        os.makedirs(out)
+        with self.assertRaises(OSError):
+            aisha.extract_archive(tpath, out)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "escaped.txt")))
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "deep", "escaped.txt")))
+
+    def test_tar_with_relative_symlink_inside(self):
+        import io
+        import tarfile
+        tpath = os.path.join(self.dir, "rt.tar.gz")
+        with tarfile.open(tpath, "w:gz") as tf:
+            ti = tarfile.TarInfo("bin/libllama.so.1")
+            ti.size, ti.mode = 1, 0o644
+            tf.addfile(ti, io.BytesIO(b"x"))
+            ti = tarfile.TarInfo("bin/libllama.so")
+            ti.type, ti.linkname = tarfile.SYMTYPE, "libllama.so.1"
+            tf.addfile(ti)
+            ti = tarfile.TarInfo("bin/llama-server")
+            ti.size, ti.mode = 3, 0o755
+            tf.addfile(ti, io.BytesIO(b"#!x"))
+        out = os.path.join(self.dir, "out")
+        aisha.extract_archive(tpath, out)
+        self.assertTrue(os.path.islink(os.path.join(out, "bin", "libllama.so")))
+        self.assertTrue(os.access(os.path.join(out, "bin", "llama-server"), os.X_OK))
+
+    def test_non_json_reply_is_an_llm_error(self):
+        class Html(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"<html>oops</html>")
+
+        srv = HTTPServer(("127.0.0.1", 0), Html)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
         try:
-            dest = os.path.join(self.dir, "m", "model.gguf")
-            os.makedirs(os.path.dirname(dest))
-            with open(dest + ".part", "wb") as f:
-                f.write(payload[:1000])
-            aisha.download(f"http://127.0.0.1:{srv.server_port}/model.gguf", dest, "model")
-            with open(dest, "rb") as f:
-                self.assertEqual(f.read(), payload)
-            self.assertFalse(os.path.exists(dest + ".part"))
+            llm = aisha.LLM(dict(aisha.DEFAULTS, llm_url=f"http://127.0.0.1:{srv.server_port}/v1", llm_timeout=5.0))
+            with self.assertRaises(aisha.LLMError):
+                llm.command_for("x", self.dir, "")
         finally:
             srv.shutdown()
             srv.server_close()
@@ -707,3 +792,107 @@ class TestEditingCommands(LabTest):
         r = subprocess.run(["bash", "-c", self.cmd("compare README.md and run1/notes.txt")],
                            cwd=self.lab, capture_output=True, text=True)
         self.assertIn("+Sensor log", r.stdout)
+
+
+class TestReviewRegressions(LabTest):
+    """Bugs found in review; each must stay fixed."""
+
+    def shell(self):
+        sh = aisha.Shell(dict(aisha.DEFAULTS, llm="off"))
+        sh.cwd = self.lab
+        return sh
+
+    def read(self, name):
+        with open(os.path.join(self.lab, name)) as f:
+            return f.read().strip()
+
+    def test_plain_variables_umask_and_options_persist(self):
+        sh = self.shell()
+        sh.handle("d=hello; arr=(a 'b c')")
+        sh.handle('echo "$d ${arr[1]}" > v.txt')
+        self.assertEqual(self.read("v.txt"), "hello b c")
+        sh.handle("umask 077")
+        sh.handle("umask > u.txt")
+        self.assertEqual(self.read("u.txt"), "0077")
+        sh.handle("shopt -s nullglob")
+        sh.handle("echo none*.zzz > g.txt")
+        self.assertEqual(self.read("g.txt"), "")
+
+    def test_rc_files_load(self):
+        rc1, rc2 = os.path.join(self.lab, "rc1"), os.path.join(self.lab, "rc2")
+        with open(rc1, "w") as f:
+            f.write("alias hi='echo hi-from-alias'\n")
+        with open(rc2, "w") as f:
+            f.write("export FROM_RC=yes\n")
+        saved = aisha.RC_FILES
+        aisha.RC_FILES = [rc1, rc2]
+        try:
+            sh = self.shell()
+        finally:
+            aisha.RC_FILES = saved
+        self.assertEqual(sh.env.get("FROM_RC"), "yes")
+        self.assertIn("hi", sh.names)
+
+    def test_real_commands_are_not_replaced(self):
+        for line in ["time make", "watch date", "sort names", "kill 1234", "kill %1"]:
+            self.assertTrue(aisha.looks_like_shell(line, None, self.lab), line)
+
+    def test_more_things_need_a_yes(self):
+        for cmd in ["sed -i 's/a/b/' f", "sed --in-place s/a/b/ f", "rsync -a --delete src/ dst/",
+                    "git checkout -- .", "git push --force", "git push -f origin main", "sort f > f",
+                    "chmod -vR 777 .", "chmod --recursive 777 .", "bash <(curl -s x)", "pkill -9 x",
+                    "cp img /dev/vda", "python3 -c 'import shutil; shutil.rmtree(\"x\")'", "apt install x"]:
+            self.assertTrue(aisha.needs_care(cmd), cmd)
+        for cmd in ["ls 2>/dev/null", "du -h . | sort -hr", "echo hi >&2", "grep x f >/dev/null"]:
+            self.assertFalse(aisha.needs_care(cmd), cmd)
+
+    def test_dry_run_never_executes_bash_lines(self):
+        sh = aisha.Shell(dict(aisha.DEFAULTS, llm="off"), dry_run=True)
+        sh.cwd = self.lab
+        sh.handle("rm -f README.md")
+        sh.handle("!rm -f README.md")
+        self.assertTrue(os.path.exists(os.path.join(self.lab, "README.md")))
+
+
+class TestReviewEntryPoints(unittest.TestCase):
+    def run_aisha(self, *args, stdin=None, cwd=None):
+        env = dict(os.environ, AISHA_LLM="off", AISHA_HOME=tempfile.mkdtemp())
+        return subprocess.run([sys.executable, AISHA, *args], input=stdin, capture_output=True,
+                              text=True, cwd=cwd, env=env, timeout=30)
+
+    def test_dash_n_and_quoted_args(self):
+        with tempfile.TemporaryDirectory() as d:
+            for n in ("victim", "build", "output", "build output"):
+                open(os.path.join(d, n), "w").close()
+            self.run_aisha("-n", "rm", "-f", "victim", cwd=d)
+            self.assertTrue(os.path.exists(os.path.join(d, "victim")))
+            self.assertEqual(self.run_aisha("-n", cwd=d).returncode, 2)
+            self.run_aisha("rm", "-f", "build output", cwd=d)
+            self.assertFalse(os.path.exists(os.path.join(d, "build output")))
+            self.assertTrue(os.path.exists(os.path.join(d, "build")))
+            self.assertTrue(os.path.exists(os.path.join(d, "output")))
+
+    def test_dash_c_scripts_with_comments(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.run_aisha("-c", "# step one\ntouch f1", cwd=d)
+            self.run_aisha("-c", "touch f2 # don't", cwd=d)
+            self.assertTrue(os.path.exists(os.path.join(d, "f1")))
+            self.assertTrue(os.path.exists(os.path.join(d, "f2")))
+
+    def test_lines_commands_do_not_eat_input(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, "sub"))
+            r = self.run_aisha("--lines", stdin="wc -l\ngo to sub\npwd\n", cwd=d)
+            self.assertTrue(r.stdout.strip().endswith("/sub"), r.stdout)
+
+    def test_sigterm_exits_cleanly(self):
+        import signal as sig
+        env = dict(os.environ, AISHA_LLM="off", AISHA_HOME=tempfile.mkdtemp())
+        p = subprocess.Popen([sys.executable, AISHA, "sleep", "20"], env=env,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        import time as _t
+        _t.sleep(1.0)
+        p.send_signal(sig.SIGTERM)
+        self.assertEqual(p.wait(timeout=10), 128 + sig.SIGTERM)
+        r = subprocess.run(["pgrep", "-f", "^sleep 20$"], capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), "", "the command aisha was running is still alive")

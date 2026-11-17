@@ -168,7 +168,7 @@ DESTRUCTIVE_RE = re.compile(
     | \bfind\b[^|;&]*\s-delete\b
     | \bfind\b[^|;&]*-exec\s+rm\b
     | \bdd\b[^|;&]*\bof=/dev/
-    | >\s*/dev/(sd|nvme|hd|mmc|loop)
+    | >\s*/dev/(sd|nvme|hd|mmc|loop|vd|xvd|md|dm-)
     | \bgit\s+(reset\s+--hard|clean\s+-[a-z]*f)
     """,
     re.VERBOSE,
@@ -2258,9 +2258,9 @@ newest oldest recent empty hidden old big
 
 # Real commands that are also everyday English verbs ("go up", "kill firefox",
 # "find big files"). For these, a confident rules parse wins over bash.
-AMBIGUOUS_FIRST = {"go", "kill", "find", "sort", "open", "make", "which", "who", "file", "install", "compare",
-                   "time", "du", "df", "free", "locate", "look", "see", "show", "cd", "zip",
-                   "unzip", "watch", "head", "tail", "touch", "less", "more", "split"}
+AMBIGUOUS_FIRST = {"go", "kill", "find", "open", "make", "which", "who", "file", "install", "compare",
+                   "du", "df", "free", "locate", "look", "see", "show", "cd", "zip", "unzip", "head",
+                   "tail", "touch", "less"}
 
 
 # On Debian `edit` is run-mailcap and `open` is openvt: nobody typing
@@ -2284,7 +2284,10 @@ def looks_like_shell(line: str, path_env: str | None = None, cwd: str | None = N
         plan = interpret(line, cwd)
         if plan and plan.confidence >= threshold:
             return False
-    if (cwd and toks[0] in AMBIGUOUS_FIRST and rest
+    # words, not numbers, %jobs or paths that exist here ("kill 1234" and "kill %1" stay bash)
+    plain = [t for t in rest if not re.fullmatch(r"[%+-]?\d+|%\S*", t)
+             and not os.path.exists(os.path.join(cwd or ".", os.path.expanduser(t)))]
+    if (cwd and toks[0] in AMBIGUOUS_FIRST and plain
             and not any(t.startswith("-") for t in rest)
             and not re.search(r"[|&;<>`$]", line)
             and not all(os.path.exists(os.path.join(cwd, os.path.expanduser(t))) for t in rest)):
@@ -2314,7 +2317,10 @@ def _looks_like_shell(line: str, path_env: str | None = None, known: set = froze
     try:
         toks = shlex.split(line)
     except ValueError:
-        toks = None
+        try:   # "touch f # don't": the apostrophe is inside a comment
+            toks = shlex.split(line, comments=True)
+        except ValueError:
+            toks = None
     if not toks:
         return False
     first = toks[0]
@@ -2508,6 +2514,13 @@ class LLM:
         return f"{self.cfg['llm_model']} at {self.cfg['llm_url']}"
 
     def _post(self, messages: list[dict]) -> str:
+        import http.client
+        try:
+            return self._post_once(messages)
+        except http.client.HTTPException as e:   # e.g. a truncated reply
+            raise LLMError(f"the LLM server's reply broke off ({type(e).__name__})") from None
+
+    def _post_once(self, messages: list[dict]) -> str:
         url = self.cfg["llm_url"].rstrip("/") + "/chat/completions"
         body = json.dumps({"model": self.cfg["llm_model"], "messages": messages,
                            "temperature": 0, "max_tokens": 256, "stream": False}).encode()
@@ -2533,6 +2546,8 @@ class LLM:
                 raise LLMError(f"model {self.cfg['llm_model']} is not installed "
                                f"(try: ollama pull {self.cfg['llm_model']})") from None
             raise LLMError(f"LLM server returned HTTP {e.code}: {detail}") from None
+        except ValueError as e:              # 200 but not JSON
+            raise LLMError(f"the LLM server sent something that is not JSON ({e})") from None
         except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
             reason = getattr(e, "reason", e)
             hint = "" if self._hinted else " Run 'aisha --setup' to add a local model."
@@ -2715,13 +2730,68 @@ RISKY_RE = re.compile(
       | \b(?:curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b | \bkill\s+-9\b | \bkillall\b
       | \bsystemctl\s+(?:stop|disable|mask|restart)\b | \bcrontab\s+-r\b | \bpasswd\b
       | \buser(?:del|mod)\b | \bapt(?:-get)?\s+(?:remove|purge|autoremove)\b
-      | >\s*/etc/ | \bmv\b[^|;&]*\s/dev/null\b | :\(\)\s*\{""",
+      | >\s*/etc/ | \bmv\b[^|;&]*\s/dev/null\b | :\(\)\s*\{
+      | \bsed\b[^|;&]*\s(?:-[a-zA-Z]*i|--in-place) | \brsync\b[^|;&]*--(?:delete|remove-source-files)
+      | \bgit\s+(?:checkout\s+(?:--\s|\.)|restore\b|push\b[^|;&]*(?:\s-f\b|--force)|branch\s+-D
+                 |stash\s+(?:drop|clear)|clean\b|reset\b)
+      | (?<![<>&\d])>(?![>&])\s*(?!/dev/null\b)[^\s|&;]   # > file truncates it
+      | \bchmod\s+(?:-\w*R|--recursive) | \b(?:ba|z|da)?sh\s+<\(\s*(?:curl|wget)
+      | \b(?:pkill|kill|killall)\s+-(?:9|KILL|SIGKILL)\b
+      | \b(?:cp|cat|tee|dd|pv)\b[^|;&]*\s/dev/(?:sd|nvme|hd|mmc|loop|vd|xvd|md|dm-)
+      | \bpython3?\b.*?(?:rmtree|os\.remove|os\.unlink|\.unlink\(|os\.rmdir|truncate)
+      | \bapt(?:-get)?\s+install\b | \bdpkg\s+-[ir]\b | \buseradd\b | \bsystemctl\s+(?:start|enable)\b""",
     re.VERBOSE,
 )
 
 
 def needs_care(cmd: str) -> bool:
     return looks_destructive(cmd) or bool(RISKY_RE.search(cmd))
+
+
+# Bash's own and per-run variables: never carried to the next line.
+SPECIAL_VARS = re.compile(r"(?:BASH\w*|EUID|UID|PPID|SHELLOPTS|FUNCNAME|GROUPS|LINENO|RANDOM|SRANDOM|SECONDS|"
+                          r"EPOCH\w*|PIPESTATUS|HISTCMD|_|__aisha_\w*|COMP_\w*|DIRSTACK|SHLVL|PWD|OLDPWD|"
+                          r"OPTIND|IFS|PS4|COLUMNS|LINES)$")
+
+
+def shell_vars(dump: str) -> str:
+    """From `declare -p; umask -p; shopt -p`: plain (not exported, not readonly)
+    variables, the umask and shell options, ready to source."""
+    out = []
+    for entry in re.split(r"\n(?=declare -|umask |shopt )", dump.strip()):
+        m = re.match(r"declare -([-\w]*) ([A-Za-z_]\w*)", entry)
+        if m:
+            if "x" in m.group(1) or "r" in m.group(1) or SPECIAL_VARS.match(m.group(2)):
+                continue
+            if "=" not in entry.split("\n", 1)[0]:
+                continue  # declared but unset
+        elif not entry.startswith(("umask ", "shopt ")):
+            continue
+        out.append(entry)
+    return "\n".join(out) + "\n"
+
+
+def kill_tree(pid: int, sig: int) -> None:
+    """Signal a process and everything it started (children first), via /proc."""
+    kids: dict[int, list[int]] = {}
+    for entry in os.listdir("/proc"):
+        if entry.isdigit():
+            try:
+                with open(f"/proc/{entry}/stat") as f:
+                    ppid = int(f.read().rsplit(")", 1)[1].split()[1])
+            except (OSError, IndexError, ValueError):
+                continue
+            kids.setdefault(ppid, []).append(int(entry))
+    order, todo = [], [pid]
+    while todo:
+        p = todo.pop()
+        order.append(p)
+        todo += kids.get(p, [])
+    for p in reversed(order):
+        try:
+            os.kill(p, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
 
 
 def git_branch(cwd: str) -> str:
@@ -2763,6 +2833,7 @@ class Shell:
         self._seq = 0
         self._exit_warned = False
         self._cmd_cache: tuple | None = None
+        self.child_stdin: int | None = None      # fd for commands' stdin (--lines)
         atexit.register(shutil.rmtree, self.workdir, True)
         if self.tty is not None:
             for sig in (signal.SIGTSTP, signal.SIGTTOU, signal.SIGTTIN, signal.SIGQUIT):
@@ -2773,7 +2844,7 @@ class Shell:
         """Aliases, functions and exports from ~/.bash_aliases and aisharc."""
         files = [os.path.expanduser(f) for f in RC_FILES if os.path.isfile(os.path.expanduser(f))]
         if files:
-            self.run(" ".join(f". {shlex.quote(f)}" for f in files), track=False)
+            self.run("\n".join(f". {shlex.quote(f)}" for f in files))
 
     # -- entry point for one line
     def handle(self, line: str) -> int:
@@ -2815,17 +2886,61 @@ class Shell:
                 return self.natural(line[7:].strip())
             finally:
                 self.dry_run = saved
+        if word == "kill" and any(t.startswith("%") for t in toks[1:]):
+            return self.job_kill(toks[1:])
         if line.startswith("!"):
-            self.rc = self.run_line(line[1:].strip())
-            return self.rc
+            return self.shell_line(line[1:].strip())
         if line.startswith("?"):
             self.rc = self.via_llm(line[1:].strip(), interpret(line[1:].strip(), self.cwd))
             return self.rc
         if looks_like_shell(line, self.env.get("PATH"), self.cwd, self.cfg["threshold"], self.names):
-            self.rc = self.run_line(line)
-            return self.rc
+            return self.shell_line(line)
         self.rc = self.natural(line)
         return self.rc
+
+    def shell_line(self, line: str) -> int:
+        if self.dry_run:
+            say(bold("$ ") + line)
+            say(dim("(bash line; dry run, not run)"))
+            return 0
+        self.rc = self.run_line(line)
+        return self.rc
+
+    def job_kill(self, args: list[str]) -> int:
+        """kill [-SIG] %N: signal one of aisha's jobs (bash's %N means nothing to bash -c)."""
+        sig, rc = signal.SIGTERM, 0
+        targets = []
+        it = iter(args)
+        for a in it:
+            if a == "-s":
+                a = "-" + next(it, "TERM")
+            if a == "--":
+                continue
+            if a.startswith("-") and not targets:   # -9, -KILL, -SIGTERM
+                name = a[1:].upper()
+                try:
+                    sig = signal.Signals(int(name)) if name.isdigit() else signal.Signals[
+                        name if name.startswith("SIG") else "SIG" + name]
+                except (KeyError, ValueError):
+                    say(f"kill: {a}: invalid signal")
+                    return 1
+            else:
+                targets.append(a)
+        for t in targets:
+            job = self._pick_job(t, ("stopped", "running")) if t.startswith("%") else None
+            try:
+                if job:
+                    os.killpg(job.pid, sig)
+                    if sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT) and job.state == "stopped":
+                        os.killpg(job.pid, signal.SIGCONT)
+                elif t.lstrip("-").isdigit():
+                    os.kill(int(t), sig)
+                else:
+                    rc = 1
+            except (ProcessLookupError, PermissionError) as e:
+                say(f"kill: {t}: {e.strerror}")
+                rc = 1
+        return rc
 
     def run_line(self, line: str) -> int:
         m = re.fullmatch(r"(.*?[^&])\s*&\s*", line)    # "cmd &" but not "a && b"
@@ -2923,8 +3038,9 @@ class Shell:
     # -- running bash, keeping cd/export/alias/function effects
     SCRIPT_HEAD = (
         '__aisha_state=$1 __aisha_defs=$2 __aisha_out=$3; set --\n'
-        '__aisha_save() { local rc=$?; { printf "%s\\0" "$PWD"; env -0; } > "$__aisha_state" 2>/dev/null; '
-        '{ alias -p; declare -f; } > "$__aisha_out" 2>/dev/null; exit $rc; }\n'
+        '__aisha_save() { __aisha_rc=$?; { printf "%s\\0" "$PWD"; env -0; } > "$__aisha_state" 2>/dev/null; '
+        '{ alias -p; declare -f; echo "#__aisha_vars__"; declare -p; umask -p; shopt -p; } '
+        '> "$__aisha_out" 2>/dev/null; exit $__aisha_rc; }\n'
         'trap __aisha_save EXIT\n'
         'shopt -s globstar extglob expand_aliases 2>/dev/null\n'
         '[ -r "$__aisha_defs" ] && . "$__aisha_defs"\n'
@@ -2943,9 +3059,16 @@ class Shell:
             try:
                 if job_control:
                     os.setpgid(0, 0)
+                    if not background:
+                        try:
+                            os.tcsetpgrp(self.tty, os.getpid())   # SIGTTOU is still ignored here
+                        except OSError:
+                            pass
                 for sig in (signal.SIGINT, signal.SIGQUIT, signal.SIGTSTP, signal.SIGTTIN,
                             signal.SIGTTOU, signal.SIGPIPE, signal.SIGXFSZ, signal.SIGCHLD):
                     signal.signal(sig, signal.SIG_DFL)
+                if self.child_stdin is not None:
+                    os.dup2(self.child_stdin, 0)
                 try:
                     os.chdir(self.cwd)
                 except OSError:
@@ -2982,6 +3105,15 @@ class Shell:
                     _, status = os.waitpid(job.pid, os.WUNTRACED if self.tty is not None else 0)
                 except InterruptedError:
                     continue
+                except ExitShell as e:          # aisha is being hung up / terminated
+                    if self.tty is not None:
+                        try:
+                            os.killpg(job.pid, e.code - 128)
+                        except (ProcessLookupError, PermissionError, ValueError):
+                            pass
+                    else:
+                        kill_tree(job.pid, e.code - 128)
+                    raise
                 except ChildProcessError:
                     job.state = "done"
                     break
@@ -3061,10 +3193,11 @@ class Shell:
                 defs = f.read()
         except OSError:
             return
+        defs, _, rest = defs.partition("#__aisha_vars__\n")
         # keep everything but our own helper function
         defs = re.sub(r"(?ms)^__aisha_\w+ \(\) \n\{.*?^\}\n?", "", defs)
         with open(self.defs_file, "w") as f:
-            f.write(defs)
+            f.write(defs + "\n" + shell_vars(rest))
         self.names = set(re.findall(r"(?m)^alias ([^=\s]+)=", defs)) | \
             {n for n in re.findall(r"(?m)^(\S+) \(\) $", defs) if not n.startswith("__aisha")}
 
@@ -3219,6 +3352,9 @@ class Shell:
             except KeyboardInterrupt:
                 say("^C")
                 continue
+            except ExitShell as e:   # hangup or termination at the prompt
+                code = e.code
+                break
             try:
                 self.handle(line)
             except ExitShell as e:
@@ -3291,22 +3427,40 @@ def http_json(url: str):
 
 
 def download(url: str, dest: str, label: str) -> str:
-    """Download with a progress line, resuming a partial .part file."""
+    """Download with a progress line, resuming a partial .part file when the
+    server confirms it is still the same file (If-Range)."""
+    import urllib.request
     os.makedirs(os.path.dirname(dest), exist_ok=True)
-    part = dest + ".part"
+    part, tagfile = dest + ".part", dest + ".part.tag"
     have = os.path.getsize(part) if os.path.exists(part) else 0
+    tag = ""
+    if have and os.path.exists(tagfile):
+        with open(tagfile) as f:
+            tag = f.read().strip()
+    if have and not tag:
+        have = 0                          # cannot prove it is the same file: start over
     headers = {"User-Agent": USER_AGENT}
     if have:
         headers["Range"] = f"bytes={have}-"
-    import urllib.request
-    req = urllib.request.Request(url, headers=headers)
-    with url_open(req, timeout=60) as r:
-        if have and r.status != 206:      # server ignored the range: start over
+        headers["If-Range"] = tag
+    try:
+        r = url_open(urllib.request.Request(url, headers=headers), timeout=60)
+    except urllib.error.HTTPError as e:
+        if e.code != 416:
+            raise
+        for f in (part, tagfile):          # stale partial file: start over
+            if os.path.exists(f):
+                os.unlink(f)
+        return download(url, dest, label)
+    with r:
+        if have and r.status != 206:       # the file changed, or no range support
             have = 0
+        new_tag = r.headers.get("ETag") or r.headers.get("Last-Modified") or ""
+        with open(tagfile, "w") as f:
+            f.write(new_tag)
         total = int(r.headers.get("Content-Length") or 0) + have
-        mode = "ab" if have else "wb"
         done, last = have, 0.0
-        with open(part, mode) as f:
+        with open(part, "ab" if have else "wb") as f:
             while True:
                 chunk = r.read(1 << 20)
                 if not chunk:
@@ -3322,6 +3476,8 @@ def download(url: str, dest: str, label: str) -> str:
     if total and os.path.getsize(part) != total:
         raise OSError(f"download incomplete ({os.path.getsize(part)} of {total} bytes); run setup again to resume")
     os.replace(part, dest)
+    if os.path.exists(tagfile):
+        os.unlink(tagfile)
     return dest
 
 
@@ -3338,36 +3494,68 @@ def pick_llama_asset(assets: list, machine: str | None = None) -> dict | None:
 
 
 def extract_archive(path: str, dest: str) -> None:
-    """Unpack a .zip or .tar.gz into dest, refusing paths that escape it."""
+    """Unpack a .zip or .tar.gz into dest. Nothing is ever written outside dest:
+    every file's real parent folder is checked just before it is written, so
+    neither ../ names nor chains of symlinks can escape. Hard links become copies."""
     os.makedirs(dest, exist_ok=True)
     root = os.path.realpath(dest)
 
-    def safe(name: str) -> str:
-        target = os.path.realpath(os.path.join(root, name))
-        if target != root and not target.startswith(root + os.sep):
+    def inside(p: str) -> bool:
+        return p == root or p.startswith(root + os.sep)
+
+    def target_for(name: str) -> str:
+        name = name.lstrip("/")
+        lexical = os.path.normpath(os.path.join(root, name))
+        if not inside(lexical):
             raise OSError(f"unsafe path in archive: {name}")
-        return target
+        parent = os.path.dirname(lexical)
+        os.makedirs(parent, exist_ok=True)
+        if not inside(os.path.realpath(parent)):
+            raise OSError(f"archive path escapes through a link: {name}")
+        return lexical
+
+    def write(name: str, data_stream, mode: int) -> None:
+        target = target_for(name)
+        if os.path.islink(target):
+            os.unlink(target)
+        with open(target, "wb") as out:
+            shutil.copyfileobj(data_stream, out)
+        os.chmod(target, (mode & 0o777) or 0o644)
 
     if path.endswith(".zip"):
         import zipfile
         with zipfile.ZipFile(path) as z:
             for info in z.infolist():
-                target = safe(info.filename)
-                z.extract(info, root)
-                mode = (info.external_attr >> 16) & 0o777
-                if mode and not info.is_dir():
-                    os.chmod(target, mode)
-    else:
-        import tarfile
-        with tarfile.open(path) as t:
-            for m in t.getmembers():
-                safe(m.name)
-                if m.issym() or m.islnk():
-                    safe(os.path.join(os.path.dirname(m.name), m.linkname))
-            try:
-                t.extractall(root, filter="data")
-            except TypeError:  # Python without extraction filters
-                t.extractall(root)
+                if info.is_dir():
+                    os.makedirs(target_for(info.filename.rstrip("/") + "/x")[:-2], exist_ok=True)
+                    continue
+                with z.open(info) as src:
+                    write(info.filename, src, (info.external_attr >> 16) or 0o644)
+        return
+    import tarfile
+    with tarfile.open(path) as t:
+        members = t.getmembers()
+        by_name = {m.name: m for m in members}
+        for m in members:
+            if m.isdir():
+                d = target_for(m.name.rstrip("/") + "/x")[:-2]
+                os.makedirs(d, exist_ok=True)
+            elif m.isfile():
+                write(m.name, t.extractfile(m), m.mode)
+            elif m.islnk():                      # hard link: copy the file it points to
+                src = by_name.get(m.linkname)
+                if src is not None and src.isfile():
+                    write(m.name, t.extractfile(src), src.mode)
+            elif m.issym():
+                link = target_for(m.name)
+                if os.path.isabs(m.linkname):
+                    raise OSError(f"absolute symlink in archive: {m.name}")
+                if not inside(os.path.normpath(os.path.join(os.path.dirname(link), m.linkname))):
+                    raise OSError(f"symlink points outside the archive: {m.name}")
+                if os.path.lexists(link):
+                    os.unlink(link)
+                os.symlink(m.linkname, link)
+            # devices, fifos and the like are skipped
 
 
 def find_server(root: str) -> str | None:
@@ -3568,6 +3756,15 @@ def login_env() -> dict:
     return env
 
 
+def join_args(args: list[str]) -> str:
+    """`aisha rm -f "build output"` must keep its quoting; `aisha what's here?` must not gain any."""
+    if len(args) == 1:
+        return args[0]
+    if any(not a or re.search(r"""[\s;&|<>$`(){}*\[\]\\"]""", a.rstrip("?!.")) for a in args):
+        return shlex.join(args)
+    return " ".join(args)
+
+
 def is_script(path: str) -> bool:
     if not os.path.isfile(path):
         return False
@@ -3604,12 +3801,19 @@ def main(argv: list[str]) -> int:
             print("aisha: -c: option requires an argument", file=sys.stderr)
             return 2
         line, rest = args[1], args[2:]
-        if _looks_like_shell(line) or not line.strip():
+        if ("\n" in line.strip() or line.lstrip().startswith("#") or not line.strip()
+                or _looks_like_shell(line)):
             os.execvp("bash", bash + ["-c", line] + rest)
         args = [line]
     if args and args[0] == "--lines":
+        lines = sys.stdin.read().splitlines()   # all of it now, so commands can't eat the rest
+        try:
+            fd = os.open("/dev/tty", os.O_RDWR)
+        except OSError:
+            fd = os.open(os.devnull, os.O_RDONLY)
         shell, rc = Shell(load_config()), 0
-        for line in sys.stdin:
+        shell.child_stdin = fd
+        for line in lines:
             try:
                 rc = shell.handle(line)
             except ExitShell as e:
@@ -3618,16 +3822,22 @@ def main(argv: list[str]) -> int:
     dry = False
     if args and args[0] == "-n":
         dry, args = True, args[1:]
+        if not args:
+            print("aisha: -n needs a request, e.g. aisha -n delete old logs", file=sys.stderr)
+            return 2
     if args and not dry and is_script(args[0]):
         os.execvp("bash", bash + args)
     cfg = load_config()
     if args:
         try:
-            return Shell(cfg, dry_run=dry).handle(" ".join(args))
+            return Shell(cfg, dry_run=dry).handle(join_args(args))
         except ExitShell as e:
             return e.code
     if not sys.stdin.isatty():
         os.execvp("bash", bash + ["-s"])   # a script on stdin: plain bash semantics
+    # A login shell started through a script launcher loses the leading "-" of
+    # argv[0]; a session leader on a terminal with no arguments is one too.
+    login = login or (os.getsid(0) == os.getpid() and not argv)
     shell = Shell(cfg, interactive=True)
     if login:
         shell.env.update(login_env())
@@ -3635,12 +3845,20 @@ def main(argv: list[str]) -> int:
     return shell.repl()
 
 
+def _terminate(signum, _frame):
+    raise ExitShell(128 + signum)
+
+
 def cli() -> None:
     """Entry point for the installed launcher (/usr/bin/aisha imports this module)."""
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(sig, _terminate)
     try:
         sys.exit(main(sys.argv[1:]))
     except KeyboardInterrupt:
         sys.exit(130)
+    except ExitShell as e:      # SIGHUP/SIGTERM outside the prompt loop
+        sys.exit(e.code)
 
 
 if __name__ == "__main__":
