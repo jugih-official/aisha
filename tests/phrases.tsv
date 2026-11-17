@@ -138,7 +138,7 @@ uninstall htop	remove htop
 translate this to french	!LLM
 find duplicate files	md5sum ;; uniq -w32
 make a gif from video.mp4	!LLM
-what is the weather	!LLM
+what is the weather	wttr.in
 find the file with the invoice from last tuesday	!LLM
 send an email to my boss	!LLM
 
@@ -258,7 +258,7 @@ find non-empty files	-not -empty
 summarize this log file	!LLM
 write a script that backs up my home folder	!LLM
 play some music	!LLM
-remind me in 10 minutes	!LLM
+remind me in 10 minutes	sleep 600
 make a new python script called hello.py	!LLM
 compare README.md and logs.txt	diff -u -- README.md logs.txt
 what's the difference between README.md and logs.txt	diff -u -- README.md logs.txt
@@ -299,3 +299,124 @@ list files in $HOME	ls -lh -- ~
 list files in home	ls -lh -- ~
 find big files in ~home	find ~ 
 list files in nosuchdir	ls -lh -- nosuchdir
+
+# -- recipes: files, text, dates, system, packages, shell, network, git, users, desktop
+show file tree	tree -C -L 3 || sed -e
+show the folder structure	tree -C -L 3 || sed -e
+show the directory tree of src	src
+details of README.md	stat -- README.md
+when was README.md last modified	stat -- README.md
+what kind of file is backup.zip	backup.zip
+permissions of run.sh	ls -ld -- run.sh
+who owns README.md	stat -c
+sha256 checksum of backup.zip	sha256sum -- backup.zip
+md5 of backup.zip	md5sum -- backup.zip
+show line 1 of README.md	sed -n '1p' -- README.md
+lines 1 to 3 of README.md	sed -n '1,3p' -- README.md
+show README.md with line numbers	cat -n -- README.md
+sort the lines in logs.txt	sort -- logs.txt
+unique lines in logs.txt	sort -u -- logs.txt
+remove duplicate lines from logs.txt	sort -u -o logs.txt -- logs.txt
+how many times does error appear in app.log	grep -oiF -- error ;; app.log ;; wc -l
+reverse logs.txt	tac -- logs.txt
+pretty print data.json	python3 -m json.tool data.json
+show people.csv as a table	people.csv
+append "hello world" to notes.md	printf ;; 'hello world' >> notes.md
+write "hi" to out.txt	hi > out.txt
+empty logs.txt	: > logs.txt
+empty the trash	Trash
+move README.md to the trash	README.md ;; Trash || gio trash
+create a symlink to run.sh	ln -s -- run.sh .
+what's in backup.zip	-l backup.zip
+list the contents of data.tar.gz	tar -tvf data.tar.gz
+base64 encode "hello"	printf '%s' hello | base64
+decode "aGVsbG8="	base64 -d
+convert "Hello" to uppercase	tr '[:lower:]' '[:upper:]'
+generate a strong password	secrets
+generate a password with 32 characters	range(32)
+generate a uuid	/proc/sys/kernel/random/uuid
+pick a random number between 1 and 10	shuf -i 1-10 -n 1
+roll a dice	shuf -i 1-6
+flip a coin	heads tails
+current unix timestamp	date +%s
+convert 1700000000 to a date	date -d @1700000000
+what date is it 30 days from now	date -d '+30 day'
+what day was it 2 weeks ago	date -d '-2 week'
+what day is tomorrow	date -d tomorrow
+what week is it	date +%V
+what time is it in tokyo	TZ=Asia/Tokyo date
+what time is it in new york	TZ=America/New_York date
+what is my timezone	timedatectl || date +
+set a timer for 5 minutes	sleep 300
+remind me to stretch in 20 minutes	sleep 1200 ;; stretch
+system load	/proc/loadavg
+how busy is the cpu	/proc/loadavg
+what architecture is this	uname -m
+which shell am i using	$SHELL
+swap usage	swapon || /proc/swaps
+show inodes	df -i
+what file systems do i have	df -Th
+what gpu do i have	nvidia-smi || lspci || drm
+list usb devices	lsusb || usb/devices
+hardware info	inxi || lscpu
+screen resolution	xrandr || drm
+kernel messages	journalctl -k || dmesg
+show system errors	journalctl -p err || syslog
+am i root	id
+what is my locale	locale
+keyboard layout	localectl || XKB
+shut down in 30 minutes	sudo shutdown +30
+cancel the shutdown	sudo shutdown -c
+check for updates	apt list --upgradable
+remove old packages	sudo apt autoremove
+info about the package bash	apt show 'bash' || apt show bash
+which package provides bash	dpkg -S
+what did i install recently	dpkg.log
+what is $HOME	printf '%s\n' "${HOME}"
+set EDITOR to micro	export EDITOR=micro
+make an alias ll for ls -la	alias ll='ls -la'
+what does grep do	whatis grep
+how do i use tar	man tar
+help for find	man find
+run uptime every 5 seconds	watch -n 5 uptime
+time how long sleep 1 takes	time sleep 1
+run sleep 100 in the background	nohup sleep 100
+run apt update as root	sudo apt update
+is example.com reachable	ping -c 3 example.com || create_connection
+what is the ip of example.com	getent ahosts example.com
+is port 443 open on example.com	/dev/tcp/example.com/443
+headers of https://example.com	https://example.com
+weather in helsinki	wttr.in/helsinki
+what's my default gateway	ip route show default || /proc/net/route
+show dns servers	resolvectl dns || nameserver
+what's my mac address	ip -br link || address
+sync src to backup	src/ ;; backup/
+what changed	git status --short
+show recent commits	git log --oneline
+which branch am i on	git branch --show-current
+list branches	git branch -a
+switch to branch dev	git switch dev
+create a new branch called feature-x	git switch -c feature-x
+commit everything with message "fix typo"	git commit -m 'fix typo'
+push my changes	git push
+pull the latest changes	git pull
+undo the last commit	git reset --soft HEAD~1
+discard my changes to README.md	git restore -- README.md
+show the changes in README.md	git diff -- README.md
+who changed README.md	git log ;; README.md
+stash my changes	git stash push
+clone ggml-org/llama.cpp	git clone -- https://github.com/ggml-org/llama.cpp
+add a user called bob	sudo adduser bob
+add me to the docker group	sudo usermod -aG docker "$USER"
+change my password	passwd
+become root	sudo -i
+google how to bake bread	duckduckgo.com/?q=how+to+bake+bread
+open README.md	cat README.md
+cpu usage	top -bn1
+how much memory is firefox using	ps -C firefox
+how long has sshd been running	ps -C sshd -o pid,etime
+follow the system log	journalctl -f || tail -f
+today's logs	journalctl --since today
+count files by extension	uniq -c
+what kinds of files are here	uniq -c
+back up this folder	tar -czf ../ ;; date +%F

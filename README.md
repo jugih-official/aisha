@@ -337,18 +337,47 @@ running it.
 
 ### What the rules understand
 
-Listing; finding by type, name, content, size (incl. ranges), age, owner,
-emptiness, broken links, duplicates, with exclusions ("except python
-files"); text search; counting; sizes and disk usage; showing, following and
-editing files; comparing files; replacing text in files;
-copy/move/rename/delete, also "find … and delete/move/copy them"; bulk
-extension renames; creating files and folders; `chmod`; zip/tar/extract;
-downloads; `cd`/`pwd`; arithmetic; memory, CPU, temperature, battery,
-processes, ports, OS, IP, drives, boot time, internet check, users, groups,
-crontab, versions, "is X installed"; services, packages, reboot/shutdown.
-Actions you rule out ("find tmp files, don't remove them") are never run.
-`tests/phrases.tsv` lists the 240 requests the test suite checks, including
-ones the rules must leave to the model.
+About 140 kinds of request, without a model:
+
+- **Files** — list, find (type, name, content, size and size ranges, age,
+  owner, empty, hidden, broken links, duplicates, exclusions), file tree,
+  details, type, permissions, owner, checksums, show/head/tail/follow/edit,
+  copy/move/rename/delete (also "find … and delete/move/copy them"), bulk
+  extension renames, trash, symlinks, zip/tar/extract and archive contents,
+  backups, downloads, compare, replace text, count files by extension.
+- **Text** — line N or lines N–M, line numbers, sort, unique lines, remove
+  duplicate lines, count matches, reverse, pretty-print JSON, CSV as a
+  table, append or write a line, empty a file, base64, upper/lower case.
+- **Dates and numbers** — arithmetic, time in a city, timezone, week number,
+  dates N days from now, timestamps, timers, reminders, random numbers,
+  dice, coin, passwords, UUIDs.
+- **System** — memory, CPU usage, load, temperature, battery, disks,
+  inodes, swap, GPU, USB and PCI devices, hardware, screen resolution,
+  processes and what a program uses, ports and freeing one, kernel
+  messages, system errors, boot and service logs, services (start, stop,
+  restart, status, running, failed), logins, sudo rights, locale, keyboard,
+  reboot/shutdown/scheduled shutdown, lock screen.
+- **Packages** — install, remove, search, info, which package owns a file,
+  files of a package, recently installed, check for updates, upgrade, clean
+  up old packages.
+- **Shell** — variables, aliases (saved to `aisharc`), adding to `PATH`,
+  what a command does, its manual, repeat every N seconds, time a command,
+  run in the background, as root, notify when done, `again`.
+- **Network** — IPs, gateway, routes, DNS servers, MAC addresses, is a host
+  up, DNS lookup, is a port open on a host, HTTP headers, weather, Wi-Fi
+  networks/name/password, ssh, scp to and from a server, sync folders,
+  firewall.
+- **Git** (inside a repository) — what changed, recent commits, branch,
+  switch/create branch, commit with a message, push, pull, undo last commit,
+  discard changes, diff of a file, who changed a file, stash, clone, init.
+- **Users and desktop** — add a user, add to a group, change password,
+  become root, switch user, open a website or app, web search, screenshot,
+  volume.
+
+"what can you do" inside aisha lists examples. Actions you rule out ("find
+tmp files, don't remove them") are never run. `tests/phrases.tsv` lists the
+380+ requests the test suite checks, including ones the rules must leave to
+the model.
 
 | You type | aisha runs |
 |---|---|

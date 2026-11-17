@@ -49,7 +49,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.3.1"
+VERSION = "0.4.0"
 
 # ---- configuration ----------------------------------------------------------
 
@@ -215,7 +215,7 @@ they their there these those this that which who what whats where when how
 and or also then so up out ok okay hey hi lets let want need wanna like look looks
 give get tell have has had only really actually currently exactly thing things stuff
 item items entries entry everything first one ones whole
-show display check tell see view give report but anything nothing instead
+show display check tell see view give report but anything nothing instead list print find here
 """.split())
 
 # Dates the rules do not parse. They must not become search keywords; they
@@ -427,6 +427,7 @@ class Utterance:
     """
 
     def __init__(self, text: str, cwd: str, literals: list[str] | None = None):
+        self.raw = text
         self.cwd = cwd
         self.literals: list[str] = list(literals or [])
         text = (text.replace("’", "'").replace("‘", "'")
@@ -1199,6 +1200,7 @@ class Plan:
     unknown: list = field(default_factory=list)
     keywords: list = field(default_factory=list)    # words used as search terms
     show_only: bool = False                         # "how do I ...": print, don't run
+    runs_on_question: bool = False                  # "how do I use tar": the answer is to run it
     source: str = "rules"           # rules | learned | llm
 
     def rationale(self) -> str:
@@ -2094,7 +2096,7 @@ SYSTEM = [  # (pattern, command or alternatives, label)
     (r"\bwhat\s+day\s+is\s+(?:it|today)\b|\b(?:the\s+)?(?:date|time)(?:\s+is\s+it)?\b|\btoday's\s+date\b", "date", "date and time"),
     (r"\bcalendar\b", [("cal", "cal"), (None, "python3 -m calendar $(date '+%Y %-m')")], "calendar"),
     (r"\bhost\s*name\b|\b(?:computer|machine)\s+name\b", "hostname", "hostname"),
-    (r"\b(?:usb\s+)?(?:drives|disks|partitions|block\s+devices|usb\s+sticks?|usb\s+devices)\b|\bmounted\s+(?:drives|disks|file\s*systems)\b|\bwhat\s+is\s+mounted\b",
+    (r"\b(?:usb\s+)?(?:drives|disks|partitions|block\s+devices|usb\s+sticks?)\b|\bmounted\s+(?:drives|disks|file\s*systems)\b|\bwhat\s+is\s+mounted\b",
      "lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT", "drives and partitions"),
     (r"\$?path\s+(?:variable|entries|dirs|directories)\b|\bwhat\s+is\s+in\s+(?:my\s+)?\$?path\b|\bmy\s+\$?path\b",
      "echo \"$PATH\" | tr ':' '\\n'", "PATH entries"),
@@ -2188,7 +2190,9 @@ def h_package(u: Utterance) -> Plan | None:
     m = u.peek(r"\b(install|uninstall|remove|purge)\s+(?:the\s+)?(?:package\s+|program\s+|app\s+)?(\S+)(?:\s+(?:package|program|app))?$")
     if m and (m.group(1) in ("install", "uninstall", "purge") or u.peek(r"\b(?:package|program|app)\b")):
         name = u.lit(u.o(m, 2))
-        if name.lower() in ("folder", "file", "directory", "dir", "files", "folders") or \
+        if name.lower() in TIMEISH or name.lower() in FILLER or name.lower() in (
+                "recently", "today", "lately", "yesterday", "history") or \
+                name.lower() in ("folder", "file", "directory", "dir", "files", "folders") or \
                 os.path.exists(os.path.join(u.cwd, name)):
             return None
         cmd = install_cmd([shlex.quote(name)], remove=m.group(1) != "install")
@@ -2387,7 +2391,601 @@ def h_calc(u: Utterance) -> Plan | None:
     return Plan(f"python3 -c {shlex.quote(f'print({expr})')}", "calculate", [expr])
 
 
-HANDLERS = [h_system, h_power, h_version, h_installed, h_port, h_pkg_search, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
+# ---- recipes: everyday requests with a fixed shape ---------------------------------
+# One table instead of a handler each. A recipe has patterns (on the masked,
+# lower-case text; named groups are slots), slot types, and a command: a
+# template, a list of (tool, template) alternatives, or a function. Slot
+# values are resolved and quoted before they reach the template.
+
+WEB_DOMAIN = (r"[\w-]+(?:\.[\w-]+)*\.(?:com|org|net|io|fi|dev|ai|edu|gov|de|uk|eu|se|no|dk|co|me|info|app|tv|"
+              r"xyz|ly|gg|so|to|sh|us|ca|au|nl|fr|it|es|ch|at|be|pl|ru|jp|in|br)(?:/\S*)?")
+GUI = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+UNITS_S = {"s": 1, "sec": 1, "second": 1, "m": 60, "min": 60, "minute": 60, "h": 3600, "hr": 3600,
+           "hour": 3600, "d": 86400, "day": 86400}
+APPS = {  # what people call it -> command
+    "firefox": "firefox", "browser": "x-www-browser", "chrome": "google-chrome", "chromium": "chromium",
+    "vs code": "code", "vscode": "code", "code": "code", "text editor": "gnome-text-editor", "gedit": "gedit",
+    "files": "nautilus", "file manager": "nautilus", "nautilus": "nautilus", "terminal": "x-terminal-emulator",
+    "calculator": "gnome-calculator", "settings": "gnome-control-center", "system monitor": "gnome-system-monitor",
+    "thunderbird": "thunderbird", "libreoffice": "libreoffice", "gimp": "gimp", "vlc": "vlc", "spotify": "spotify",
+    "steam": "steam", "discord": "discord", "slack": "slack", "telegram": "telegram-desktop", "obs": "obs",
+}
+
+
+def _seconds(n: str, unit: str) -> int:
+    u = re.sub(r"s$", "", unit.lower())
+    return int(float(n) * UNITS_S.get(u, UNITS_S.get(u[:3], 60)))
+
+
+def _tz(city: str) -> str | None:
+    want = re.sub(r"\s+", "_", city.strip().lower()).split("/")[-1]
+    for root, _, files in os.walk("/usr/share/zoneinfo"):
+        if "/posix" in root or "/right" in root:
+            continue
+        for f in files:
+            if f.lower() == want:
+                return os.path.relpath(os.path.join(root, f), "/usr/share/zoneinfo")
+    return None
+
+
+def _archive_list(v, u):
+    f, low = v["file"], v["file"].lower()
+    if re.search(r"\.(zip|jar|whl|apk)'?$", low):
+        return first_available([("unzip", f"unzip -l {f}"), (None, f"python3 -m zipfile -l {f}")])
+    if re.search(r"\.(tar(\.(gz|bz2|xz|zst))?|tgz|tbz2|txz)'?$", low):
+        return f"tar -tvf {f}"
+    if low.rstrip("'").endswith(".deb"):
+        return f"dpkg -c {f}"
+    if low.rstrip("'").endswith(".7z"):
+        return f"7z l {f}"
+    return None
+
+
+def _owner_pkg(v, u):
+    p = u.lit(v["_raw_path"])
+    if "/" in p:
+        return f"dpkg -S -- {qpath(p)}"
+    if shutil.which(p):
+        return f'dpkg -S -- "$(readlink -f "$(command -v {shlex.quote(p)})")"'
+    return None
+
+
+def _date_math(v, u):
+    n, unit = v["n"], re.sub(r"s$", "", v["unit"])
+    sign = "-" if "ago" in v["when"] else "+"
+    return f"date -d '{sign}{n} {unit}' '+%A %d %B %Y'"
+
+
+def _websearch(v, u):
+    q = urllib.parse.quote_plus(" ".join(u.lit(w) for w in v["_raw_text"].split()))
+    url = shlex.quote(f"https://duckduckgo.com/?q={q}")
+    return f"xdg-open {url}" if GUI and shutil.which("xdg-open") else f"echo {url}"
+
+
+def _app(v, u):
+    name = APPS.get(re.sub(r"\s+", " ", v["_raw_app"].lower()))
+    if not name or not GUI or not shutil.which(name):
+        return None
+    return f"nohup {name} >/dev/null 2>&1 &"
+
+
+def _volume(v, u):
+    if not shutil.which("pactl"):
+        return None
+    how = v.get("_raw_how", "").lower()
+    if v.get("n"):
+        return f"pactl set-sink-volume @DEFAULT_SINK@ {v['n']}%"
+    if "unmute" in how:
+        return "pactl set-sink-mute @DEFAULT_SINK@ 0"
+    if "mute" in how:
+        return "pactl set-sink-mute @DEFAULT_SINK@ toggle"
+    step = "+10%" if re.search(r"up|louder|raise|increase", how) else "-10%"
+    return f"pactl set-sink-volume @DEFAULT_SINK@ {step}"
+
+
+def _clone(v, u):
+    url = u.lit(v["_raw_url"])
+    if re.fullmatch(r"[\w.-]+/[\w.-]+", url):
+        url = f"https://github.com/{url}"
+    return f"git clone -- {shlex.quote(url)}"
+
+
+def _alias(v, u):
+    name, body = v["word"], " ".join(u.lit(w) for w in v["_raw_cmdtext"].split())
+    if not re.fullmatch(r"[\w.-]+", name):
+        return None
+    line = f"alias {name}={shlex.quote(body)}"
+    return f"{line} && printf '%s\\n' {shlex.quote(line)} >> {qpath(AISHARC)}"
+
+
+def _path_add(v, u):
+    d = v["dir"]
+    line = f'export PATH="$PATH:{d}"' if not d.startswith("'") else f"export PATH=\"$PATH\":{d}"
+    return f"{line} && printf '%s\\n' {shlex.quote(line)} >> {qpath(AISHARC)}"
+
+
+class Recipe:
+    def __init__(self, label, patterns, cmd, *, slots=None, defaults=None, destructive=False, warning=None,
+                 needs=(), git=False, gui=False, runs_on_question=False):
+        self.label, self.cmd, self.slots = label, cmd, slots or {}
+        self.patterns = [re.compile(p) for p in ([patterns] if isinstance(patterns, str) else patterns)]
+        self.defaults, self.destructive, self.warning = defaults or {}, destructive, warning
+        self.needs, self.git, self.gui, self.runs_on_question = needs, git, gui, runs_on_question
+
+
+SLOT_TYPES = {"file": "file", "path": "path", "dir": "dir", "newfile": "newfile", "host": "host", "url": "url",
+              "n": "n", "m": "n", "word": "word", "user": "word", "pkg": "word", "var": "var", "text": "text",
+              "cmdtext": "cmdtext", "remote": "remote", "city": "city", "algo": "algo", "unit": "raw",
+              "when": "raw", "how": "raw", "app": "raw", "dest": "dest"}
+
+
+def _slot(kind: str, raw: str, u: Utterance):
+    tok = u.lit(raw.strip())
+    if kind == "raw":
+        return raw.strip()
+    if kind in ("file", "path"):
+        p = resolve(tok, u.cwd, "file" if kind == "file" else None)
+        if not p and "/" not in tok:
+            hits = find_below(tok, u.cwd)
+            p = hits[0] if len(hits) == 1 else None
+        return qpath(p) if p else None
+    if kind == "dir":
+        p = home_alias(tok, u.cwd) or resolve(tok, u.cwd, "dir")
+        return qpath(p) if p else None
+    if kind == "newfile":
+        return qpath(tok) if (raw.startswith("qlit") or is_pathlike(tok)) else None
+    if kind == "host":
+        tok = re.sub(r"^\w+://", "", tok).split("/")[0]
+        ok = (re.fullmatch(r"[A-Za-z0-9][\w-]*(?:\.[\w-]+)*\.[A-Za-z]{2,}", tok)
+              or re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", tok) or tok == "localhost")
+        return tok if ok and not os.path.exists(os.path.join(u.cwd, tok)) else None
+    if kind == "url":
+        if os.path.exists(os.path.join(u.cwd, os.path.expanduser(tok))):
+            return None                  # README.md is a file, not a website
+        if re.match(r"(?:https?|ftp)://\S+", tok) or re.fullmatch(WEB_DOMAIN, tok):
+            return shlex.quote(tok if "://" in tok else "https://" + tok)
+        return None
+    if kind == "dest":
+        return qpath(tok)
+    if kind == "n":
+        n = num(raw)
+        return str(int(n)) if n is not None else None
+    if kind == "word":
+        return shlex.quote(tok) if re.fullmatch(r"[\w.@+/:-]+", tok) and raw.lower() not in (
+            "the", "a", "an", "my", "this", "that", "it", "me") else None
+    if kind == "var":
+        return tok if re.fullmatch(r"[A-Za-z_]\w*", tok) else None
+    if kind == "text":
+        return shlex.quote(" ".join(u.lit(w) for w in raw.split()))
+    if kind == "cmdtext":
+        return " ".join(u.lit(w) for w in raw.split())
+    if kind == "remote":
+        return shlex.quote(tok) if re.fullmatch(r"(?:[\w.-]+@)?[\w.-]+:\S*|[\w.-]+@[\w.-]+", tok) else None
+    if kind == "city":
+        return _tz(tok)
+    if kind == "algo":
+        return {"md5": "md5sum", "sha1": "sha1sum", "sha512": "sha512sum"}.get(tok.lower(), "sha256sum")
+    return None
+
+
+def _apply_recipe(r: Recipe, u: Utterance) -> Plan | None:
+    if any(not shutil.which(t) for t in r.needs):
+        return None
+    if r.git and not (shutil.which("git") and git_branch(u.cwd)):
+        return None
+    if r.gui and not GUI:
+        return None
+    for pat in r.patterns:
+        m = pat.search(u.text)
+        if not m:
+            continue
+        vals: dict = {}
+        ok = True
+        for name, raw in m.groupdict().items():
+            base = re.sub(r"\d+$", "", name)
+            if raw is None:
+                continue
+            raw_orig = u.o(m, name)
+            vals["_raw_" + base] = raw_orig
+            kind = r.slots.get(base, SLOT_TYPES.get(base, "raw"))
+            v = _slot(kind, raw_orig, u)
+            if v is None:
+                ok = False
+                break
+            vals[base] = v
+        if not ok:
+            continue
+        for k, d in r.defaults.items():
+            vals.setdefault(k, d)
+        if callable(r.cmd):
+            cmd = r.cmd(vals, u)
+        else:
+            tmpl = first_available(r.cmd) if isinstance(r.cmd, list) else r.cmd
+            try:
+                cmd = tmpl.format(**vals)
+            except (KeyError, IndexError):
+                cmd = None
+        if not cmd:
+            continue
+        u.blank(m.start(), m.end())
+        shown = [f"{k} {u.lit(v) if isinstance(v, str) else v}" for k, v in vals.items()
+                 if not k.startswith("_") and k in m.groupdict() and m.group(k)]
+        return Plan(cmd, r.label, shown, destructive=r.destructive, warning=r.warning,
+                    runs_on_question=r.runs_on_question)
+    return None
+
+
+F = r"(?P<file>\S+)"
+P = r"(?P<path>\S+)"
+H = r"(?P<host>\S+)"
+T_UNIT = r"(?P<unit>seconds?|secs?|minutes?|mins?|hours?|hrs?)"
+
+RECIPES = [
+    # -- files and folders
+    Recipe("tree", [r"\b(?:show\s+(?:me\s+)?)?(?:the\s+)?(?:file|folder|directory|dir|project)?\s*(?:tree|structure|hierarchy|layout)\b"
+                    r"(?:\s+(?:of|for|in)\s+(?:the\s+)?(?P<dir>\S+))?"],
+           [("tree", "tree -C -L 3 --dirsfirst -I .git {dir}"),
+            (None, "find {dir} -maxdepth 3 -mindepth 1 -not -path '*/.git' -not -path '*/.git/*' | sort | "
+                   "sed -e 's|[^/]*/|  |g'")], defaults={"dir": "."}),
+    Recipe("file details", [rf"\b(?:details|info|information|metadata|properties|stats?)\s+(?:of|for|about|on)\s+(?:the\s+file\s+)?{P}",
+                            rf"\bwhen\s+was\s+{P}\s+(?:last\s+)?(?:modified|changed|created|edited)\b"],
+           "stat -- {path}"),
+    Recipe("file type", [rf"\bwhat\s+(?:kind|type|sort)\s+of\s+file\s+is\s+{P}", rf"\b(?:file\s+)?type\s+of\s+(?:the\s+file\s+)?{P}",
+                         rf"\bwhat\s+is\s+{P}\s+for\b"],
+           [("file", "file -- {path}"),
+            (None, "python3 -c 'import mimetypes, sys; print(mimetypes.guess_type(sys.argv[1])[0] or \"unknown\")' {path}")]),
+    Recipe("permissions", [rf"\b(?:permissions?|perms|access\s+rights)\s+(?:of|on|for)\s+(?:the\s+file\s+)?{P}",
+                           rf"\bwho\s+can\s+(?:read|write|open|access|edit)\s+{P}"], "ls -ld -- {path}"),
+    Recipe("owner", [rf"\bwho\s+owns\s+{P}", rf"\b(?:the\s+)?owner\s+of\s+{P}"], "stat -c '%U:%G  %n' -- {path}"),
+    Recipe("checksum", [rf"\b(?:(?P<algo>md5|sha1|sha256|sha512)\s+)?(?:checksum|hash|sum|digest)\s+(?:of|for)\s+{F}",
+                        rf"\b(?P<algo>md5|sha1|sha256|sha512)\s+(?:of\s+)?{F}"],
+           "{algo} -- {file}", defaults={"algo": "sha256sum"}),
+    Recipe("line", [rf"\b(?:the\s+)?line\s+(?:number\s+)?(?P<n>\d+)\s+(?:of|in|from)\s+{F}"], "sed -n '{n}p' -- {file}"),
+    Recipe("lines", [rf"\blines?\s+(?P<n>\d+)\s*(?:-|to|through|until|and)\s*(?P<m>\d+)\s+(?:of|in|from)\s+{F}"],
+           "sed -n '{n},{m}p' -- {file}"),
+    Recipe("line numbers", [rf"\b{F}\s+with\s+line\s+numbers\b", rf"\bline\s+numbers\s+(?:of|for|in)\s+{F}",
+                            rf"\bnumber\s+the\s+lines\s+(?:of|in)\s+{F}"], "cat -n -- {file}"),
+    Recipe("sort lines", [rf"\bsort\s+(?:the\s+)?(?:lines\s+(?:of|in)\s+)?{F}(?:\s+alphabetically)?\s*$"], "sort -- {file}"),
+    Recipe("sort numbers", [rf"\bsort\s+(?:the\s+)?(?:lines\s+(?:of|in)\s+)?{F}\s+(?:numerically|by\s+number)\b"], "sort -n -- {file}"),
+    Recipe("unique lines", [rf"\b(?:unique|distinct|different)\s+lines\s+(?:of|in)\s+{F}"], "sort -u -- {file}"),
+    Recipe("remove duplicate lines", [rf"\b(?:remove|delete|drop)\s+(?:the\s+)?duplicate\s+lines\s+(?:from|in|of)\s+{F}",
+                                      rf"\bdedup(?:licate)?\s+{F}"],
+           "sort -u -o {file} -- {file}", destructive=True, warning="! rewrites the file sorted and without duplicates"),
+    Recipe("count matches", [r"\bhow\s+(?:many\s+times|often)\s+(?:does\s+|is\s+)?(?P<text>\S+)\s+(?:appear|occur|show\s+up|used|mentioned)?\s*in\s+" + F,
+                             r"\bcount\s+(?:the\s+)?(?:occurrences|matches|times)\s+of\s+(?P<text>\S+)\s+in\s+" + F],
+           "grep -oiF -- {text} {file} | wc -l"),
+    Recipe("reverse lines", [rf"\breverse\s+(?:the\s+)?(?:lines\s+(?:of|in)\s+|order\s+of\s+)?{F}"], "tac -- {file}"),
+    Recipe("json", [rf"\b(?:pretty[- ]?print|prettify|format|beautify|indent)\s+(?:the\s+)?(?:json\s+(?:in|of|from)\s+)?{F}",
+                    rf"\bshow\s+{F}\s+(?:nicely|pretty|formatted)\b"], "python3 -m json.tool {file}"),
+    Recipe("csv table", [rf"\bshow\s+{F}\s+as\s+(?:a\s+)?table\b", rf"\b(?:view|show|display|open)\s+(?:the\s+)?csv\s+(?:file\s+)?{F}"],
+           [("column", "column -s, -t < {file}"),
+            (None, "python3 -c 'import csv, sys; r = list(csv.reader(open(sys.argv[1]))); w = [max(map(len, c)) for c in zip(*r)]; "
+                   "[print(\"  \".join(x.ljust(n) for x, n in zip(row, w))) for row in r]' {file}")]),
+    Recipe("append", [r"\b(?:append|add)\s+(?:the\s+(?:line|text)\s+)?(?P<text>qlit\d+)\s+to\s+(?:the\s+end\s+of\s+)?(?P<newfile>\S+)\s*$"],
+           "printf '%s\\n' {text} >> {newfile}", destructive=True, warning="! adds a line to the file"),
+    Recipe("write", [r"\b(?:write|put|save)\s+(?:the\s+(?:line|text)\s+)?(?P<text>qlit\d+)\s+(?:to|in|into)\s+(?P<newfile>\S+)\s*$"],
+           "printf '%s\\n' {text} > {newfile}", destructive=True, warning="! replaces the file's contents"),
+    Recipe("empty file", [rf"\b(?:empty|truncate|blank|wipe\s+the\s+contents\s+of)\s+(?:the\s+)?(?:file\s+)?{F}\s*$",
+                          rf"\bclear\s+(?:the\s+)?(?:contents\s+of\s+(?:the\s+)?)?(?:file\s+)?{F}\s*$"],
+           ": > {file}", destructive=True, warning="! empties the file"),
+    Recipe("empty trash", [r"\b(?:empty|clear|clean)\s+(?:the\s+|my\s+)?(?:trash|recycle\s+bin|wastebasket)\b"],
+           "rm -rf -- ~/.local/share/Trash/files/* ~/.local/share/Trash/info/*", destructive=True,
+           warning="! permanently deletes everything in the trash"),
+    Recipe("move to trash", [rf"\b(?:move|put|send|throw)\s+{P}\s+(?:to|in|into)\s+(?:the\s+)?(?:trash|recycle\s+bin|wastebasket)\b",
+                             rf"\btrash\s+{P}\s*$"],
+           [("gio", "gio trash -- {path}"), (None, "mkdir -p ~/.local/share/Trash/files && mv -i -- {path} ~/.local/share/Trash/files/")],
+           destructive=True, warning="! moves it to the trash"),
+    Recipe("symlink", [r"\b(?:create|make|add)\s+(?:a\s+)?(?:sym(?:bolic)?\s*)?(?:link|shortcut)\s+(?:to|for)\s+(?P<path>\S+)"
+                       r"(?:\s+(?:called|named|at|in)\s+(?P<newfile>\S+))?\s*$"],
+           "ln -s -- {path} {newfile}", defaults={"newfile": "."}),
+    Recipe("change owner", [rf"\b(?:change|set)\s+(?:the\s+)?owner(?:ship)?\s+of\s+{P}\s+to\s+(?P<user>[\w.-]+)",
+                            rf"\bmake\s+(?P<user>[\w.-]+)\s+(?:the\s+)?owner\s+of\s+{P}"],
+           "sudo chown -R {user}: -- {path}", destructive=True),
+    Recipe("file manager", [r"\bopen\s+(?:this\s+folder|the\s+current\s+folder|here|this\s+directory)\s+in\s+(?:the\s+)?(?:file\s+manager|files|explorer|nautilus)\b",
+                            r"\bopen\s+(?:the\s+|a\s+)?file\s+(?:manager|browser|explorer)(?:\s+here)?\b"],
+           "xdg-open .", needs=("xdg-open",), gui=True),
+    Recipe("archive contents", [r"\b(?:what(?:\s+is|'s)\s+in(?:side)?|list\s+(?:the\s+)?(?:contents?\s+of|files\s+in)|show\s+(?:the\s+)?contents?\s+of|"
+                                r"contents?\s+of|look\s+inside|peek\s+(?:in|into)|list)\s+(?:the\s+)?(?:archive\s+|zip\s+|tarball\s+)?"
+                                r"(?P<file>qlit\d+)"],
+           _archive_list),
+
+    # -- text, numbers, dates
+    Recipe("base64 encode", [r"\b(?:base64[- ]encode|encode)\s+(?P<text>qlit\d+|\S+)(?:\s+(?:in|as|to|with)\s+base64)?\s*$",
+                             r"\bbase64\s+(?:of\s+)?(?P<text>qlit\d+|\S+)\s*$"], "printf '%s' {text} | base64"),
+    Recipe("base64 decode", [r"\b(?:base64[- ]decode|decode)\s+(?:the\s+base64\s+)?(?P<text>qlit\d+|\S+)(?:\s+from\s+base64)?\s*$"],
+           "printf '%s' {text} | base64 -d; echo"),
+    Recipe("upper case", [r"\b(?:convert|change|make|turn)\s+(?P<text>qlit\d+)\s+(?:to|into)\s+(?:upper\s*case|capitals|caps)\b",
+                          r"\buppercase\s+(?P<text>qlit\d+)"], "printf '%s\\n' {text} | tr '[:lower:]' '[:upper:]'"),
+    Recipe("lower case", [r"\b(?:convert|change|make|turn)\s+(?P<text>qlit\d+)\s+(?:to|into)\s+lower\s*case\b",
+                          r"\blowercase\s+(?P<text>qlit\d+)"], "printf '%s\\n' {text} | tr '[:upper:]' '[:lower:]'"),
+    Recipe("password", [r"\b(?:generate|make|create|give\s+me|new)\s+(?:an?\s+)?(?:random\s+|strong\s+|secure\s+|new\s+|good\s+)*password"
+                        r"(?:\s+(?:of|with)\s+(?P<n>\d+)\s+(?:characters|chars|letters))?"],
+           "python3 -c 'import secrets, string; a = string.ascii_letters + string.digits + \"-_.!@#%+\"; "
+           "print(\"\".join(secrets.choice(a) for _ in range({n})))'", defaults={"n": "20"}),
+    Recipe("uuid", [r"\b(?:generate|make|create|give\s+me|new)\s+(?:an?\s+)?(?:random\s+)?(?:uuid|guid)\b"],
+           "cat /proc/sys/kernel/random/uuid"),
+    Recipe("random number", [r"\b(?:pick\s+)?(?:a\s+)?random\s+number(?:\s+(?:between|from)\s+(?P<n>\d+)\s+(?:and|to)\s+(?P<m>\d+))?",
+                             r"\bpick\s+a\s+number\s+(?:between|from)\s+(?P<n>\d+)\s+(?:and|to)\s+(?P<m>\d+)"],
+           "shuf -i {n}-{m} -n 1", defaults={"n": "1", "m": "100"}),
+    Recipe("dice", [r"\broll\s+(?:a\s+)?(?:die|dice)\b"], "shuf -i 1-6 -n 1"),
+    Recipe("coin", [r"\b(?:flip|toss)\s+a\s+coin\b"], "shuf -n 1 -e heads tails"),
+    Recipe("epoch now", [r"\b(?:unix|epoch|posix)\s+(?:time(?:stamp)?|seconds)\b|\bcurrent\s+timestamp\b"], "date +%s"),
+    Recipe("epoch to date", [r"\b(?:convert\s+)?(?:timestamp\s+)?(?P<n>\d{9,11})\s+(?:to|as|into)\s+(?:a\s+)?(?:date|time)\b",
+                             r"\bwhat\s+(?:date|time)\s+is\s+(?:timestamp\s+)?(?P<n>\d{9,11})\b"], "date -d @{n}"),
+    Recipe("date math", [r"\bwhat\s+(?:date|day)\s+(?:is|was|will\s+it\s+be)\s+(?:it\s+)?(?P<n>\d+)\s+(?P<unit>days?|weeks?|months?|years?)\s+"
+                         r"(?P<when>from\s+now|from\s+today|later|ago|before\s+today)"], _date_math),
+    Recipe("tomorrow", [r"\bwhat\s+(?:date|day)\s+is\s+(?:it\s+)?(?P<when>tomorrow|yesterday)\b"], "date -d {when} '+%A %d %B %Y'"),
+    Recipe("week number", [r"\bwhat\s+week\s+(?:number\s+)?is\s+(?:it|this)\b|\bweek\s+number\b|\bcurrent\s+week\b"], "date +%V"),
+    Recipe("time in city", [r"\b(?:what(?:\s+is|'s)\s+the\s+)?(?:current\s+)?time\s+(?:is\s+it\s+)?in\s+(?P<city>[a-z][a-z_ ]+?)\s*(?:now|right\s+now)?\s*$"],
+           "TZ={city} date"),
+    Recipe("timezone", [r"\b(?:my\s+|the\s+|current\s+|which\s+|what\s+)?time\s*zone\b(?!\s+to)"],
+           [("timedatectl", "timedatectl | grep -i 'time zone'"), (None, "date +'%Z (UTC%z)'")]),
+    Recipe("set timezone", [r"\bset\s+(?:the\s+)?time\s*zone\s+to\s+(?P<city>[a-z][a-z_ /]+?)\s*$"],
+           "sudo timedatectl set-timezone {city}", needs=("timedatectl",), destructive=True),
+    Recipe("timer", [r"\b(?:set\s+(?:a\s+)?)?(?:timer|countdown|alarm)\s+(?:for\s+)?(?P<n>\d+(?:\.\d+)?)\s*" + T_UNIT,
+                     r"\bwait\s+(?P<n>\d+(?:\.\d+)?)\s*" + T_UNIT + r"\s+(?:and|then)\s+(?:beep|tell\s+me|alert\s+me)\b"],
+           lambda v, u: f"sleep {_seconds(v['n'], v['unit'])} && printf '\\a⏰ time is up\\n'"
+                        + (" && notify-send aisha 'Time is up' 2>/dev/null" if shutil.which("notify-send") else "")),
+    Recipe("reminder", [r"\bremind\s+me\s+(?:to\s+(?P<text>.+?)\s+)?in\s+(?P<n>\d+(?:\.\d+)?)\s*" + T_UNIT + r"(?:\s+to\s+(?P<text2>.+))?\s*$"],
+           lambda v, u: (lambda s, msg: f"(sleep {s}; notify-send 'Reminder' {msg} 2>/dev/null; "
+                                        f"printf '\\a\\nReminder: %s\\n' {msg} > /dev/tty) >/dev/null 2>&1 &")(
+               _seconds(v["n"], v["unit"]), v.get("text") or shlex.quote("time's up"))),
+
+    # -- system
+    Recipe("load", [r"\b(?:system\s+|cpu\s+)?load(?:\s+average)?\b(?!\s+(?:of|from))", r"\bhow\s+busy\s+is\s+(?:the\s+|this\s+|my\s+)?(?:system|computer|machine|cpu|server)\b"],
+           "cat /proc/loadavg"),
+    Recipe("architecture", [r"\b(?:cpu\s+|system\s+)?architecture\b|\bis\s+(?:this|it|my\s+system)\s+(?:32|64)[- ]?bit\b|\bwhat\s+arch\b"],
+           "uname -m"),
+    Recipe("shell", [r"\b(?:which|what)\s+shell\b|\bmy\s+shell\b"], 'echo "login shell: $SHELL, now in aisha $AISHA"'),
+    Recipe("swap", [r"\bswap(?:\s+(?:space|usage|memory|file))?\b"], [("swapon", "swapon --show && free -h | grep -i swap"),
+                                                                     (None, "cat /proc/swaps")]),
+    Recipe("inodes", [r"\binodes?\b"], "df -i"),
+    Recipe("filesystems", [r"\bfile\s*system\s+types?\b|\bwhat\s+file\s*systems?\b|\bwhich\s+file\s*system\b"], "df -Th"),
+    Recipe("gpu", [r"\b(?:gpu|graphics\s+card|video\s+card|graphics\s+chip)\b"],
+           [("nvidia-smi", "nvidia-smi"), ("lspci", "lspci | grep -iE 'vga|3d|display'"),
+            (None, "grep -h DRIVER /sys/class/drm/card*/device/uevent")]),
+    Recipe("usb devices", [r"\busb\s+devices\b|\bwhat\s+is\s+(?:plugged|connected)\s+(?:in|to\s+usb)\b|\bconnected\s+usb\b"],
+           [("lsusb", "lsusb"), (None, "cat /sys/bus/usb/devices/*/product 2>/dev/null")]),
+    Recipe("pci devices", [r"\bpci\s+devices\b"], [("lspci", "lspci"), (None, "ls /sys/bus/pci/devices")]),
+    Recipe("hardware", [r"\bhardware(?:\s+(?:info|information|details|summary|specs))?\b|\b(?:my\s+)?(?:computer|system|pc|machine)\s+specs\b"],
+           [("inxi", "inxi -Fxz"),
+            (None, "lscpu | head -n 15; echo; free -h; echo; lsblk -d -o NAME,SIZE,MODEL")]),
+    Recipe("resolution", [r"\b(?:screen|display|monitor)\s+(?:resolution|size)\b|\bresolution\b"],
+           [("xrandr", "xrandr | grep -E ' connected|\\*'"), (None, "cat /sys/class/drm/*/modes 2>/dev/null | head -n 3")]),
+    Recipe("kernel messages", [r"\bkernel\s+(?:messages|log|logs)\b|\bdmesg\b"],
+           [("journalctl", "journalctl -k -n 50 --no-pager"), (None, "sudo dmesg | tail -n 50")]),
+    Recipe("system errors", [r"\b(?:system|recent|boot)\s+errors\b|\berrors\s+(?:in|from)\s+(?:the\s+)?(?:system\s+)?(?:log|logs|journal)\b",
+                             r"\bwhat\s+went\s+wrong\b|\bany\s+errors\s+(?:since\s+(?:boot|startup)|today)\b"],
+           [("journalctl", "journalctl -p err -b --no-pager | tail -n 50"), (None, "grep -i error /var/log/syslog | tail -n 50")]),
+    Recipe("boot log", [r"\bboot\s+(?:log|logs|messages)\b|\b(?:log|messages)\s+(?:since|from)\s+(?:the\s+)?(?:last\s+)?boot\b"],
+           "journalctl -b --no-pager | tail -n 100", needs=("journalctl",)),
+    Recipe("service logs", [r"\blogs?\s+(?:of|for|from)\s+(?:the\s+)?(?P<word>[\w@.-]+)\s+service\b",
+                            r"\b(?P<word>[\w@.-]+)\s+service\s+logs?\b", r"\blogs?\s+(?:of|for|from)\s+(?:the\s+)?(?P<word>ssh|sshd|nginx|apache2|docker|cron|"
+                            r"mysql|postgresql|networkmanager|bluetooth|cups|systemd-\w+)\b"],
+           "journalctl -u {word} -n 50 --no-pager", needs=("journalctl",)),
+    Recipe("running services", [r"\b(?:list|show|all|running|active)\s+(?:the\s+)?services\b|\bservices\s+(?:that\s+are\s+)?running\b|\bwhat\s+services\b"],
+           "systemctl list-units --type=service --state=running --no-pager", needs=("systemctl",)),
+    Recipe("failed services", [r"\bfailed\s+services\b|\bservices\s+(?:that\s+)?(?:have\s+)?failed\b|\bbroken\s+services\b|\bfailed\s+units\b"],
+           "systemctl --failed --no-pager", needs=("systemctl",)),
+    Recipe("last logins", [r"\b(?:last|recent)\s+logins?\b|\bwho\s+(?:has\s+)?logged\s+in\s+(?:recently|lately|before)\b|\blogin\s+history\b"],
+           [("last", "last -n 20"), (None, "journalctl _COMM=sshd -n 20 --no-pager")]),
+    Recipe("sudo rights", [r"\bam\s+i\s+(?:root|an?\s+admin(?:istrator)?|admin|a\s+sudoer)\b|\bdo\s+i\s+have\s+(?:sudo|admin|root)(?:\s+rights)?\b|"
+                           r"\bcan\s+i\s+(?:use\s+)?sudo\b"],
+           "id; id -nG | grep -qwE 'sudo|wheel|admin' && echo 'you can use sudo' || echo 'you are not in a sudo group'"),
+    Recipe("user id", [r"\bmy\s+(?:user\s+)?id\b|\bmy\s+uid\b"], "id"),
+    Recipe("locale", [r"\b(?:my\s+|system\s+)?(?:locale|language\s+settings?|system\s+language)\b"], "locale"),
+    Recipe("keyboard", [r"\bkeyboard\s+(?:layout|language|map)\b"], [("localectl", "localectl status"),
+                                                                     (None, "grep -E 'XKB' /etc/default/keyboard")]),
+    Recipe("schedule shutdown", [r"\b(?:shut\s*down|power\s*off|turn\s+off)\s+(?:the\s+computer\s+|this\s+computer\s+)?in\s+(?P<n>\d+)\s*(?:minutes?|mins?)\b"],
+           "sudo shutdown +{n}", destructive=True, warning="! schedules a shutdown"),
+    Recipe("cancel shutdown", [r"\bcancel\s+(?:the\s+)?(?:shutdown|reboot|restart)\b"], "sudo shutdown -c"),
+    Recipe("lock screen", [r"\block\s+(?:the\s+|my\s+)?(?:screen|computer|session|desktop)\b"], "loginctl lock-session",
+           needs=("loginctl",)),
+    Recipe("check updates", [r"\b(?:check\s+for|any|available|pending|list)\s+(?:system\s+)?updates\b|\bwhat\s+(?:can|needs\s+to)\s+be\s+(?:updated|upgraded)\b|"
+                             r"\bupgradable\b|\bis\s+(?:my\s+system|everything)\s+up\s+to\s+date\b"],
+           "apt list --upgradable 2>/dev/null", needs=("apt",)),
+    Recipe("clean packages", [r"\b(?:clean\s+up|clean|remove)\s+(?:the\s+)?(?:old|unused|unneeded|leftover)\s+(?:packages|kernels|dependencies)\b|\bautoremove\b|"
+                              r"\bclean\s+(?:up\s+)?(?:the\s+)?(?:apt|package)\s+cache\b"],
+           "sudo apt autoremove && sudo apt clean", needs=("apt",), destructive=True,
+           warning="! removes packages nothing needs any more"),
+    Recipe("package info", [r"\b(?:info|information|details|description)\s+(?:about|on|for|of)\s+(?:the\s+)?package\s+(?P<pkg>[\w.+-]+)",
+                            r"\bwhat\s+is\s+the\s+package\s+(?P<pkg>[\w.+-]+)", r"\bdescribe\s+(?:the\s+)?package\s+(?P<pkg>[\w.+-]+)"],
+           "apt show {pkg} 2>/dev/null", needs=("apt",)),
+    Recipe("package of file", [r"\b(?:which|what)\s+package\s+(?:owns|provides|installed|contains|has)\s+(?P<path>\S+)",
+                               r"\bwhere\s+(?:does|did)\s+(?P<path>\S+)\s+come\s+from\b"], _owner_pkg, needs=("dpkg",),
+           slots={"path": "raw"}),
+    Recipe("package files", [r"\b(?:what\s+)?files\s+(?:did\s+|does\s+)?(?:the\s+)?package\s+(?P<pkg>[\w.+-]+)\s+(?:install|contain|have)\b",
+                             r"\bfiles\s+(?:in|of|from)\s+(?:the\s+)?package\s+(?P<pkg>[\w.+-]+)"], "dpkg -L {pkg}", needs=("dpkg",)),
+    Recipe("recently installed", [r"\brecently\s+installed\b|\bwhat\s+(?:did\s+i|have\s+i)\s+install(?:ed)?\s+(?:recently|today|lately)\b|\binstall(?:ation)?\s+history\b"],
+           "grep -h ' install ' /var/log/dpkg.log | tail -n 20", needs=("dpkg",)),
+
+    # -- shell setup
+    Recipe("show variable", [r"\b(?:value\s+of|what\s+is\s+in|what\s+is|show|print|echo)\s+(?:the\s+)?(?:env(?:ironment)?\s+)?(?:variable\s+)?\$(?P<var>[a-z_]\w*)\b"],
+           "printf '%s\\n' \"${{{var}}}\""),
+    Recipe("set variable", [r"\bset\s+(?:the\s+)?(?:env(?:ironment)?\s+)?variable\s+\$?(?P<var>[a-z_]\w*)\s+to\s+(?P<text>.+?)\s*$",
+                            r"\bset\s+\$(?P<var>[a-z_]\w*)\s+to\s+(?P<text>.+?)\s*$",
+                            r"\bset\s+(?:my\s+)?(?P<var>editor|visual|pager|browser|lang)\s+to\s+(?P<text>.+?)\s*$"],
+           lambda v, u: f"export {v['var'].upper() if v['var'].islower() else v['var']}={v['text']}"),
+    Recipe("alias", [r"\b(?:make|create|add|set\s+up|define)\s+(?:an?\s+)?alias\s+(?:called\s+|named\s+)?(?P<word>[\w.-]+)\s+(?:for|to|that\s+runs|=)\s+(?P<cmdtext>.+?)\s*$"],
+           _alias),
+    Recipe("add to path", [r"\badd\s+(?P<dir>\S+)\s+to\s+(?:my\s+|the\s+)?\$?path\b"], _path_add),
+    Recipe("what does", [r"\bwhat\s+(?:does|is)\s+(?:the\s+)?(?:command\s+)?(?P<word>[\w.+-]+)(?:\s+command)?\s+(?:do|for)\b",
+                         r"\bwhat\s+is\s+the\s+(?P<word>[\w.+-]+)\s+command\b"],
+           lambda v, u: (lambda w: f"whatis {w} 2>/dev/null || {w} --help 2>&1 | head -n 20")(v["word"])
+           if shutil.which(u.lit(v["_raw_word"])) else None, runs_on_question=True),
+    Recipe("manual", [r"^\s*(?:how\s+(?:do|can)\s+i\s+use|how\s+to\s+use)\s+(?:the\s+)?(?:command\s+)?(?P<word>[\w.+-]+)(?:\s+command)?\s*$",
+                      r"^\s*use\s+(?:the\s+)?(?:command\s+)?(?P<word>[\w.+-]+)(?:\s+command)?\s*$",
+                      r"\b(?:help|manual|man\s+page|docs?|documentation)\s+(?:for|on|of|about)\s+(?:the\s+)?(?:command\s+)?(?P<word>[\w.+-]+)"],
+           lambda v, u: f"man {v['word']} 2>/dev/null || {v['word']} --help" if shutil.which(u.lit(v["_raw_word"])) else None,
+           runs_on_question=True),
+    Recipe("repeat every", [r"\b(?:run|repeat|watch|refresh)\s+(?P<cmdtext>.+?)\s+every\s+(?P<n>\d+)\s*(?:seconds?|secs?|s)\b"],
+           lambda v, u: f"watch -n {v['n']} {shlex.quote(v['cmdtext'])}", needs=("watch",)),
+    Recipe("time it", [r"\b(?:time|measure)\s+how\s+long\s+(?P<cmdtext>.+?)\s+takes\b", r"\bhow\s+long\s+does\s+(?P<cmdtext>.+?)\s+take\b"],
+           "time {cmdtext}"),
+    Recipe("background", [r"\brun\s+(?P<cmdtext>.+?)\s+in\s+(?:the\s+)?background\b"], "nohup {cmdtext} >/dev/null 2>&1 &"),
+    Recipe("as root", [r"\brun\s+(?P<cmdtext>.+?)\s+as\s+(?:root|admin|administrator|superuser|sudo)\b"], "sudo {cmdtext}",
+           destructive=True, warning="! runs with root rights"),
+    Recipe("notify when done", [r"\brun\s+(?P<cmdtext>.+?)\s+and\s+(?:notify|tell|alert|ping)\s+me\s+(?:when\s+(?:it\s+is\s+|it's\s+)?(?:done|finished|complete|ready))?\s*$"],
+           lambda v, u: f"{v['cmdtext']}; printf '\\a'; notify-send aisha {shlex.quote('done: ' + v['cmdtext'])} 2>/dev/null; true"),
+
+    Recipe("cpu usage", [r"\bcpu\s+(?:usage|utili[sz]ation|use|percentage)\b|\bhow\s+much\s+cpu\b(?!\s+(?:does|is))"],
+           "top -bn1 | head -n 15"),
+    Recipe("program memory", [r"\b(?:memory|ram)\s+(?:usage\s+)?(?:of|used\s+by|for)\s+(?P<word>[\w.-]+)\b",
+                              r"\bhow\s+much\s+(?:memory|ram)\s+(?:is\s+|does\s+)?(?P<word>[\w.-]+)\s+(?:using|use|take|taking)\b"],
+           lambda v, u: f"ps -C {v['word']} -o pid,rss,%mem,etime,cmd" if v["word"].strip("'") not in ("my", "the", "this", "it") else None),
+    Recipe("program runtime", [r"\bhow\s+long\s+has\s+(?P<word>[\w.-]+)\s+been\s+running\b"], "ps -C {word} -o pid,etime,cmd"),
+    Recipe("free a port", [r"\b(?:kill|stop|end)\s+(?:whatever|what|the\s+(?:process|program)\s+that)(?:\s+is)?\s+(?:using|on|listening\s+on)\s+port\s+(?P<n>\d+)",
+                           r"\bfree\s+(?:up\s+)?port\s+(?P<n>\d+)"],
+           "pids=$(ss -ltnupH 'sport = :{n}' | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u); "
+           "[ -n \"$pids\" ] && kill $pids && echo \"stopped $pids\" || echo 'nothing is using port {n}'",
+           needs=("ss",), destructive=True, warning="! stops the program using that port"),
+    Recipe("service action", [r"^\s*(?P<how>start|stop|restart|reload|enable|disable)\s+(?:the\s+)?(?P<word>[\w@.-]+)\s*$",
+                              r"^\s*(?:what\s+is\s+the\s+)?status\s+of\s+(?:the\s+)?(?P<word>[\w@.-]+)\s*$"],
+           lambda v, u: (lambda unit, how: (f"systemctl status {unit} --no-pager" if not how else f"sudo systemctl {how} {unit}")
+                         if any(os.path.exists(f"{d}/{unit}.service") for d in
+                                ("/etc/systemd/system", "/lib/systemd/system", "/usr/lib/systemd/system")) else None)(
+               v["word"].strip("'"), v.get("how", "")), needs=("systemctl",)),
+    Recipe("follow log", [r"\b(?:follow|watch|tail)\s+(?:the\s+)?(?:system\s+)?(?:log|logs|journal)\b(?:\s+live)?\s*$"],
+           [("journalctl", "journalctl -f"), (None, "tail -f /var/log/syslog")]),
+    Recipe("todays log", [r"\b(?:system\s+)?logs?\s+(?:from|for|since)\s+today\b|\btoday'?s\s+(?:system\s+)?logs?\b"],
+           "journalctl --since today --no-pager | tail -n 100", needs=("journalctl",)),
+    Recipe("count by extension", [r"\b(?:count|how\s+many)\s+files\s+(?:of\s+each|per|by)\s+(?:type|extension|kind)\b",
+                                  r"\bfile\s+types\s+(?:here|in\s+this\s+(?:folder|project))\b|\bwhat\s+kinds?\s+of\s+files\b"],
+           "find . -path '*/.git' -prune -o -type f -name '*.*' -print | sed 's/.*\\.//' | sort | uniq -c | sort -rn | head -n 20"),
+    Recipe("backup this folder", [r"\b(?:back\s*up|make\s+a\s+backup\s+of|archive|snapshot)\s+(?:this|the\s+current|my\s+current)\s+(?:folder|directory|project|dir)\b"],
+           lambda v, u: (lambda b: f'tar -czf ../{b}-"$(date +%F-%H%M)".tar.gz -C .. {b}')(
+               shlex.quote(os.path.basename(u.cwd.rstrip("/")) or "backup"))),
+
+    # -- network
+    Recipe("reachable", [rf"\bis\s+{H}\s+(?:up|down|reachable|online|alive|working|responding)\b", rf"\bcan\s+i\s+reach\s+{H}",
+                         rf"\bcheck\s+(?:if\s+)?{H}\s+is\s+(?:up|online|reachable)\b"],
+           [("ping", "ping -c 3 {host}"),
+            (None, "python3 -c 'import socket, sys; socket.create_connection((sys.argv[1], 443), 5); print(\"reachable\")' {host}")]),
+    Recipe("dns", [rf"\b(?:ip(?:\s+address)?\s+(?:of|for)|dns\s+(?:lookup|records?)\s+(?:for|of)|resolve|look\s+up)\s+{H}",
+                   rf"\bwhat\s+is\s+the\s+ip\s+(?:address\s+)?(?:of|for)\s+{H}"],
+           "getent ahosts {host} | awk '{{print $1}}' | sort -u"),
+    Recipe("remote port", [rf"\bis\s+port\s+(?P<n>\d+)\s+open\s+on\s+{H}", rf"\bcheck\s+(?:if\s+)?port\s+(?P<n>\d+)\s+(?:is\s+open\s+)?on\s+{H}",
+                           rf"\bcan\s+i\s+connect\s+to\s+{H}\s+(?:on\s+)?port\s+(?P<n>\d+)"],
+           "timeout 3 bash -c '</dev/tcp/{host}/{n}' 2>/dev/null && echo 'port {n} is open' || echo 'port {n} is closed or filtered'"),
+    Recipe("headers", [r"\b(?:http\s+)?headers\s+(?:of|for|from)\s+(?P<url>\S+)"],
+           [("curl", "curl -sI {url}"),
+            (None, "python3 -c 'import sys, urllib.request as u; r = u.urlopen(u.Request(sys.argv[1], method=\"HEAD\"), timeout=10); "
+                   "print(r.status); print(r.headers)' {url}")]),
+    Recipe("weather", [r"\bweather(?:\s+(?:forecast|like))?(?:\s+(?:in|for|at)\s+(?P<text>[a-z][a-z \-]*?))?(?:\s+(?:today|now|tomorrow))?\s*$"],
+           lambda v, u: (lambda city: first_available([
+               ("curl", f"curl -s {shlex.quote('https://wttr.in/' + city + '?format=3')}"),
+               (None, "python3 -c 'import sys, urllib.request as u; print(u.urlopen(sys.argv[1], timeout=10).read().decode())' "
+                      + shlex.quote("https://wttr.in/" + city + "?format=3"))]))(
+               urllib.parse.quote(" ".join(u.lit(w) for w in v.get("_raw_text", "").split())))),
+    Recipe("wifi networks", [r"\b(?:wi-?fi|wireless)\s+networks?\b|\b(?:available|nearby)\s+(?:wi-?fi\s+)?networks\b|\bscan\s+(?:for\s+)?wi-?fi\b"],
+           "nmcli dev wifi list", needs=("nmcli",)),
+    Recipe("wifi name", [r"\b(?:which|what)\s+wi-?fi\b|\bwi-?fi\s+(?:name|ssid)\b|\bconnected\s+to\s+(?:which|what)\s+(?:wi-?fi|network)\b"],
+           [("nmcli", "nmcli -t -f active,ssid dev wifi | grep '^yes' | cut -d: -f2"), ("iwgetid", "iwgetid -r")]),
+    Recipe("wifi password", [r"\bwi-?fi\s+password\b|\bpassword\s+(?:of|for)\s+(?:the\s+|my\s+)?wi-?fi\b"],
+           "nmcli dev wifi show-password", needs=("nmcli",)),
+    Recipe("gateway", [r"\b(?:default\s+)?gateway\b|\brouter(?:'s)?\s+(?:ip|address)\b"],
+           [("ip", "ip route show default"), (None, "awk '$2 == \"00000000\" {{print $1}}' /proc/net/route")]),
+    Recipe("routes", [r"\brouting\s+table\b|\bnetwork\s+routes\b|\bshow\s+routes\b"], [("ip", "ip route"), (None, "cat /proc/net/route")]),
+    Recipe("dns servers", [r"\bdns\s+servers?\b|\bname\s*servers?\b|\bwhich\s+dns\b"],
+           [("resolvectl", "resolvectl dns"), (None, "grep nameserver /etc/resolv.conf")]),
+    Recipe("mac address", [r"\bmac\s+address(?:es)?\b"], [("ip", "ip -br link"), (None, "grep -H . /sys/class/net/*/address")]),
+    Recipe("ssh", [r"\b(?:ssh|connect|log\s*in|login|log)\s+(?:in)?to\s+(?:the\s+server\s+)?(?P<host>\S+)"
+                   r"(?:\s+as\s+(?P<user>[\w.-]+))?(?:\s+(?:on\s+)?port\s+(?P<n>\d+))?\s*$"],
+           lambda v, u: "ssh" + (f" -p {v['n']}" if v.get("n") else "") + " " + (f"{u.lit(v['_raw_user'])}@" if v.get("user") else "")
+           + v["host"], needs=("ssh",)),
+    Recipe("upload", [r"\b(?:copy|upload|send|transfer)\s+(?P<path>\S+)\s+to\s+(?:the\s+)?(?:server\s+)?(?P<remote>\S+)\s*$"],
+           "scp -r -- {path} {remote}", needs=("scp",)),
+    Recipe("download from server", [r"\b(?:copy|download|fetch|get)\s+(?P<remote>\S+)\s*(?:to\s+(?:here|this\s+folder))?\s*$"],
+           lambda v, u: f"scp -r -- {v['remote']} ." if ":" in u.lit(v["_raw_remote"]) else None, needs=("scp",)),
+    Recipe("sync", [r"\b(?:sync|synchroni[sz]e|mirror)\s+(?P<dir>\S+)\s+(?:to|with|into|onto)\s+(?P<dest>\S+)"],
+           [("rsync", "rsync -av --progress -- {dir}/ {dest}/"), (None, "mkdir -p -- {dest} && cp -a -- {dir}/. {dest}/")], destructive=True,
+           warning="! copies over files in the destination"),
+    Recipe("firewall", [r"\bfirewall(?:\s+(?:status|rules))?\b"], [("ufw", "sudo ufw status verbose"), ("nft", "sudo nft list ruleset")]),
+
+    # -- git (in a repository)
+    Recipe("git status", [r"\bwhat\s+(?:has\s+)?changed\b(?!\s+(?:between|today|yesterday|this|in|since|recently|last))\s*(?:in\s+(?:the\s+|this\s+)?(?:repo|repository|project))?\s*$",
+                          r"\buncommitted\s+changes\b|\b(?:git|repo|repository)\s+status\b|\bwhat\s+did\s+i\s+change\s*$"],
+           "git status --short && git diff --stat", git=True),
+    Recipe("git log", [r"\b(?:recent|last|latest)\s+(?:(?P<n>\d+)\s+)?commits\b|\bcommit\s+history\b|\b(?:git|repo)\s+history\b",
+                       r"\bshow\s+(?:the\s+)?(?:git\s+)?log\b"], "git log --oneline --graph --decorate -n {n}", defaults={"n": "15"}, git=True),
+    Recipe("git branch", [r"\b(?:which|what)\s+branch\b|\bcurrent\s+branch\b"], "git branch --show-current", git=True),
+    Recipe("git branches", [r"\b(?:list|show|all)\s+(?:the\s+|all\s+)?branches\b|\bwhat\s+branches\b"], "git branch -a", git=True),
+    Recipe("git switch", [r"\b(?:switch|change|go|checkout|check\s+out)\s+(?:to\s+)?(?:the\s+)?branch\s+(?P<word>[\w./-]+)",
+                          r"\bswitch\s+to\s+(?:the\s+)?(?P<word>[\w./-]+)\s+branch\b"], "git switch {word}", git=True),
+    Recipe("git new branch", [r"\b(?:create|make|start|new)\s+(?:a\s+)?(?:new\s+)?branch\s+(?:called\s+|named\s+)?(?P<word>[\w./-]+)"],
+           "git switch -c {word}", git=True),
+    Recipe("git commit", [r"\bcommit\s+(?:all\s+|everything\s+|my\s+changes\s+|the\s+changes\s+|all\s+(?:my\s+|the\s+)?changes\s+)?"
+                          r"(?:with\s+(?:the\s+)?(?:message|msg)\s+|saying\s+|as\s+)?(?P<text>qlit\d+)\s*$"],
+           "git add -A && git commit -m {text}", git=True),
+    Recipe("git push", [r"^\s*(?:git\s+)?push(?:\s+(?:my\s+|the\s+)?(?:changes|commits|code|branch))?(?:\s+to\s+(?:github|gitlab|origin|the\s+remote|the\s+server))?\s*$"],
+           "git push", git=True),
+    Recipe("git pull", [r"\b(?:pull|get|fetch|download)\s+(?:the\s+)?(?:latest|new|newest)\s+(?:changes|commits|code|version)\b|"
+                        r"\bupdate\s+(?:the\s+|this\s+|my\s+)?(?:repo|repository|project|code|checkout)\b|^\s*pull\s*$"], "git pull", git=True),
+    Recipe("git undo commit", [r"\bundo\s+(?:the\s+|my\s+)?last\s+commit\b"], "git reset --soft HEAD~1", git=True, destructive=True,
+           warning="! undoes the last commit (your changes stay)"),
+    Recipe("git discard", [r"\b(?:discard|throw\s+away|revert|undo|reset)\s+(?:all\s+)?(?:my\s+|the\s+)?(?:local\s+|uncommitted\s+)?changes"
+                           r"(?:\s+(?:to|in|of)\s+(?P<path>\S+))?\s*$"],
+           "git restore -- {path}", defaults={"path": "."}, git=True, destructive=True,
+           warning="! throws away uncommitted changes"),
+    Recipe("git diff", [r"\b(?:show\s+)?(?:the\s+|my\s+)?(?:changes|diff|differences)\s+(?:in|to|of|for)\s+(?P<path>\S+)\s*$"],
+           "git diff -- {path}", git=True),
+    Recipe("git who changed", [r"\bwho\s+(?:changed|wrote|edited|modified|touched)\s+(?P<path>\S+)", r"\bblame\s+(?P<path>\S+)",
+                               r"\bhistory\s+of\s+(?P<path>\S+)"],
+           "git log --format='%h  %an  %ar  %s' -n 15 -- {path}", git=True),
+    Recipe("git stash", [r"\bstash\s+(?:my\s+|the\s+|all\s+)?changes\b|^\s*stash\s*$"], "git stash push", git=True),
+    Recipe("git unstash", [r"\b(?:pop|apply|restore|bring\s+back)\s+(?:the\s+|my\s+)?stash(?:ed\s+changes)?\b|\bunstash\b"],
+           "git stash pop", git=True),
+    Recipe("git clone", [r"\b(?:git\s+)?clone\s+(?:the\s+repo(?:sitory)?\s+)?(?P<url>\S+)"], _clone, needs=("git",),
+           slots={"url": "raw"}),
+    Recipe("git init", [r"\b(?:make|turn)\s+(?:this|this\s+folder|it)\s+(?:into\s+)?a\s+git\s+repo(?:sitory)?\b|\binit(?:ialize)?\s+(?:a\s+)?git\b"],
+           "git init", needs=("git",)),
+
+    # -- users
+    Recipe("add user", [r"\b(?:add|create)\s+(?:a\s+)?(?:new\s+)?user\s+(?:account\s+)?(?:called\s+|named\s+)?(?P<user>[a-z][\w.-]*)"],
+           "sudo adduser {user}", destructive=True),
+    Recipe("add to group", [r"\badd\s+(?P<user>me|myself|[\w.-]+)\s+to\s+(?:the\s+)?(?P<word>[\w.-]+)\s+group\b"],
+           lambda v, u: (f"sudo usermod -aG {v['word']} " + ('"$USER"' if v["user"].lower() in ("me", "myself")
+                                                              else shlex.quote(v["user"])))
+           if re.fullmatch(r"[\w.-]+", v["user"]) else None,
+           destructive=True, slots={"user": "raw"}),
+    Recipe("password change", [r"\bchange\s+(?:my\s+)?password\b"], "passwd"),
+    Recipe("become root", [r"\b(?:become|switch\s+to)\s+root\b|\broot\s+shell\b"], "sudo -i"),
+    Recipe("switch user", [r"\bswitch\s+(?:to\s+)?user\s+(?P<user>[\w.-]+)|\blog\s+in\s+as\s+(?P<user2>[\w.-]+)\b"], "su - {user}"),
+
+    # -- desktop
+    Recipe("open website", [r"\b(?:open|visit|browse\s+to|go\s+to)\s+(?:the\s+(?:website|site|page)\s+)?(?P<url>\S+)"
+                            r"(?:\s+in\s+(?:the\s+|a\s+)?(?:browser|firefox|chrome))?\s*$"], "xdg-open {url}", needs=("xdg-open",), gui=True),
+    Recipe("web search", [r"\b(?:search|google|look\s+up)\s+(?:the\s+(?:web|internet)|online|google)\s+for\s+(?P<text>.+)$",
+                          r"^\s*google\s+(?P<text>.+)$"], _websearch, slots={"text": "raw"}),
+    Recipe("open app", [r"^\s*(?:open|start|launch|run)\s+(?:the\s+)?(?P<app>vs\s+code|text\s+editor|file\s+manager|system\s+monitor|[a-z]+)"
+                        r"(?:\s+app)?\s*$"], _app),
+    Recipe("screenshot", [r"\b(?:take|make|grab)\s+a\s+screen\s*shot\b|^\s*screenshot\s*$"],
+           [("gnome-screenshot", "gnome-screenshot"), ("spectacle", "spectacle -b"), ("scrot", "scrot"),
+            ("import", "import -window root ~/screenshot-$(date +%F-%H%M%S).png")], gui=True),
+    Recipe("volume", [r"\b(?:set\s+(?:the\s+)?)?volume\s+(?:to\s+)?(?P<n>\d+)\s*%?", r"\b(?P<how>turn\s+(?:the\s+)?volume\s+(?:up|down)|volume\s+(?:up|down)|"
+                      r"louder|quieter|mute|unmute)\b"], _volume),
+]
+
+
+def h_recipe(u: Utterance) -> Plan | None:
+    best = None
+    text = Utterance(u.raw, u.cwd).text
+    for r in RECIPES:
+        if not any(p.search(text) for p in r.patterns):
+            continue                     # cheap pre-check; most recipes stop here
+        uu = Utterance(u.raw, u.cwd)
+        try:
+            plan = _apply_recipe(r, uu)
+        except (ValueError, KeyError, IndexError, re.error, OSError):
+            continue
+        if plan:
+            plan = finish(uu, plan)
+            if best is None or plan.confidence > best.confidence:
+                best = plan
+    return best
+
+
+HANDLERS = [h_recipe, h_system, h_power, h_version, h_installed, h_port, h_pkg_search, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
             h_find_then, h_reext, h_download, h_compare, h_replace, h_calc, h_copy_move, h_delete, h_read, h_grep, h_count, h_size, h_find, h_list]
 
 
@@ -2459,7 +3057,7 @@ def interpret(text: str, cwd: str) -> Plan | None:
     q = QUESTION_RE.match(text)
     if q and text[q.end():].strip():
         plan = _interpret_fixing(text[q.end():].rstrip(" ?"), cwd)
-        if plan:
+        if plan and not plan.runs_on_question:
             plan.show_only = True
             plan.why.append("shown, not run: you asked how")
     else:
@@ -2520,6 +3118,7 @@ newest oldest recent empty hidden old big
 # Real commands that are also everyday English verbs ("go up", "kill firefox",
 # "find big files"). For these, a confident rules parse wins over bash.
 AMBIGUOUS_FIRST = {"go", "kill", "find", "open", "make", "which", "who", "file", "install", "compare",
+                   "base64", "convert", "set", "sync", "ssh", "clone", "add", "pull", "push",
                    "du", "df", "free", "locate", "look", "see", "show", "cd", "zip", "unzip", "head",
                    "tail", "touch", "less"}
 
@@ -2548,8 +3147,9 @@ def looks_like_shell(line: str, path_env: str | None = None, cwd: str | None = N
     # words, not numbers, %jobs or paths that exist here ("kill 1234" and "kill %1" stay bash)
     plain = [t for t in rest if not re.fullmatch(r"[%+-]?\d+|%\S*", t)
              and not os.path.exists(os.path.join(cwd or ".", os.path.expanduser(t)))]
+    english = len(rest) > 1 and rest[0].lower() in ("a", "an", "the", "my", "me", "all", "every", "some", "how")
     if (cwd and toks[0] in AMBIGUOUS_FIRST and plain
-            and not any(t.startswith("-") for t in rest)
+            and (english or not any(t.startswith("-") for t in rest))
             and not re.search(r"[|&;<>`$]", line)
             and not all(os.path.exists(os.path.join(cwd, os.path.expanduser(t))) for t in rest)):
         plan = interpret(line, cwd)
@@ -2587,6 +3187,8 @@ def _looks_like_shell(line: str, path_env: str | None = None, known: set = froze
     first = toks[0]
     if first.startswith(("./", "/", "~/", "../")):
         return True
+    if first == "time" and len(toks) > 1 and toks[1].lower() in ("how", "it", "the"):
+        return False                     # "time how long make takes"
     if first in known or first in SHELL_KEYWORDS:
         return True
     if first not in SHELL_BUILTINS and not shutil.which(first, path=path_env):
@@ -2936,32 +3538,34 @@ class Memory:
 
 # ---- the shell --------------------------------------------------------------------
 
-HELP = """aisha — type bash, or say what you want.
+HELP = """aisha — type bash, or say what you want. Some things you can say:
 
-Plain words, for example:
-  find recursively files older than 2 months from this folder
-  find logs older than 2 months and move them to archive
-  edit logs.txt with micro
-  show the 5 newest files here
-  which files mention "invoice"
-  find duplicate files
-  what's eating my disk
-  how much ram is free
-  how do I delete empty folders        (shows the command, runs nothing)
+Files       find files older than 2 months in this folder · find big files · show file tree
+            find files containing "invoice" · find duplicate files · delete empty folders
+            edit notes.txt with micro · show the last 20 lines of app.log · what's in backup.zip
+            copy report.pdf to ~/Documents · rename all .jpeg files to .jpg · zip the src folder
+            replace "foo" with "bar" in all python files · compare a.txt and b.txt
+Text        line 10 of app.log · sort the lines in names.txt · pretty print data.json
+            how many times does error appear in app.log · base64 encode "hello"
+System      what's eating my disk · how much ram is free · what's using all my memory
+            cpu temperature · battery · system errors · failed services · logs of the ssh service
+            check for updates · install htop · remove old packages · shut down in 30 minutes
+Network     what's my ip · is example.com up · ip of example.com · is port 443 open on example.com
+            which ports are open · wifi networks · ssh to server.example.com as me
+Git         what changed · recent commits · switch to branch dev · commit everything with message "fix"
+Shell       set EDITOR to micro · make an alias ll for ls -la · add ~/bin to my path
+            run make in the background · run make and notify me · time how long make takes
+Other       what time is it in tokyo · what date is it 30 days from now · set a timer for 5 minutes
+            remind me to stretch in 20 minutes · generate a password · weather in helsinki
+            how do I delete empty folders   (shows the command, runs nothing)
 
-Shell:
-  any bash command, pipes, loops, aliases, functions
-  Ctrl-Z, jobs, fg, bg, cmd &          job control
-  Tab                                  complete commands and paths
+Shell features: pipes, loops, aliases, functions, Ctrl-Z/jobs/fg/bg, Tab completion.
 
-aisha:
-  !<command>         force plain bash
-  ?<request>         skip the rules and ask the LLM
-  explain <request>  show what would run, run nothing
-  learned            phrases remembered from the LLM
-  forget <request>   drop a remembered phrase
-  llm                check the local LLM (set it up with: aisha --setup)
-  exit               leave (or Ctrl-D)
+aisha commands:
+  !<command>         force plain bash             ?<request>         ask the LLM directly
+  explain <request>  show what would run          again              repeat the last line
+  learned / forget   remembered LLM answers       llm                check the local LLM
+  exit               leave (or Ctrl-D)            aisha --setup      add the local LLM
 """
 
 
@@ -3095,6 +3699,7 @@ class Shell:
         self._exit_warned = False
         self._cmd_cache: tuple | None = None
         self.child_stdin: int | None = None      # fd for commands' stdin (--lines)
+        self.last_line = ""                       # for "again"
         atexit.register(shutil.rmtree, self.workdir, True)
         if self.tty is not None:
             for sig in (signal.SIGTSTP, signal.SIGTTOU, signal.SIGTTIN, signal.SIGQUIT):
@@ -3123,9 +3728,19 @@ class Shell:
                 say("There are stopped jobs. ('exit' again to leave anyway)")
                 return 1
             raise ExitShell(int(toks[1]) if len(toks) == 2 and toks[1].isdigit() else self.rc)
-        if line in ("help", "?"):
+        low = line.lower().strip(" ?!.")
+        if line in ("help", "?") or low in (
+                "what can you do", "what can i ask", "what can i say", "what can you help with", "what do you understand",
+                "help me", "examples", "show examples", "show me examples", "commands", "what can i do"):
             say(HELP)
             return 0
+        if low in ("again", "repeat", "repeat that", "do it again", "do that again", "run it again",
+                   "run that again", "same again", "once more") or line == "!!":
+            if not self.last_line:
+                say(dim("nothing to repeat yet"))
+                return 1
+            say(dim("↻ " + self.last_line))
+            return self.handle(self.last_line)
         if line == "learned":
             for k, v in sorted(self.memory.data.items()):
                 say(f"{cyan(k)}\n  $ {v['command']}  {dim('(used %d×)' % v.get('uses', 1))}")
@@ -3139,6 +3754,7 @@ class Shell:
             return self.llm_status()
         if line == "history":
             return self.show_history()
+        self.last_line = line
         if word in ("jobs", "fg", "bg") and len(toks) <= 2:
             return getattr(self, "job_" + word)(toks[1] if len(toks) == 2 else None)
         if word == "explain":

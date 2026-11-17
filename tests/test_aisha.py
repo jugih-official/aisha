@@ -51,6 +51,12 @@ def make_corpus(root):
                        ".hidden": "", "report.pdf": ""}.items():
         with open(os.path.join(root, path), "w") as f:
             f.write(text)
+    with open(os.path.join(root, ".git", "HEAD"), "w") as f:
+        f.write("ref: refs/heads/main\n")
+    with open(os.path.join(root, "data.json"), "w") as f:
+        f.write('{"a": 1}\n')
+    with open(os.path.join(root, "people.csv"), "w") as f:
+        f.write("name,age\nann,30\n")
     with zipfile.ZipFile(os.path.join(root, "backup.zip"), "w") as z:
         z.writestr("a.txt", "a")
     with tarfile.open(os.path.join(root, "data.tar.gz"), "w:gz") as t:
@@ -1066,3 +1072,41 @@ class TestPlaces(LabTest):
         self.assertIn("measur", self.cmd("find files with measurement data in them"))
         self.assertIn("--include='*.py'", self.cmd("find TODO in python files"))
         self.assertIn("-mtime -3", self.cmd("find files modified in the last 3 days"))
+
+
+class TestRecipesNeedingTools(LabTest):
+    """Recipes whose tools this machine may not have: pretend they are installed."""
+
+    def setUp(self):
+        super().setUp()
+        orig = aisha.shutil.which
+        aisha.shutil.which = lambda c, *a, **k: f"/usr/bin/{c}" if c in ("ssh", "scp", "lsusb", "nmcli") else orig(c, *a, **k)
+        self.addCleanup(setattr, aisha.shutil, "which", orig)
+
+    def test_network_recipes(self):
+        self.assertEqual(self.cmd("ssh to example.com as jukka"), "ssh jukka@example.com")
+        self.assertEqual(self.cmd("connect to 10.0.0.5 on port 2222"), "ssh -p 2222 10.0.0.5")
+        self.assertEqual(self.cmd("copy README.md to jukka@server.example.com:/tmp"),
+                         "scp -r -- README.md jukka@server.example.com:/tmp")
+        self.assertEqual(self.cmd("list usb devices"), "lsusb")
+        self.assertEqual(self.cmd("show wifi networks"), "nmcli dev wifi list")
+
+
+class TestShellWords(LabTest):
+    def test_again_and_help(self):
+        sh = aisha.Shell(dict(aisha.DEFAULTS, llm="off"))
+        sh.cwd = self.lab
+        self.assertEqual(sh.handle("what can you do?"), 0)
+        sh.handle("echo x >> again.txt")
+        sh.handle("again")
+        sh.handle("do it again")
+        with open(os.path.join(self.lab, "again.txt")) as f:
+            self.assertEqual(f.read().split(), ["x", "x", "x"])
+
+    def test_every_recipe_template_formats(self):
+        import string
+        for r in aisha.RECIPES:
+            tmpls = [] if callable(r.cmd) else ([c for _, c in r.cmd] if isinstance(r.cmd, list) else [r.cmd])
+            for t in tmpls:
+                names = {f for _, f, _, _ in string.Formatter().parse(t) if f}
+                t.format(**{n: "X" for n in names})
