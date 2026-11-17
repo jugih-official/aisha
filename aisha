@@ -1,0 +1,2176 @@
+#!/usr/bin/env python3
+"""aisha — a natural-language shell.
+
+Type bash as usual, or say what you want in plain words:
+
+    aisha ~/lab ❯ find files in this folder that have the measurement data
+    → find · here and subfolders · files · name or content ~ "measur" (from "measurement"; "data" is generic)
+    $ find . -path '*/.git' -prune -o -type f \\( -iname '*measur*' -o -exec grep -IqiF -e measur {} \\; \\) -print
+
+Each line goes through these stages, in order, and stops at the first that
+handles it:
+
+  1. Shell input. A command on PATH with flags, paths, pipes or redirects
+     runs in bash unchanged. `!` forces this stage.
+  2. Memory. A phrase whose LLM-written command you approved before is
+     replayed without asking the model again.
+  3. Rules. A deterministic parser pulls slots out of the words (action,
+     where, file types, size, age, name and content keywords, sort, limit)
+     and builds the command from them. No model, instant, and it shows its
+     reasoning.
+  4. LLM. Only when the rules are not confident, a small local model is
+     asked, with the parser's partial understanding attached as hints. Any
+     OpenAI-compatible server works (Ollama, llama.cpp, LM Studio). Its
+     command is always shown and confirmed before it runs. `?` forces this
+     stage.
+
+Commands that delete or overwrite data always ask first.
+
+Standard library only. Python 3.10+.
+"""
+
+from __future__ import annotations
+
+import glob as globmod
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+
+VERSION = "0.1.0"
+
+# ---- configuration ----------------------------------------------------------
+
+CFG_DIR = os.path.expanduser(os.environ.get("AISHA_HOME", "~/.config/ai-bash/aisha"))
+CFG_FILE = os.path.join(CFG_DIR, "config.json")
+LEARNED_FILE = os.path.join(CFG_DIR, "learned.json")
+HISTORY_FILE = os.path.join(CFG_DIR, "history")
+
+DEFAULTS = {
+    "llm": "auto",                          # auto | off
+    "llm_url": "http://127.0.0.1:11434/v1",  # Ollama's OpenAI-compatible API
+    "llm_model": "qwen2.5-coder:1.5b",
+    "llm_key": "",                          # bearer token, if the server wants one
+    "llm_timeout": 60,                      # seconds; CPU models can be slow to load
+    "threshold": 0.7,                       # rules below this confidence go to the LLM
+    "confirm": "llm",                       # llm | always | destructive
+}
+ENV_KEYS = {
+    "llm": "AISHA_LLM",
+    "llm_url": "AISHA_LLM_URL",
+    "llm_model": "AISHA_LLM_MODEL",
+    "llm_key": "AISHA_LLM_KEY",
+    "llm_timeout": "AISHA_LLM_TIMEOUT",
+    "threshold": "AISHA_THRESHOLD",
+    "confirm": "AISHA_CONFIRM",
+}
+
+
+def load_config() -> dict:
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CFG_FILE) as f:
+            cfg.update(json.load(f))
+    except (OSError, ValueError):
+        pass
+    for key, env in ENV_KEYS.items():
+        if os.environ.get(env):
+            cfg[key] = os.environ[env]
+    cfg["llm_timeout"] = float(cfg["llm_timeout"])
+    cfg["threshold"] = float(cfg["threshold"])
+    return cfg
+
+
+# ---- terminal output ---------------------------------------------------------
+# Everything aisha itself says goes to stderr, so `aisha ... | other` pipes
+# only the command's own output.
+
+_COLOR = sys.stderr.isatty() and not os.environ.get("NO_COLOR")
+
+
+def _paint(code: str, s: str) -> str:
+    return f"\033[{code}m{s}\033[0m" if _COLOR else s
+
+
+def dim(s):    return _paint("2", s)
+def bold(s):   return _paint("1", s)
+def red(s):    return _paint("1;31", s)
+def green(s):  return _paint("1;32", s)
+def yellow(s): return _paint("1;33", s)
+def cyan(s):   return _paint("36", s)
+
+
+def say(s: str = "") -> None:
+    print(s, file=sys.stderr, flush=True)
+
+
+def ask(prompt: str) -> str | None:
+    """Read one answer, from the terminal even when stdin is a pipe.
+
+    None means nobody can answer (no terminal at all): callers treat it as no.
+    """
+    if sys.stdin.isatty():
+        try:
+            return input(prompt)
+        except EOFError:
+            return None
+    try:
+        with open("/dev/tty") as tty:
+            sys.stderr.write(prompt)
+            sys.stderr.flush()
+            return tty.readline().strip()
+    except OSError:
+        sys.stderr.write(prompt + "(no terminal to answer — not running)\n")
+        return None
+
+
+# ---- safety ------------------------------------------------------------------
+# Same idea as `ai`: anything that meaningfully deletes or overwrites data.
+
+DESTRUCTIVE_RE = re.compile(
+    r"""
+    \b( rm | rmdir | shred | unlink | truncate | wipefs | fdisk | parted | sfdisk
+      | mkfs(\.[a-z0-9]+)? )\b
+    | \bfind\b[^|;&]*\s-delete\b
+    | \bfind\b[^|;&]*-exec\s+rm\b
+    | \bdd\b[^|;&]*\bof=/dev/
+    | >\s*/dev/(sd|nvme|hd|mmc|loop)
+    | \bgit\s+(reset\s+--hard|clean\s+-[a-z]*f)
+    """,
+    re.VERBOSE,
+)
+
+
+def looks_destructive(cmd: str) -> bool:
+    return bool(DESTRUCTIVE_RE.search(cmd))
+
+
+# ---- vocabulary --------------------------------------------------------------
+
+NUMWORDS = {
+    "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "fifteen": 15, "twenty": 20, "thirty": 30, "forty": 40,
+    "fifty": 50, "hundred": 100, "few": 3, "couple": 2,
+}
+NUM = (r"(\d+(?:\.\d+)?|an?|one|two|three|four|five|six|seven|eight|nine|ten|"
+       r"eleven|twelve|fifteen|twenty|thirty|forty|fifty|hundred|few|couple(?:\s+of)?)")
+TUNIT = r"(minutes?|mins?|hours?|hrs?|days?|weeks?|wks?|months?|years?|yrs?)"
+SUNIT = (r"(bytes?|b|kilobytes?|kib|kb|k|megabytes?|megs?|mib|mb|m|"
+         r"gigabytes?|gigs?|gib|gb|g|terabytes?|tib|tb|t)")
+
+
+def num(s: str | None, default=None):
+    if s is None:
+        return default
+    s = s.strip().lower().replace(" of", "")
+    if re.fullmatch(r"\d+", s):
+        return int(s)
+    if re.fullmatch(r"\d*\.\d+", s):
+        return float(s)
+    return NUMWORDS.get(s, default)
+
+
+# Words that carry no meaning once the slots are out. Anything left over that
+# is not in here counts against the parser's confidence.
+FILLER = set("""
+a an the all any some every each of in on at to for from by with within into onto
+is are was were be been being am do does did done can could would will should shall
+please pls plz kindly just quickly now me my mine i we our us you your it its them
+they their there these those this that which who what whats where when how
+and or also then so up out ok okay hey hi lets let want need wanna like look looks
+give get tell have has had only really actually currently exactly thing things stuff
+item items entries entry everything first one ones whole
+""".split())
+
+# Dates the rules do not parse. They must not become search keywords; they
+# count as unknown so the LLM gets the request.
+TIMEISH = set("""
+monday tuesday wednesday thursday friday saturday sunday last next ago since until
+january february march april may june july august september october november december
+morning evening tonight night weekend
+""".split())
+
+# Nouns too vague to be search keywords ("the measurement *data*").
+GENERIC = set("""
+data info information content contents stuff thing things text word words string
+strings phrase file files line lines value values record records entry entries
+document documents doc docs item items one ones folder folders directory directories
+""".split())
+
+CODE_EXTS = ["py", "js", "mjs", "cjs", "jsx", "ts", "tsx", "sh", "bash", "c", "h",
+             "cpp", "cc", "hpp", "java", "go", "rs", "rb", "php", "pl", "lua",
+             "kt", "swift", "cs", "scala", "r", "m", "sql"]
+
+# word -> (label, extensions). Plurals are found by stripping a trailing "s".
+TYPE_WORDS = {
+    "python": ("Python", ["py"]),
+    "javascript": ("JavaScript", ["js", "mjs", "cjs", "jsx"]),
+    "typescript": ("TypeScript", ["ts", "tsx"]),
+    "shell": ("shell", ["sh", "bash", "zsh"]),
+    "bash": ("shell", ["sh", "bash"]),
+    "java": ("Java", ["java"]),
+    "golang": ("Go", ["go"]),
+    "rust": ("Rust", ["rs"]),
+    "ruby": ("Ruby", ["rb"]),
+    "php": ("PHP", ["php"]),
+    "html": ("HTML", ["html", "htm"]),
+    "css": ("CSS", ["css", "scss", "sass"]),
+    "json": ("JSON", ["json"]),
+    "yaml": ("YAML", ["yaml", "yml"]),
+    "xml": ("XML", ["xml"]),
+    "markdown": ("Markdown", ["md", "markdown"]),
+    "txt": ("text", ["txt"]),
+    "log": ("log", ["log"]),
+    "csv": ("CSV", ["csv"]),
+    "tsv": ("TSV", ["tsv"]),
+    "pdf": ("PDF", ["pdf"]),
+    "spreadsheet": ("spreadsheet", ["xls", "xlsx", "ods", "csv"]),
+    "excel": ("Excel", ["xls", "xlsx"]),
+    "presentation": ("presentation", ["ppt", "pptx", "odp"]),
+    "slide": ("presentation", ["ppt", "pptx", "odp"]),
+    "powerpoint": ("presentation", ["ppt", "pptx"]),
+    "image": ("image", ["jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "heic", "tif", "tiff"]),
+    "picture": ("image", ["jpg", "jpeg", "png", "gif", "bmp", "webp", "svg", "heic", "tif", "tiff"]),
+    "photo": ("image", ["jpg", "jpeg", "png", "heic", "webp", "tif", "tiff"]),
+    "pic": ("image", ["jpg", "jpeg", "png", "gif", "webp"]),
+    "screenshot": ("image", ["png", "jpg", "jpeg"]),
+    "video": ("video", ["mp4", "mkv", "avi", "mov", "webm", "m4v"]),
+    "movie": ("video", ["mp4", "mkv", "avi", "mov", "webm", "m4v"]),
+    "audio": ("audio", ["mp3", "wav", "flac", "ogg", "m4a", "aac", "opus"]),
+    "music": ("audio", ["mp3", "wav", "flac", "ogg", "m4a", "aac", "opus"]),
+    "song": ("audio", ["mp3", "wav", "flac", "ogg", "m4a", "aac", "opus"]),
+    "sound": ("audio", ["mp3", "wav", "flac", "ogg", "m4a", "aac", "opus"]),
+    "mp3": ("MP3", ["mp3"]),
+    "archive": ("archive", ["zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "zst"]),
+    "zip": ("zip", ["zip"]),
+    "zipped": ("archive", ["zip", "gz", "tgz", "7z"]),
+    "compressed": ("archive", ["zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "zst"]),
+    "tarball": ("archive", ["tar", "tgz", "gz", "xz", "bz2"]),
+    "data": ("data", ["csv", "tsv", "json", "xlsx", "xls", "parquet", "h5", "hdf5",
+                      "dat", "npy", "npz", "mat", "sqlite", "db", "feather"]),
+    "config": ("config", ["conf", "cfg", "ini", "toml", "yaml", "yml", "json", "env"]),
+    "configuration": ("config", ["conf", "cfg", "ini", "toml", "yaml", "yml", "json", "env"]),
+    "code": ("code", CODE_EXTS),
+    "source": ("code", CODE_EXTS),
+    "script": ("script", ["sh", "bash", "py", "pl", "rb", "js"]),
+    "backup": ("backup", ["bak", "old", "orig", "backup"]),
+    "temp": ("temporary", ["tmp", "temp", "swp"]),
+    "temporary": ("temporary", ["tmp", "temp", "swp"]),
+    "tmp": ("temporary", ["tmp", "temp"]),
+}
+TYPE_PHRASES = [  # multi-word types, checked before single words
+    (r"\bword\s+(?:documents?|docs?|files?)\b", ("Word", ["doc", "docx", "odt"])),
+    (r"\bsource\s+code\b", ("code", CODE_EXTS)),
+    (r"\bc\+\+(?:\s+files?)?\b|\bcpp\b", ("C++", ["cpp", "cc", "cxx", "hpp", "h"])),
+    (r"\btext\s+files?\b|\bplain\s+text\b", ("text", ["txt"])),
+    (r"\b(?:documents?|docs)\b", ("document", ["pdf", "doc", "docx", "odt", "rtf", "txt", "md"])),
+]
+
+XDG_DIRS = {
+    "downloads": "Downloads", "download": "Downloads", "documents": "Documents",
+    "desktop": "Desktop", "pictures": "Pictures", "music": "Music",
+    "videos": "Videos", "templates": "Templates", "public": "Public",
+}
+
+
+def type_word(w: str):
+    if w in TYPE_WORDS:
+        return TYPE_WORDS[w]
+    if w.endswith("s") and w[:-1] in TYPE_WORDS:
+        return TYPE_WORDS[w[:-1]]
+    return None
+
+
+SUFFIXES = ["ations", "ation", "ments", "ment", "ings", "ing", "ies", "ers",
+            "er", "ed", "es", "s"]
+
+
+def stem(w: str) -> str:
+    """Tiny suffix stripper so "measurement" also finds "measured", "measure"."""
+    if len(w) <= 4 or not w.isalpha():
+        return w
+    for suf in SUFFIXES:
+        if w.endswith(suf) and len(w) - len(suf) >= 4:
+            w = w[: -len(suf)] + ("y" if suf == "ies" else "")
+            break
+    if w.endswith("e") and len(w) > 4:
+        w = w[:-1]
+    return w
+
+
+# ---- paths -------------------------------------------------------------------
+
+def qpath(p: str) -> str:
+    """Shell-quote a path but keep a leading ~ expandable."""
+    if p == "~":
+        return "~"
+    if p.startswith("~/"):
+        return "~/" + shlex.quote(p[2:])
+    return shlex.quote(p)
+
+
+def is_pathlike(tok: str) -> bool:
+    return (tok == ".." or bool(re.search(r"[/~*?]", tok))
+            or bool(re.fullmatch(r"[\w.+-]*[A-Za-z_][\w-]*\.[A-Za-z0-9]{1,8}", tok)))
+
+
+def resolve(tok: str, cwd: str, want: str | None = None) -> str | None:
+    """Turn a word into a real path, as the user would type it.
+
+    want: "dir", "file" or None. Tries the literal path, then a
+    case-insensitive match in cwd ("readme" -> README.md), then the usual
+    home folders ("downloads" -> ~/Downloads).
+    """
+    if not tok:
+        return None
+    full = os.path.expanduser(tok)
+    if not os.path.isabs(full):
+        full = os.path.join(cwd, full)
+
+    def ok(path):
+        if want == "dir":
+            return os.path.isdir(path)
+        if want == "file":
+            return os.path.isfile(path)
+        return os.path.exists(path)
+
+    if ok(full):
+        return tok
+    if "/" not in tok:
+        try:
+            entries = os.listdir(cwd)
+        except OSError:
+            entries = []
+        low = tok.lower()
+        for match in ([e for e in entries if e.lower() == low],
+                      [e for e in entries if os.path.splitext(e)[0].lower() == low]):
+            match = [e for e in match if ok(os.path.join(cwd, e))]
+            if len(match) == 1:
+                return match[0]
+        if want in ("dir", None) and low in XDG_DIRS:
+            return "~/" + XDG_DIRS[low]
+    return None
+
+
+# ---- the utterance -------------------------------------------------------------
+
+CONTRACTIONS = [
+    (r"\bwhat's\b", "what is"), (r"\bwhere's\b", "where is"), (r"\bit's\b", "it is"),
+    (r"\bthat's\b", "that is"), (r"\bwho's\b", "who is"), (r"\bi'm\b", "i am"),
+    (r"\bdon't\b", "do not"), (r"\bdoesn't\b", "does not"), (r"\bisn't\b", "is not"),
+    (r"\baren't\b", "are not"), (r"\bhaven't\b", "have not"), (r"\bhasn't\b", "has not"),
+    (r"\bwasn't\b", "was not"), (r"\bweren't\b", "were not"), (r"\bcan't\b", "cannot"),
+    (r"\blet's\b", "let us"), (r"\bhow's\b", "how is"),
+]
+
+
+class Utterance:
+    """The request, with a mask that slot extractors blank out as they go.
+
+    `low` is a lowercased copy of `orig` with identical character offsets, so
+    a match found in the mask can be read back with its original case
+    (file names keep their capitals). Quoted strings become qlitN tokens.
+    """
+
+    def __init__(self, text: str, cwd: str, literals: list[str] | None = None):
+        self.cwd = cwd
+        self.literals: list[str] = list(literals or [])
+        text = (text.replace("’", "'").replace("‘", "'")
+                    .replace("“", '"').replace("”", '"'))
+
+        def quoted(m):
+            self.literals.append(m.group(1) if m.group(1) is not None else m.group(2))
+            return f" qlit{len(self.literals) - 1} "
+
+        text = re.sub(r'"([^"]*)"|(?<!\w)\'([^\']*)\'(?!\w)', quoted, text)
+        for pat, rep in CONTRACTIONS:
+            text = re.sub(pat, rep, text, flags=re.I)
+        toks = [t.rstrip(",;!?") for t in text.split()]
+        if toks and toks[-1].endswith(".") and toks[-1] not in (".", ".."):
+            toks[-1] = toks[-1][:-1]
+        # File names and paths become literals too, so word rules never read
+        # inside them ("old.tmp" is a name, not the word "old").
+        for i, t in enumerate(toks):
+            if is_pathlike(t) and not re.fullmatch(r"\*?\.[A-Za-z0-9]{1,8}|qlit\d+", t, re.I):
+                self.literals.append(t)
+                toks[i] = f"qlit{len(self.literals) - 1}"
+        self.orig = " ".join(t for t in toks if t)
+        self.low = "".join(c.lower() if len(c.lower()) == 1 else c for c in self.orig)
+        self.text = self.low
+
+    # -- masking
+    def blank(self, start: int, end: int) -> None:
+        self.text = self.text[:start] + " " * (end - start) + self.text[end:]
+
+    def take(self, pattern: str):
+        m = re.search(pattern, self.text)
+        if m:
+            self.blank(m.start(), m.end())
+        return m
+
+    def peek(self, pattern: str):
+        return re.search(pattern, self.text)
+
+    def o(self, m, g: int = 0) -> str:
+        """Original-case text of a match group."""
+        return self.orig[m.start(g):m.end(g)]
+
+    def lit(self, tok: str) -> str:
+        m = re.fullmatch(r"qlit(\d+)", tok.lower())
+        return self.literals[int(m.group(1))] if m else tok
+
+    def remaining(self) -> list[tuple[str, str, int]]:
+        """(low, orig, start) for each word still unmasked."""
+        return [(m.group(0), self.orig[m.start():m.end()], m.start())
+                for m in re.finditer(r"\S+", self.text)]
+
+    def leftover(self) -> list[str]:
+        return [w for w, _, _ in self.remaining() if w not in FILLER]
+
+
+# ---- slots ---------------------------------------------------------------------
+
+@dataclass
+class FindSpec:
+    root: str = "."
+    rec: bool | None = None          # None = the intent's default
+    ftype: str | None = None         # f d l
+    exts: list = field(default_factory=list)
+    names: list = field(default_factory=list)       # -iname globs
+    hidden: bool = False
+    empty: bool = False
+    executable: bool = False
+    size: list = field(default_factory=list)        # find args
+    time: list = field(default_factory=list)
+    daystart: bool = False
+    content: list = field(default_factory=list)     # (mode, needle, shown)
+    sort: tuple | None = None                       # (key, descending)
+    limit: int | None = None
+    why: list = field(default_factory=list)
+    unparsed: list = field(default_factory=list)    # words seen but not understood
+
+    def narrowed(self) -> bool:
+        return bool(self.exts or self.names or self.hidden or self.empty
+                    or self.executable or self.size or self.time or self.content)
+
+
+MOD = r"(?:(?:modified|changed|edited|created|updated|touched|saved|made|written)\s+)?"
+
+
+def to_bytes(n: float, unit: str) -> int:
+    u = unit.lower()
+    if u.startswith(("t",)):
+        mult = 1024 ** 4
+    elif u.startswith(("g",)):
+        mult = 1024 ** 3
+    elif u.startswith(("m",)):
+        mult = 1024 ** 2
+    elif u.startswith(("k",)):
+        mult = 1024
+    else:
+        mult = 1
+    return int(n * mult)
+
+
+def size_arg(sign: str, n: float, unit: str) -> str:
+    u = unit.lower()
+    letter = {"k": "k", "m": "M", "g": "G"}.get(u[0])
+    if sign == "+" and letter and float(n).is_integer() and not u.startswith("b"):
+        return f"+{int(n)}{letter}"
+    return f"{sign}{to_bytes(n, unit)}c"   # exact bytes; -1M would mean "empty"
+
+
+def take_size(u: Utterance, spec: FindSpec) -> None:
+    big = (r"(?:bigger|larger|greater|heavier|more|over|above|exceeding|at\s+least|>=?)")
+    small = r"(?:smaller|less|lighter|under|below|at\s+most|<=?)"
+    for word, sign, label in ((big, "+", ">"), (small, "-", "<")):
+        m = u.take(rf"(?:\b|(?=[<>])){word}\s*(?:than\s+)?{NUM}\s*{SUNIT}\b")
+        if m:
+            n = num(m.group(1), 1)
+            spec.size += ["-size", size_arg(sign, n, m.group(2))]
+            spec.why.append(f"size {label} {m.group(1)}{m.group(2)}")
+
+
+def time_args(n, unit: str, sign: str) -> list[str]:
+    n = max(1, int(round(n))) if n else 1
+    unit = unit.lower()
+    if unit.startswith("min"):
+        return ["-mmin", f"{sign}{n}"]
+    if unit.startswith(("hour", "hr")):
+        return ["-mmin", f"{sign}{n * 60}"]
+    days = n * {"d": 1, "w": 7, "m": 30, "y": 365}[unit[0]]
+    return ["-mtime", f"{sign}{days}"]
+
+
+def take_time(u: Utterance, spec: FindSpec) -> None:
+    if u.take(rf"\b{MOD}today\b"):
+        spec.daystart, spec.time = True, ["-mtime", "0"]
+        spec.why.append("modified today")
+        return
+    if u.take(rf"\b{MOD}yesterday\b"):
+        spec.daystart, spec.time = True, ["-mtime", "1"]
+        spec.why.append("modified yesterday")
+        return
+    rules = [  # (pattern, sign, number group, unit group)
+        (rf"\b{MOD}(?:(?:in|within|during|over|from)\s+)?(?:the\s+)?(?:last|past|previous)\s+(?:{NUM}\s*)?{TUNIT}\b", "-"),
+        (rf"\b{MOD}(?:newer\s+than|less\s+than|under|within)\s+{NUM}\s*{TUNIT}(?:\s+(?:old|ago))?\b", "-"),
+        (rf"\b(?:not|never|have\s+not\s+been|has\s+not\s+been)\s+(?:been\s+)?(?:modified|changed|touched|used|accessed|opened|edited)\s+(?:in|for|during|since)\s+(?:the\s+)?(?:last|past)?\s*(?:{NUM}\s*)?{TUNIT}\b", "+"),
+        (rf"\b{MOD}(?:older\s+than|more\s+than|over|at\s+least)\s+{NUM}\s*{TUNIT}(?:\s+(?:old|ago))?\b", "+"),
+        (rf"\b{NUM}\s*{TUNIT}\s+old\b", "+"),
+    ]
+    for pat, sign in rules:
+        m = u.take(pat)
+        if m:
+            n, unit = num(m.group(1), 1), m.group(2)
+            spec.time = time_args(n, unit, sign)
+            what = "within the last" if sign == "-" else "older than"
+            spec.why.append(f"modified {what} {m.group(1) or 1} {unit}")
+            return
+    m = u.take(rf"\b{MOD}this\s+(week|month|year)\b")
+    if m:
+        spec.time = time_args(1, m.group(1), "-")
+        spec.why.append(f"modified this {m.group(1)}")
+        return
+    if u.take(r"\bold\b"):
+        spec.time = ["-mtime", "+30"]
+        spec.why.append("old = not modified in 30+ days")
+
+
+SORT_WORD = {
+    "largest": ("size", True), "biggest": ("size", True), "heaviest": ("size", True),
+    "huge": ("size", True), "big": ("size", True), "large": ("size", True),
+    "smallest": ("size", False), "tiniest": ("size", False),
+    "newest": ("time", True), "latest": ("time", True), "recent": ("time", True),
+    "oldest": ("time", False),
+}
+SORT_LABEL = {("size", True): "largest first", ("size", False): "smallest first",
+              ("time", True): "newest first", ("time", False): "oldest first",
+              ("name", False): "by name", ("name", True): "by name, reversed"}
+RECENT = r"(?:most\s+)?recent(?:ly)?(?:\s+(?:modified|changed|edited|updated|created))?|(?:modified|changed|edited|updated)\s+recently"
+
+
+def take_sort_limit(u: Utterance, spec: FindSpec) -> None:
+    m = u.take(rf"\b(?:the\s+)?(?:top|first)\s+{NUM}\b(?!\s*(?:lines?|bytes?))")
+    if m:
+        spec.limit = int(num(m.group(1), 10))
+    words = r"largest|biggest|heaviest|smallest|tiniest|newest|latest|oldest"
+    m = u.take(rf"\b{NUM}\s+({words}|{RECENT})\b")
+    if m:
+        spec.limit = int(num(m.group(1), 10))
+        word = m.group(2)
+    else:
+        m = u.take(rf"\b({words}|huge|big|large|{RECENT})\b")
+        word = m.group(1) if m else None
+    if word:
+        key = "recent" if "recent" in word else word.split()[0]
+        spec.sort = SORT_WORD.get(key, ("time", True))
+    m = u.take(r"\b(?:sorted|sort(?:ed)?|ordered|order|arranged)?\s*by\s+(size|date|time|name|age|"
+               r"modification\s+(?:date|time)|(?:last\s+)?modified)"
+               r"(?:\s+(desc(?:ending)?|asc(?:ending)?|reversed?|in\s+reverse))?\b")
+    if m:
+        key = {"size": "size", "name": "name"}.get(m.group(1), "time")
+        desc = key != "name"
+        if m.group(2):
+            desc = m.group(2).startswith("desc") or (key == "name" and "rev" in m.group(2))
+            if key != "name" and ("asc" in m.group(2) or "rev" in m.group(2)):
+                desc = False
+        spec.sort = (key, desc)
+    if u.take(r"\balphabetical(?:ly)?\b"):
+        spec.sort = ("name", False)
+    if spec.sort:
+        spec.why.append("sorted " + SORT_LABEL[spec.sort])
+    if spec.limit:
+        spec.why.append(f"top {spec.limit}")
+
+
+LOC_PREP = r"(?:in|on|inside|within|under|from|at|across|throughout)"
+
+
+def take_location(u: Utterance, spec: FindSpec) -> None:
+    if u.take(r"\b(?:recursively|recursive|(?:and|including|incl|with|in|plus)\s+(?:all\s+)?(?:the\s+|its\s+)?"
+              r"(?:sub-?folders|sub-?directories|subdirs)|in\s+any\s+sub-?folder|all\s+the\s+way\s+down)\b"):
+        spec.rec = True
+    m = u.take(r"\b(?:non-?recursively|(?:only|just)\s+(?:in\s+)?(?:the\s+)?(?:top[- ]level|this\s+folder|"
+               r"this\s+directory|here)|top[- ]level(?:\s+only)?|not\s+(?:in\s+)?sub-?folders|"
+               r"without\s+sub-?folders|(?:this\s+folder|this\s+directory|here)\s+only)\b")
+    if m:
+        spec.rec = False
+    if u.take(rf"\b(?:{LOC_PREP}\s+)?(?:this|the|my|current)\s+(?:project|repo|repository|codebase|source\s+tree)\b"):
+        spec.root, spec.rec = ".", True if spec.rec is None else spec.rec
+        return
+    fixed = [
+        (rf"\b{LOC_PREP}\s+(?:this|the\s+current|current|the\s+present|the\s+same)\s+(?:folder|directory|dir|location|place|path)\b", "."),
+        (r"\b(?:this|current)\s+(?:folder|directory|dir)\b", "."),
+        (r"\b(?:right\s+)?here\b", "."),
+        (rf"\b(?:{LOC_PREP}\s+)?(?:my|the)\s+home(?:\s+(?:folder|directory|dir))?\b|\bhome\s+(?:folder|directory|dir)\b", "~"),
+        (rf"\b(?:{LOC_PREP}\s+)?(?:the\s+)?(?:whole|entire)\s+(?:system|computer|disk|drive|machine|file\s*system)\b|\beverywhere\b|\bsystem[- ]wide\b", "/"),
+        (rf"\b(?:{LOC_PREP}\s+)?(?:the\s+)?parent\s+(?:folder|directory|dir)\b|\bone\s+(?:level|folder|directory)\s+up\b", ".."),
+    ]
+    for pat, root in fixed:
+        if u.take(pat):
+            spec.root = root
+            return
+    # "in Downloads", "under the src folder", "in ~/data"
+    pat = (rf"\b{LOC_PREP}\s+(?:the\s+|my\s+)?(?:(?:folder|directory|dir)\s+(?:called\s+|named\s+)?)?"
+           r"(\S+)(?:\s+(?:folder|directory|dir)\b)?")
+    for m in re.finditer(pat, u.text):
+        tok = u.lit(u.o(m, 1))
+        path = resolve(tok, u.cwd, "dir")
+        if path:
+            u.blank(m.start(), m.end())
+            spec.root = path
+            return
+    # a bare path: "find big files ~/videos"
+    for low, orig, start in u.remaining():
+        tok = u.lit(orig)
+        if ("/" in tok or tok.startswith("~") or low.startswith("qlit")) and resolve(tok, u.cwd, "dir"):
+            u.blank(start, start + len(orig))
+            spec.root = tok
+            return
+
+
+def add_exts(spec: FindSpec, exts, label: str | None = None) -> None:
+    for e in exts:
+        if e not in spec.exts:
+            spec.exts.append(e)
+    shown = label or " ".join("." + e for e in exts)
+    spec.why.append(f"type: {shown}")
+
+
+def take_ext(u: Utterance, spec: FindSpec) -> None:
+    for m in list(re.finditer(r"(?<![\w/~.])\*?\.([a-z0-9]{1,8})\b(?![/\w.])", u.text)):
+        u.blank(m.start(), m.end())
+        add_exts(spec, [m.group(1)])
+    m = u.take(r"\b(?:with\s+|having\s+)?(?:the\s+|an?\s+)?(?:extension|suffix)\s+\.?([a-z0-9]{1,8})\b")
+    m = m or u.take(r"\b\.?([a-z0-9]{1,8})\s+(?:extension|suffix)\b")
+    if m:
+        add_exts(spec, [m.group(1)])
+
+
+def take_name(u: Utterance, spec: FindSpec) -> None:
+    rules = [
+        (r"\bwhose\s+(?:file)?names?\s+(?:(contains?|includes?|has|have|is|are|matches|match)|(starts?\s+with|begins?\s+with)|(ends?\s+with))\s+(\S+)", None),
+        (r"\bwith\s+(?:a\s+)?(?:file)?names?\s+(?:(containing|including|like|matching|that\s+contains?)|(starting\s+with|beginning\s+with)|(ending\s+with))\s+(\S+)", None),
+        (r"\b(?:file)?names?\s+(?:(like|matching|containing)|(starting\s+with|beginning\s+with|that\s+starts?\s+with)|(ending\s+with|that\s+ends?\s+with))\s+(\S+)", None),
+        (r"\b(?:that\s+are\s+|which\s+are\s+)?(?:named|called|titled)\s+(\S+)", "named"),
+        (r"\b(?:starting|beginning)\s+with\s+(\S+)", "start"),
+        (r"\bending\s+(?:in|with)\s+(\S+)", "end"),
+        (r"\bwith\s+(\S+)\s+in\s+(?:the|their|its)\s+(?:file)?names?\b", "contains"),
+    ]
+    for pat, kind in rules:
+        m = re.search(pat, u.text)
+        if not m:
+            continue
+        g = m.lastindex  # the name token is always the last group
+        tok = u.lit(u.o(m, g))
+        if kind is None:
+            kind = "contains" if m.group(1) else ("start" if m.group(2) else "end")
+        u.blank(m.start(), m.end())
+        if kind == "end" and re.fullmatch(r"\.?[A-Za-z0-9]{1,8}", tok) and (tok.startswith(".") or type_word(tok.lower())):
+            add_exts(spec, [tok.lstrip(".").lower()])
+            continue
+        if re.search(r"[*?\[]", tok):
+            glob = tok
+        elif kind == "start":
+            glob = tok + "*"
+        elif kind == "end":
+            glob = "*" + tok
+        elif kind == "named" and "." in tok:
+            glob = tok
+        else:
+            glob = f"*{tok}*"
+        spec.names.append(glob)
+        spec.why.append(f"name ~ {glob}")
+
+
+EXPLICIT = (r"\b(?:(?:that|which)\s+)?(?:contains?|containing|mentions?|mentioning|"
+            r"(?:includes?|including|with|matching)\s+the\s+(?:text|word|string|phrase))\b")
+VAGUE_ANY = (r"\b(?:(?:that|which)\s+(?:has|have|had|holds?|stores?|keeps?)|having|holding|"
+             r"with)\b")
+VAGUE_TOPIC = r"\b(?:about|regarding|concerning|related\s+to|relating\s+to|on\s+the\s+topic\s+of)\b"
+
+
+def add_keywords(u: Utterance, spec: FindSpec, words: list[str], mode: str) -> int:
+    """Turn words into content/name needles. Returns how many were added."""
+    added = 0
+    for w in words:
+        if w.startswith("qlit"):
+            needle = u.lit(w)
+            spec.content.append((mode, needle, f'"{needle}"'))
+        else:
+            s = stem(w)
+            shown = f'"{s}"' + (f' (from "{w}")' if s != w else "")
+            spec.content.append((mode, s, shown))
+        added += 1
+    return added
+
+
+def take_content(u: Utterance, spec: FindSpec) -> None:
+    for pat, mode in ((EXPLICIT, "content"), (VAGUE_TOPIC, "any"), (VAGUE_ANY, "any")):
+        m = re.search(pat, u.text)
+        if not m:
+            continue
+        tail = u.text[m.end():]
+        name_only = re.search(r"\bin\s+(?:the|their|its)\s+(?:file\s*)?names?\b|\bin\s+(?:the\s+)?filenames?\b", tail)
+        if name_only:
+            mode = "name"
+        u.blank(m.start(), len(u.text))
+        tail = re.sub(r"\bin\s+(?:them|it|their\s+content|the\s+content|(?:the|their|its)\s+(?:file\s*)?names?|"
+                      r"(?:the\s+)?filenames?)\b|\binside\b", " ", tail)
+        words = [w for w in tail.split() if w not in FILLER]
+        if not words:
+            continue
+        if mode == "any" and pat == VAGUE_ANY:
+            types = [type_word(w) for w in words if w not in GENERIC or type_word(w)]
+            if types and all(types):          # "with python code" -> a type
+                exts = set(types[0][1])
+                for t in types[1:]:
+                    exts &= set(t[1])
+                add_exts(spec, sorted(exts) if exts else types[0][1], types[0][0])
+                return
+        spec.unparsed += [w for w in words if w in TIMEISH]
+        words = [w for w in words if w not in TIMEISH]
+        keys = [w for w in words if w not in GENERIC or w.startswith("qlit")]
+        dropped = [w for w in words if w not in keys]
+        if not keys:
+            continue
+        add_keywords(u, spec, keys, mode)
+        label = {"content": "content", "any": "name or content", "name": "name"}[mode]
+        shown = ", ".join(c[2] for c in spec.content[-len(keys):])
+        note = f'; "{" ".join(dropped)}" is generic' if dropped else ""
+        spec.why.append(f"{label} ~ {shown}{note}")
+        return
+
+
+def take_types(u: Utterance, spec: FindSpec) -> None:
+    found = []
+    for pat, (label, exts) in TYPE_PHRASES:
+        if u.take(pat):
+            found.append((label, exts))
+    for low, orig, start in u.remaining():
+        t = type_word(low)
+        if t and low not in ("files", "file"):
+            u.blank(start, start + len(orig))
+            found.append(t)
+    if found:
+        exts = set(found[0][1])
+        for _, e in found[1:]:
+            exts &= set(e)
+        if not exts:  # "images and videos" -> union
+            exts = {e for _, es in found for e in es}
+            label = " and ".join(dict.fromkeys(l for l, _ in found))
+        else:
+            label = found[-1][0] if len(found) > 1 else found[0][0]
+        add_exts(spec, sorted(exts, key=lambda e: [x for _, es in found for x in es].index(e)),
+                 f"{label} ({' '.join('.' + e for e in sorted(exts)[:6])}{' …' if len(exts) > 6 else ''})")
+    if u.take(r"\bempty\b"):
+        spec.empty = True
+        spec.why.append("empty")
+    if u.take(r"\bhidden\b|\bdot\s*files\b"):
+        spec.hidden = True
+        spec.why.append("hidden")
+    if u.take(r"\bexecutables?\b|\bexecutable\s+files?\b"):
+        spec.executable, spec.ftype = True, "f"
+        spec.why.append("executable")
+    if u.take(r"\b(?:sub-?)?(?:folders?|director(?:y|ies)|dirs?)\b"):
+        spec.ftype = "d"
+        spec.why.append("folders")
+    elif u.take(r"\bsym(?:bolic\s+)?links?\b|\blinks\b"):
+        spec.ftype = "l"
+        spec.why.append("symlinks")
+    elif u.take(r"\bfiles?\b"):
+        spec.ftype = spec.ftype or "f"
+
+
+def parse_filters(u: Utterance, spec: FindSpec) -> None:
+    take_size(u, spec)
+    take_time(u, spec)
+    take_sort_limit(u, spec)
+    take_location(u, spec)
+    take_ext(u, spec)
+    take_name(u, spec)
+    take_content(u, spec)
+    take_types(u, spec)
+
+
+def absorb_keywords(u: Utterance, spec: FindSpec, mode: str, limit: int = 2) -> int:
+    """Leftover nouns become name/content keywords ("find the budget pdf")."""
+    words = [w for w in u.leftover() if w not in TIMEISH][:limit]
+    if not words:
+        return 0
+    for w in words:
+        for low, orig, start in u.remaining():
+            if low == w:
+                u.blank(start, start + len(orig))
+                break
+    if mode == "name":
+        for w in words:
+            lit = u.lit(w)
+            if w.startswith("qlit"):
+                glob = os.path.basename(lit) if is_pathlike(lit) else f"*{lit}*"
+            else:
+                glob = f"*{stem(w)}*"
+            spec.names.append(glob)
+            spec.why.append(f"name ~ {glob}")
+    else:
+        add_keywords(u, spec, words, mode)
+        spec.why.append("name or content ~ " + ", ".join(c[2] for c in spec.content[-len(words):]))
+    return len(words)
+
+
+# ---- rendering -------------------------------------------------------------------
+
+def find_tests(spec: FindSpec) -> list[str]:
+    t: list[str] = []
+    if spec.content and not spec.ftype:
+        spec.ftype = "f"
+    if spec.ftype:
+        t += ["-type", spec.ftype]
+    if spec.exts:
+        if len(spec.exts) == 1:
+            t += ["-iname", shlex.quote("*." + spec.exts[0])]
+        else:
+            grp = []
+            for e in spec.exts:
+                grp += (["-o"] if grp else []) + ["-iname", shlex.quote("*." + e)]
+            t += ["\\("] + grp + ["\\)"]
+    if spec.hidden:
+        t += ["-name", "'.*'"]
+    if spec.empty:
+        t += ["-empty"]
+    if spec.executable:
+        t += ["-executable"]
+    t += spec.size
+    if spec.time:
+        t += (["-daystart"] if spec.daystart else []) + spec.time
+    for g in spec.names:
+        t += ["-iname", shlex.quote(g)]
+    for mode, needle, _ in spec.content:
+        grep = ["-exec", "grep", "-IqiF", "-e", shlex.quote(needle), "{}", "\\;"]
+        if mode == "content":
+            t += grep
+        elif mode == "name":
+            t += ["-iname", shlex.quote(f"*{needle}*")]
+        else:
+            t += ["\\(", "-iname", shlex.quote(f"*{needle}*"), "-o"] + grep + ["\\)"]
+    return t
+
+
+def render_find(spec: FindSpec, action: str = "list", default_rec: bool = True) -> str:
+    """action: list | delete | count | total"""
+    rec = default_rec if spec.rec is None else spec.rec
+    parts = ["find", qpath(spec.root)]
+    if not rec:
+        parts += ["-maxdepth", "1", "-mindepth", "1"]
+    if action == "delete":   # -delete implies -depth, which makes -prune a no-op error
+        parts += find_tests(spec) + ["-not", "-path", "'*/.git/*'"]
+    else:
+        parts += ["-path", "'*/.git'", "-prune", "-o"] + find_tests(spec)
+    tail = ""
+    limit = spec.limit or (10 if spec.sort and spec.sort[0] != "name" else None)
+    if action == "delete":
+        if spec.ftype == "d" and not spec.empty:
+            parts += ["-prune", "-exec", "rm", "-r", "--", "{}", "+"]
+        else:
+            parts += ["-delete"]
+    elif action == "count":
+        parts += ["-print"]
+        tail = " | wc -l"
+    elif action == "total":
+        parts += ["-print0"]
+        tail = " | du -ch --files0-from=- | tail -n 1"
+    elif spec.sort and spec.sort[0] == "size":
+        parts += ["-printf", "'%s\\t%p\\n'"]
+        tail = (f" | sort -n{'r' if spec.sort[1] else ''} | head -n {limit}"
+                " | numfmt --to=iec --field=1")
+    elif spec.sort and spec.sort[0] == "time":
+        parts += ["-printf", "'%TY-%Tm-%Td %TH:%TM  %p\\n'"]
+        tail = f" | sort{' -r' if spec.sort[1] else ''} | head -n {limit}"
+    else:
+        parts += ["-print"]
+        if spec.sort:
+            tail = " | sort" + (" -r" if spec.sort[1] else "")
+        if limit:
+            tail += f" | head -n {limit}"
+    cmd = " ".join(parts) + tail
+    if spec.root == "/":
+        cmd = cmd.replace("find / ", "find / -xdev ", 1)
+        cmd = cmd.replace(" -print", " -print 2>/dev/null", 1) if "-print " in cmd + " " else cmd
+    return cmd
+
+
+def where_label(spec: FindSpec, default_rec: bool) -> str:
+    rec = default_rec if spec.rec is None else spec.rec
+    place = {".": "here", "~": "home", "/": "whole system", "..": "parent folder"}.get(spec.root, spec.root)
+    return place + (" and subfolders" if rec else " (top level only)")
+
+
+# ---- plans ---------------------------------------------------------------------
+
+@dataclass
+class Plan:
+    command: str
+    intent: str
+    why: list = field(default_factory=list)
+    confidence: float = 1.0
+    destructive: bool = False
+    preview: str | None = None      # shown before a destructive run
+    unknown: list = field(default_factory=list)
+    source: str = "rules"           # rules | learned | llm
+
+    def rationale(self) -> str:
+        return " · ".join([self.intent] + [w for w in self.why if w])
+
+
+UNKNOWN_PENALTY = 0.75   # per word the parser could not place
+GUESS_PENALTY = 0.92     # per leftover word it turned into a keyword
+
+
+def finish(u: Utterance, plan: Plan, guessed: int = 0, spec: FindSpec | None = None) -> Plan:
+    left = u.leftover() + (spec.unparsed if spec else [])
+    plan.unknown = left
+    plan.confidence *= (UNKNOWN_PENALTY ** len(left)) * (GUESS_PENALTY ** guessed)
+    if left:
+        plan.why.append("ignored: " + " ".join(left))
+    if looks_destructive(plan.command):
+        plan.destructive = True
+    return plan
+
+
+def first_target(u: Utterance, want: str | None = None) -> tuple[str | None, int]:
+    """First remaining word that names an existing path. Blanks it."""
+    for low, orig, start in u.remaining():
+        tok = u.lit(orig)
+        if low in FILLER and not os.path.exists(os.path.join(u.cwd, tok)):
+            continue
+        path = resolve(tok, u.cwd, want)
+        if path:
+            u.blank(start, start + len(orig))
+            return path, start
+    return None, -1
+
+
+def split_items(text: str) -> list[str]:
+    return [p for p in re.split(r"\s*(?:,|\band\b|&)\s*", text.strip()) if p]
+
+
+# ---- intent handlers -------------------------------------------------------------
+# Each takes a fresh Utterance and returns a Plan or None. interpret() runs
+# them all and keeps the most confident plan.
+
+def h_find(u: Utterance) -> Plan | None:
+    m = u.take(r"\b(?:find|search(?:\s+for)?|look(?:ing)?\s+for|locate|show\s+me\s+where|"
+               r"where\s+(?:is|are|did\s+i\s+(?:put|save))|hunt\s+for|track\s+down|seek|"
+               r"(?:which|what)(?=\s+(?:\S+\s+){0,2}?(?:files?|folders?|directories|pdfs?|images?|photos?|videos?|scripts?|documents?|docs)\b))\b")
+    if not m:
+        return None
+    by_name = m.group(0).startswith(("where", "locate", "show me where"))
+    spec = FindSpec()
+    parse_filters(u, spec)
+    guessed = absorb_keywords(u, spec, "name" if by_name else "any")
+    cmd = render_find(spec)
+    plan = Plan(cmd, "find", [where_label(spec, True)] + spec.why)
+    return finish(u, plan, guessed, spec)
+
+
+LIST_V = (r"\b(?:list|ls|show(?:\s+me)?|display|view|see|sort|what\s+do\s+(?:i|we)\s+have|"
+          r"what\s+(?:is|are)(?=\s+(?:in|inside|here|there)\b)|contents?\s+of)\b")
+
+
+def h_list(u: Utterance) -> Plan | None:
+    if not u.take(LIST_V):
+        return None
+    spec = FindSpec()
+    parse_filters(u, spec)
+    u.take(r"\b(?:contents?|everything|entries)\b")
+    path, _ = first_target(u)
+    if path:
+        if not os.path.isdir(os.path.expanduser(os.path.join(u.cwd, path))):
+            return None  # an existing file: that's a read, not a list
+        spec.root = path
+    guessed = absorb_keywords(u, spec, "name")
+    show_all = bool(re.search(r"\ball\b", u.low))
+    rich = (spec.size or spec.time or spec.content or spec.names or spec.hidden
+            or spec.empty or spec.executable or spec.rec or len(spec.exts) > 1
+            or (spec.ftype == "f" and spec.limit))
+    if rich:
+        cmd = render_find(spec, default_rec=False)
+        plan = Plan(cmd, "list", [where_label(spec, False)] + spec.why)
+        return finish(u, plan, guessed, spec)
+    flags = "-lh" + ("A" if show_all else "")
+    if spec.sort:
+        key, desc = spec.sort
+        flags += {"size": "S", "time": "t", "name": ""}[key]
+        if (key != "name" and not desc) or (key == "name" and desc):
+            flags += "r"
+    root = "" if spec.root == "." else spec.root.rstrip("/") + "/"
+    if spec.ftype == "d":
+        target, has_total = qpath(root) + "*/" if root else "*/", False
+        flags += "d"
+    elif spec.exts:
+        target, has_total = (qpath(root) if root else "") + f"*.{spec.exts[0]}", False
+    else:
+        target, has_total = (qpath(spec.root) if root else ""), True
+    cmd = " ".join(p for p in ("ls", flags, "--" if target else "", target) if p)
+    if spec.limit:
+        n = spec.limit
+        cmd += f" | head -n {n + 1 if has_total else n}"
+    plan = Plan(cmd, "list", [where_label(spec, False)] + spec.why
+                + (["including hidden"] if show_all else []))
+    return finish(u, plan, guessed, spec)
+
+
+def h_grep(u: Utterance) -> Plan | None:
+    """Show matching *lines*: "search notes.txt for TODO", "find TODO in python files"."""
+    term = target = None
+    m = u.peek(r"\b(?:search|grep|look)\s+(?:in\s+|through\s+|inside\s+)?(.+?)\s+for\s+(\S+(?:\s+\S+)?)\s*$")
+    if m and not re.match(r"(?:files?|folders?)\b", m.group(2)):
+        target, term = u.o(m, 1), u.o(m, 2)
+    if not term:
+        m = u.peek(r"\b(?:find|search(?:\s+for)?|look\s+for|grep(?:\s+for)?|show(?:\s+me)?|"
+                   r"where\s+(?:is|are|do\s+i\s+use|did\s+i\s+use))\s+(?:the\s+(?:word|text|string)\s+)?"
+                   r"(\S+)\s+(?:in|inside|within|across|throughout)\s+(.+)$")
+        if m:
+            term, target = u.o(m, 1), u.o(m, 2)
+    if not term:
+        m = u.peek(r"\b(?:lines?|occurrences?|matches|mentions?)\s+(?:that\s+)?(?:contain(?:s|ing)?|with|of|"
+                   r"matching|mentioning)\s+(?:the\s+(?:word|text|string)\s+)?(\S+)(?:\s+(?:in|inside)\s+(.+))?$")
+        if m:
+            term, target = u.o(m, 1), (u.o(m, 2) if m.group(2) else None)
+    if not term:
+        m = u.peek(r"^(?:search|grep)\s+(?:for\s+)?(qlit\d+)$")
+        if m:
+            term = u.o(m, 1)
+    if not term:
+        return None
+    low_term = term.lower()
+    if low_term in FILLER or low_term in GENERIC or type_word(low_term) or low_term in ("big", "large", "empty", "hidden"):
+        return None
+    u.text = " " * len(u.text)  # the whole sentence is consumed by the pattern
+    needle = u.lit(term)
+    why = [f'text "{needle}"', "case-insensitive"]
+    if target:
+        tname = u.lit(target.strip())
+        file = resolve(tname, u.cwd, "file")
+        if file:
+            return Plan(f"grep -niF -- {shlex.quote(needle)} {qpath(file)}", "search text",
+                        why + [f"in {file}"])
+        if is_pathlike(tname) and "/" not in tname:   # a file name that lives deeper down
+            return Plan(f"grep -rniF --include={shlex.quote(tname)} --exclude-dir=.git -- "
+                        f"{shlex.quote(needle)} .", "search text",
+                        why + [f"in every {tname} here and below"])
+        sub = Utterance(target, u.cwd, u.literals)
+        spec = FindSpec()
+        parse_filters(sub, spec)
+        path, _ = first_target(sub, "dir")
+        if path:
+            spec.root = path
+        left = sub.leftover()
+        includes = " ".join(f"--include={shlex.quote('*.' + e)}" for e in spec.exts)
+        cmd = " ".join(p for p in ("grep -rniIF", includes, "--exclude-dir=.git", "--",
+                                   shlex.quote(needle), qpath(spec.root)) if p)
+        plan = Plan(cmd, "search text", why + [where_label(spec, True)] + spec.why)
+        plan.confidence *= UNKNOWN_PENALTY ** len(left)
+        plan.unknown = left
+        return plan
+    return Plan(f"grep -rniIF --exclude-dir=.git -- {shlex.quote(needle)} .", "search text",
+                why + ["here and subfolders"])
+
+
+def h_count(u: Utterance) -> Plan | None:
+    if not u.take(r"\b(?:how\s+many|count(?:\s+the)?|number\s+of|total\s+number\s+of)\b"):
+        return None
+    m = u.take(r"\b(lines?|words?|characters?|chars|bytes)\b(?:\s+of\s+code)?")
+    unit = m.group(1) if m else None
+    if unit:
+        flag = {"l": "-l", "w": "-w", "c": "-m", "b": "-c"}[unit[0]]
+        spec = FindSpec()
+        file, _ = first_target(u, "file")
+        if file:
+            plan = Plan(f"wc {flag} < {qpath(file)}", "count", [f"{unit} in {file}"])
+            return finish(u, plan)
+        if m.group(0).endswith("code"):
+            add_exts(spec, CODE_EXTS, "code")
+        parse_filters(u, spec)
+        if not spec.exts:
+            return None
+        spec.ftype = "f"
+        cmd = render_find(spec).replace(" -print", " -print0") + f" | xargs -0 cat | wc {flag}"
+        return finish(u, Plan(cmd, "count", [f"{unit} in", where_label(spec, True)] + spec.why))
+    if u.peek(r"\b(?:processes|cores|cpus|users)\b"):
+        return None
+    spec = FindSpec()
+    parse_filters(u, spec)
+    if spec.rec is None and spec.root == ".":
+        spec.why.append("say 'recursively' to include subfolders")
+    cmd = render_find(spec, "count", default_rec=False)
+    return finish(u, Plan(cmd, "count", [where_label(spec, False)] + spec.why))
+
+
+def h_size(u: Utterance) -> Plan | None:
+    # "what's eating my disk", "biggest folders"
+    hog = u.take(r"\b(?:taking|using|eating|hogging|consuming|filling)\s+(?:up\s+)?(?:the\s+most\s+|all\s+(?:the\s+|my\s+)?|so\s+much\s+|my\s+|the\s+)?"
+                 r"(?:disk\s+)?(?:space|room|storage|disk)\b")
+    big_dirs = u.take(r"\b(?:largest|biggest|heaviest)\s+(?:sub-?)?(?:folders|directories|dirs)\b")
+    if hog or big_dirs:
+        spec = FindSpec()
+        take_sort_limit(u, spec)
+        take_location(u, spec)
+        n = spec.limit or 10
+        root = qpath(spec.root)
+        cmd = f"du -h --max-depth=1 {root} 2>/dev/null | sort -hr | head -n {n + 1}"
+        return finish(u, Plan(cmd, "disk usage", [f"biggest folders in {spec.root}", f"top {n}"]))
+    m = u.take(r"\b(?:how\s+(?:big|large|heavy)|how\s+much\s+(?:space|room|disk)|size\s+of|total\s+size|"
+               r"disk\s+usage\s+of|space\s+used\s+by|du)\b")
+    if not m:
+        m = u.take(r"\b(?:free|available|remaining|used)?\s*(?:disk|storage|drive)\s*(?:space|usage|capacity|left)?\b|"
+                   r"\bfree\s+space\b|\bhow\s+full\b|\bspace\s+left\b")
+        if not m:
+            return None
+        u.take(r"\b(?:on|of)\s+(?:my\s+|the\s+)?(?:computer|machine|system|disks?|drives?)\b")
+        spec = FindSpec()
+        take_location(u, spec)
+        if spec.root == ".":
+            target = ""
+        else:
+            target = " " + qpath(spec.root)
+        if spec.root not in (".", "/") or u.peek(r"\b(?:folder|directory)\b"):
+            return finish(u, Plan(f"du -sh {qpath(spec.root)}", "size", [spec.root]))
+        cmd = "df -h -x tmpfs -x devtmpfs -x squashfs" + target
+        return finish(u, Plan(cmd, "disk space", ["all mounted drives"]))
+    spec = FindSpec()
+    parse_filters(u, spec)
+    path, _ = first_target(u)
+    if spec.narrowed() or spec.ftype == "f":
+        cmd = render_find(spec, "total")
+        return finish(u, Plan(cmd, "total size", [where_label(spec, True)] + spec.why))
+    target = path or spec.root
+    u.take(r"\b(?:it|is|are|take|takes|use|uses|of)\b")
+    return finish(u, Plan(f"du -sh {qpath(target)}", "size", [target]))
+
+
+def h_read(u: Utterance) -> Plan | None:
+    m = u.take(r"\b(?:show|print|display|cat|read|view|open|output|dump|see|look\s+at|check|edit|head|tail|"
+               r"follow|watch|what\s+is\s+in|contents?\s+of)\b")
+    verb = m.group(0) if m else ""
+    if not m and not u.peek(r"\b(?:first|top|last|bottom)\s+(?:\S+\s+)?lines?\b|\b(?:beginning|start|end)\s+of\b"):
+        return None
+    u.take(r"\b(?:the\s+)?contents?\s+of\b|\bcontents?\b")
+    n = None
+    mode = "cat"
+    mh = u.take(rf"\b(?:first|top)\s+(?:{NUM}\s+)?lines?\b|\b(?:beginning|start|head)\s+of\b")
+    mt = u.take(rf"\b(?:last|bottom)\s+(?:{NUM}\s+)?lines?\b|\b(?:end|tail)\s+of\b")
+    if mh:
+        mode, n = "head", num(mh.group(1), 10)
+    elif mt:
+        mode, n = "tail", num(mt.group(1), 10)
+    if u.take(r"\b(?:follow|live|keep\s+watching|as\s+it\s+grows|in\s+real\s*time)\b") or verb in ("follow", "watch"):
+        mode = "follow"
+    if verb == "head":
+        mode, n = "head", n or 10
+    if verb == "tail" and mode != "follow":
+        mode, n = "tail", n or 10
+    if verb == "edit":
+        mode = "edit"
+    path, _ = first_target(u, "file")
+    if not path:
+        return None
+    u.take(r"\b(?:log|file|text)\b")
+    q = qpath(path)
+    if mode == "head":
+        cmd, why = f"head -n {int(n)} {q}", [f"first {int(n)} lines"]
+    elif mode == "tail":
+        cmd, why = f"tail -n {int(n)} {q}", [f"last {int(n)} lines"]
+    elif mode == "follow":
+        cmd, why = f"tail -f {q}", ["follow new lines (Ctrl-C stops)"]
+    elif mode == "edit":
+        cmd, why = f"${{EDITOR:-nano}} {q}", ["open in $EDITOR"]
+    elif verb == "open" and not is_text(os.path.join(u.cwd, os.path.expanduser(path))):
+        cmd, why = f"xdg-open {q}", ["open with the default app"]
+    else:
+        long = line_count(os.path.join(u.cwd, os.path.expanduser(path))) > 200
+        cmd, why = (f"less -FRX {q}", ["long file, paged"]) if long else (f"cat {q}", [])
+    return finish(u, Plan(cmd, "show file", [path] + why))
+
+
+def is_text(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return b"\0" not in f.read(4096)
+    except OSError:
+        return False
+
+
+def line_count(path: str) -> int:
+    try:
+        with open(path, "rb") as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+
+
+def resolve_sources(u: Utterance, text: str) -> list[str] | None:
+    """Words like "a.txt and b.txt" or "all the pdfs" -> paths/globs."""
+    out = []
+    for item in split_items(text):
+        sub = Utterance(item, u.cwd, u.literals)
+        item_lit = u.lit(item.strip())
+        direct = resolve(item_lit, u.cwd)
+        if direct:
+            out.append(qpath(direct))
+            continue
+        if re.search(r"[*?]", item_lit) and globmod.glob(os.path.join(u.cwd, os.path.expanduser(item_lit))):
+            out.append(item_lit)
+            continue
+        spec = FindSpec()
+        take_ext(sub, spec)
+        take_types(sub, spec)
+        if spec.exts and not sub.leftover():
+            globs = [f"*.{e}" for e in spec.exts if globmod.glob(os.path.join(u.cwd, f"*.{e}"))]
+            if not globs:
+                return None
+            out += globs
+            continue
+        return None
+    return out or None
+
+
+def resolve_dest(u: Utterance, text: str) -> str:
+    text = text.strip()
+    sub = Utterance(text, u.cwd, u.literals)
+    spec = FindSpec()
+    spec.root = ""
+    take_location(sub, spec)
+    if spec.root:
+        return spec.root
+    t = re.sub(r"^(?:the|my|a|an)\s+", "", u.lit(text))
+    t = re.sub(r"\s+(?:folder|directory|dir)$", "", t)
+    path = resolve(t, u.cwd, "dir")
+    return path or t
+
+
+def h_copy_move(u: Utterance) -> Plan | None:
+    m = u.peek(r"\b(copy|cp|duplicate|move|mv|rename)\s+(.+?)\s+(?:to|into|in|as|inside|over\s+to)\s+(.+)$")
+    mb = u.peek(r"\b(?:back\s*up|make\s+a\s+backup\s+of|create\s+a\s+backup\s+of)\s+(.+)$")
+    if mb:
+        srcs = resolve_sources(u, u.o(mb, 1))
+        if not srcs or len(srcs) != 1:
+            return None
+        u.text = " " * len(u.text)
+        src = srcs[0]
+        return Plan(f"cp -a -- {src} {src}.bak", "backup", [f"copy {src} to {src}.bak"])
+    if not m:
+        return None
+    verb = m.group(1)
+    srcs = resolve_sources(u, u.o(m, 2))
+    dest = resolve_dest(u, u.o(m, 3))
+    u.text = " " * len(u.text)
+    conf = 1.0 if srcs else 0.4
+    srcs = srcs or [shlex.quote(u.lit(u.o(m, 2)))]
+    if verb == "rename":
+        cmd = f"mv -i -- {srcs[0]} {qpath(dest)}"
+        return Plan(cmd, "rename", [f"{srcs[0]} → {dest}"], confidence=conf)
+    dest_full = os.path.join(u.cwd, os.path.expanduser(dest))
+    pre = ""
+    if len(srcs) > 1 and not os.path.isdir(dest_full):
+        pre = f"mkdir -p -- {qpath(dest)} && "
+    if verb in ("copy", "cp", "duplicate"):
+        rec = any(os.path.isdir(os.path.join(u.cwd, os.path.expanduser(s.strip("'")))) for s in srcs)
+        cmd = f"{pre}cp -i{'r' if rec else ''} -- {' '.join(srcs)} {qpath(dest)}"
+        intent = "copy"
+    else:
+        cmd = f"{pre}mv -i -- {' '.join(srcs)} {qpath(dest)}"
+        intent = "move"
+    return Plan(cmd, intent, [f"{', '.join(srcs)} → {dest}", "asks before overwriting"], confidence=conf)
+
+
+def h_delete(u: Utterance) -> Plan | None:
+    if not u.take(r"\b(?:delete|remove|rm|erase|trash|get\s+rid\s+of|clean\s+up|wipe|destroy)\b"):
+        return None
+    if u.peek(r"\b(?:package|program|app|application|software)\b"):
+        return None
+    spec = FindSpec()
+    parse_filters(u, spec)
+    targets = []
+    while True:
+        path, _ = first_target(u)
+        if not path:
+            break
+        targets.append(path)
+    if targets and not spec.narrowed():
+        dirs = [t for t in targets if os.path.isdir(os.path.join(u.cwd, os.path.expanduser(t)))]
+        flag = " -r" if dirs else ""
+        cmd = f"rm{flag} -- " + " ".join(qpath(t) for t in targets)
+        return finish(u, Plan(cmd, "delete", targets))
+    if not spec.narrowed():
+        return None  # never "delete everything under here" from a vague sentence
+    if spec.root in ("/", "~") and not (spec.exts or spec.names or spec.content):
+        return None
+    cmd = render_find(spec, "delete")
+    preview = render_find(spec, "list")
+    plan = Plan(cmd, "delete", [where_label(spec, True)] + spec.why, preview=preview)
+    return finish(u, plan)
+
+
+def h_create(u: Utterance) -> Plan | None:
+    m = u.peek(r"\b(?:create|make|new|add)\s+(?:a\s+|an\s+)?(?:new\s+)?(?:empty\s+)?(folder|directory|dir|file)s?"
+               r"\s+(?:called\s+|named\s+|with\s+the\s+name\s+)?(.+?)"
+               r"(\s+and\s+(?:go|cd|move|step|switch)\s+(?:in|into|to)\s+it|\s+and\s+(?:enter|open)\s+it)?$")
+    if not m:
+        m = u.peek(r"\b(?:mkdir|create|make)\s+(folder|directory|dir)?\s*(\S+)()$") if u.peek(r"\bmkdir\b") else None
+        if not m:
+            return None
+    kind = m.group(1) or "folder"
+    names = [u.lit(n) for n in split_items(u.o(m, 2))]
+    names = [re.sub(r"^(?:the|a|an)\s+", "", n) for n in names]
+    if not names or any(" " in n and not n.startswith("qlit") and len(n.split()) > 3 for n in names):
+        return None
+    u.text = " " * len(u.text)
+    q = " ".join(qpath(n) for n in names)
+    if kind == "file":
+        return Plan(f"touch -- {q}", "create file", names)
+    cmd = f"mkdir -p -- {q}"
+    if m.group(3) and len(names) == 1:
+        cmd += f" && cd -- {qpath(names[0])}"
+    return Plan(cmd, "create folder", names + (["and go into it"] if m.group(3) else []))
+
+
+def h_chmod(u: Utterance) -> Plan | None:
+    m = u.peek(r"\bmake\s+(.+?)\s+(executable|runnable|read[- ]?only|writable|writeable|private)\b")
+    if not m:
+        m = u.peek(r"\bgive\s+(.+?)\s+(execute|exec)\s+permissions?\b")
+    if not m:
+        return None
+    srcs = resolve_sources(u, re.sub(r"^(?:all\s+)?(?:the\s+|my\s+)?", "", u.o(m, 1)))
+    if not srcs:
+        return None
+    u.text = " " * len(u.text)
+    mode = {"e": "+x", "r": "a-w", "w": "u+w", "p": "go-rwx"}[m.group(2)[0]]
+    if m.group(2).startswith("run"):
+        mode = "+x"
+    return Plan(f"chmod {mode} -- {' '.join(srcs)}", "permissions", [f"{m.group(2)}: {mode}"])
+
+
+def h_archive(u: Utterance) -> Plan | None:
+    m = u.peek(r"\b(zip(?:\s+up)?|compress|archive|pack(?:\s+up)?|tar(?:\s+up)?)\s+(.+?)(?:\s+(?:into|as|to)\s+(\S+))?$")
+    if m:
+        what = re.sub(r"^(?:the\s+|my\s+)", "", u.o(m, 2))
+        what = re.sub(r"\s+(?:folder|directory|dir)$", "", what)
+        sub = Utterance(what, u.cwd, u.literals)
+        spec = FindSpec()
+        spec.root = ""
+        take_location(sub, spec)
+        src = spec.root or resolve(u.lit(what), u.cwd)
+        if not src:
+            return None
+        u.text = " " * len(u.text)
+        use_zip = m.group(1).startswith("zip") or (m.group(3) or "").endswith(".zip")
+        if src in (".", "./"):
+            base = os.path.basename(u.cwd.rstrip("/")) or "archive"
+            dest = m.group(3) and u.lit(u.o(m, 3)) or f"../{base}" + (".zip" if use_zip else ".tar.gz")
+            cmd = (f"zip -r {qpath(dest)} ." if use_zip else
+                   f"tar -czf {qpath(dest)} -C .. {shlex.quote(base)}")
+        else:
+            stemname = src.rstrip("/")
+            dest = m.group(3) and u.lit(u.o(m, 3)) or stemname + (".zip" if use_zip else ".tar.gz")
+            cmd = (f"zip -r {qpath(dest)} {qpath(src)}" if use_zip else
+                   f"tar -czf {qpath(dest)} {qpath(src)}")
+        return Plan(cmd, "compress", [f"{src} → {dest}"])
+    m = u.peek(r"\b(?:extract|unzip|unpack|decompress|uncompress|untar|open\s+up)\s+(\S+)(?:\s+(?:to|into|in)\s+(\S+))?")
+    if not m:
+        return None
+    src = resolve(u.lit(u.o(m, 1)), u.cwd, "file")
+    if not src:
+        return None
+    u.text = " " * len(u.text)
+    dest = resolve_dest(u, u.o(m, 2)) if m.group(2) else None
+    low = src.lower()
+    if low.endswith(".zip"):
+        cmd = f"unzip {qpath(src)}" + (f" -d {qpath(dest)}" if dest else "")
+    elif re.search(r"\.(tar(\.(gz|bz2|xz|zst))?|tgz|tbz2|txz)$", low):
+        cmd = (f"mkdir -p -- {qpath(dest)} && " if dest else "") + f"tar -xf {qpath(src)}" + (f" -C {qpath(dest)}" if dest else "")
+    elif low.endswith(".gz"):
+        cmd = f"gunzip -k {qpath(src)}"
+    elif low.endswith(".7z"):
+        cmd = f"7z x {qpath(src)}" + (f" -o{qpath(dest)}" if dest else "")
+    elif low.endswith(".rar"):
+        cmd = f"unrar x {qpath(src)}" + (f" {qpath(dest)}/" if dest else "")
+    else:
+        return None
+    return Plan(cmd, "extract", [src] + ([f"into {dest}"] if dest else []))
+
+
+def h_cd(u: Utterance) -> Plan | None:
+    m = u.take(r"\b(?:go|cd|change\s+(?:directory|folder|dir)|move|switch|navigate|jump|take\s+me|step|enter|"
+               r"open\s+(?:the\s+)?(?:folder|directory))\b")
+    if not m:
+        return None
+    if m.group(0) == "move" and not u.peek(r"^\s*(?:back|up|to|into|in)\b"):
+        return None
+    if u.take(r"\bback\b|\bprevious\s+(?:folder|directory|dir)\b"):
+        return finish(u, Plan("cd -", "go", ["previous folder"]))
+    if u.take(r"\bup(?:\s+one\s+level|\s+a\s+level|\s+one)?\b|\bparent(?:\s+(?:folder|directory|dir))?\b|\bone\s+level\s+up\b"):
+        return finish(u, Plan("cd ..", "go", ["parent folder"]))
+    if u.take(r"\bhome\b"):
+        return finish(u, Plan("cd ~", "go", ["home"]))
+    u.take(r"\b(?:to|into|in)\b")
+    u.take(r"\b(?:folder|directory|dir)\b")
+    path, _ = first_target(u, "dir")
+    if not path:
+        return None
+    return finish(u, Plan(f"cd -- {qpath(path)}", "go", [path]))
+
+
+def h_pwd(u: Utterance) -> Plan | None:
+    if u.take(r"\b(?:where\s+am\s+i|current\s+(?:directory|folder|path|location)|which\s+(?:folder|directory)\s+am\s+i\s+in|"
+              r"present\s+working\s+directory|what\s+(?:folder|directory)\s+is\s+this|pwd)\b"):
+        return finish(u, Plan("pwd", "where am I"))
+    return None
+
+
+SYSTEM = [  # (pattern, command, label)
+    (r"\b(?:what|which)\s+(?:is|are|processes?|programs?|apps?)?\s*(?:using|uses?|eating|eats|hogging|consuming|taking)\s+(?:up\s+)?"
+     r"(?:the\s+most\s+|all\s+(?:the\s+|my\s+)?|so\s+much\s+|my\s+)?(?:memory|ram)\b|\bmemory\s+hogs?\b|"
+     r"\b(?:top\s+)?processes\s+(?:by|sorted\s+by|using\s+the\s+most)\s+(?:memory|ram)\b",
+     "ps aux --sort=-%mem | head -n 11", "top processes by memory"),
+    (r"\b(?:what|which)\s+(?:is|are|processes?|programs?|apps?)?\s*(?:using|uses?|eating|eats|hogging|consuming|taking)\s+(?:up\s+)?"
+     r"(?:the\s+most\s+|all\s+(?:the\s+|my\s+)?|so\s+much\s+|my\s+)?(?:cpu|processor)\b|\bcpu\s+hogs?\b|"
+     r"\b(?:top\s+)?processes(?:\s+(?:by|sorted\s+by|using\s+the\s+most)\s+cpu)?\b|\btop\s+processes\b",
+     "ps aux --sort=-%cpu | head -n 11", "top processes by CPU"),
+    (r"\bhow\s+many\s+(?:cpus?|cores|processors|threads)\b|\bnumber\s+of\s+(?:cores|cpus)\b", "nproc", "CPU cores"),
+    (r"\bhow\s+many\s+processes\b", "ps -e --no-headers | wc -l", "process count"),
+    (r"\b(?:free|available|used|how\s+much)?\s*(?:memory|ram)\b(?:\s+(?:is\s+)?(?:free|left|available|used|usage))?", "free -h", "memory"),
+    (r"\b(?:cpu|processor)\s*(?:info|information|details|model|type)?\b|\bwhat\s+(?:cpu|processor)\b", "lscpu", "CPU info"),
+    (r"\buptime\b|\bhow\s+long\s+(?:has|have)\s+(?:the\s+|this\s+)?(?:system|computer|machine|server|it)\s+been\s+(?:up|running|on)\b",
+     "uptime", "uptime"),
+    (r"\b(?:os|operating\s+system|distro|distribution|linux)\s+(?:version|release|name|info)\b|"
+     r"\bwhat\s+(?:os|linux|distro|operating\s+system)\b|\bkernel(?:\s+version)?\b|\bwhich\s+(?:os|linux|distro)\b",
+     "uname -sr && grep -E '^(PRETTY_NAME|VERSION)=' /etc/os-release", "OS and kernel"),
+    (r"\b(?:public|external)\s+ip\b", "curl -s https://ifconfig.me; echo", "public IP (asks ifconfig.me)"),
+    (r"\b(?:my\s+|the\s+|local\s+)?ip(?:\s+address(?:es)?)?\b|\bnetwork\s+interfaces?\b", "ip -br addr", "network addresses"),
+    (r"\b(?:open|listening|used)\s+ports?\b|\bports?\s+(?:that\s+are\s+)?(?:open|listening|in\s+use)\b|\bwhat\s+is\s+listening\b",
+     "ss -tulpn", "listening ports"),
+    (r"\bwho\s+am\s+i\b|\bmy\s+(?:user\s*name|user|login)\b|\bwhich\s+user\b|\bcurrent\s+user\b", "whoami", "current user"),
+    (r"\bwho\s+(?:else\s+)?is\s+(?:logged\s+in|online|on)\b|\blogged[- ]in\s+users\b", "who", "logged-in users"),
+    (r"\bwhat\s+day\s+is\s+(?:it|today)\b|\b(?:the\s+)?(?:date|time)(?:\s+is\s+it)?\b|\btoday's\s+date\b", "date", "date and time"),
+    (r"\bcalendar\b", "cal", "calendar"),
+    (r"\bhost\s*name\b|\b(?:computer|machine)\s+name\b", "hostname", "hostname"),
+    (r"\b(?:usb\s+)?(?:drives|disks|partitions|block\s+devices|usb\s+sticks?|usb\s+devices)\b|\bmounted\s+(?:drives|disks|file\s*systems)\b|\bwhat\s+is\s+mounted\b",
+     "lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT", "drives and partitions"),
+    (r"\$?path\s+(?:variable|entries|dirs|directories)\b|\bwhat\s+is\s+in\s+(?:my\s+)?\$?path\b|\bmy\s+\$?path\b",
+     "echo \"$PATH\" | tr ':' '\\n'", "PATH entries"),
+    (r"\b(?:environment|env)\s*(?:variables|vars)\b|\benv\s+vars?\b", "env | sort", "environment variables"),
+    (r"\bclear(?:\s+the)?\s+(?:screen|terminal)\b", "clear", "clear screen"),
+]
+SYSTEM_FILLER = r"\b(?:show|list|display|check|print|tell|what|whats|is|are|the|my|current|me|how|much|give|see|get|all)\b"
+
+
+def h_system(u: Utterance) -> Plan | None:
+    for pat, cmd, label in SYSTEM:
+        if u.take(pat):
+            u.text = re.sub(SYSTEM_FILLER, lambda m: " " * len(m.group(0)), u.text)
+            return finish(u, Plan(cmd, "system", [label]))
+    return None
+
+
+def pkg_manager() -> str | None:
+    for pm in ("apt", "dnf", "pacman", "zypper", "apk", "brew"):
+        if shutil.which(pm):
+            return pm
+    return None
+
+
+def h_process(u: Utterance) -> Plan | None:
+    m = u.peek(r"\bis\s+(\S+)\s+(?:running|up|alive|active)\b")
+    if m:
+        u.text = " " * len(u.text)
+        name = u.lit(u.o(m, 1))
+        return Plan(f"pgrep -a -- {shlex.quote(name)}", "processes", [f"is {name} running"])
+    m = u.peek(r"\b(start|stop|restart|reload|enable|disable|status\s+of|check)\s+(?:the\s+)?(\S+)\s+service\b")
+    if m:
+        u.text = " " * len(u.text)
+        act = "status" if m.group(1).startswith(("status", "check")) else m.group(1)
+        name = u.lit(u.o(m, 2))
+        sudo = "" if act == "status" else "sudo "
+        return Plan(f"{sudo}systemctl {act} {shlex.quote(name)}", "service", [f"{act} {name}"],
+                    destructive=act != "status")
+    m = u.peek(r"\b(?:kill|stop|terminate|end|close|quit|force\s+quit)\s+(?:the\s+|all\s+)?(?:process(?:es)?\s+)?(\S+)(?:\s+process(?:es)?)?$")
+    if m and u.peek(r"\b(?:kill|process|terminate|force\s+quit)\b"):
+        u.text = " " * len(u.text)
+        target = u.lit(u.o(m, 1))
+        cmd = f"kill {target}" if target.isdigit() else f"pkill -- {shlex.quote(target)}"
+        return Plan(cmd, "stop process", [target], destructive=True)
+    return None
+
+
+def h_package(u: Utterance) -> Plan | None:
+    pm = pkg_manager()
+    m = u.peek(r"\b(install|uninstall|remove|purge)\s+(?:the\s+)?(?:package\s+|program\s+|app\s+)?(\S+)(?:\s+(?:package|program|app))?$")
+    if m and (m.group(1) in ("install", "uninstall", "purge") or u.peek(r"\b(?:package|program|app)\b")):
+        if not pm:
+            return None
+        u.text = " " * len(u.text)
+        name = shlex.quote(u.lit(u.o(m, 2)))
+        add = {"apt": "sudo apt install", "dnf": "sudo dnf install", "pacman": "sudo pacman -S",
+               "zypper": "sudo zypper install", "apk": "sudo apk add", "brew": "brew install"}[pm]
+        rem = {"apt": "sudo apt remove", "dnf": "sudo dnf remove", "pacman": "sudo pacman -R",
+               "zypper": "sudo zypper remove", "apk": "sudo apk del", "brew": "brew uninstall"}[pm]
+        verb = add if m.group(1) == "install" else rem
+        return Plan(f"{verb} {name}", "packages", [f"{m.group(1)} {u.lit(u.o(m, 2))} with {pm}"], destructive=True)
+    if u.peek(r"\b(?:update|upgrade)\s+(?:the\s+|my\s+|all\s+)?(?:system|packages|software|everything|computer)\b|^(?:update|upgrade)$"):
+        if not pm:
+            return None
+        u.text = " " * len(u.text)
+        cmd = {"apt": "sudo apt update && sudo apt upgrade", "dnf": "sudo dnf upgrade",
+               "pacman": "sudo pacman -Syu", "zypper": "sudo zypper update", "apk": "sudo apk upgrade",
+               "brew": "brew update && brew upgrade"}[pm]
+        return Plan(cmd, "packages", [f"upgrade everything with {pm}"], destructive=True)
+    return None
+
+
+HANDLERS = [h_system, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
+            h_copy_move, h_delete, h_read, h_grep, h_count, h_size, h_find, h_list]
+
+
+def interpret(text: str, cwd: str) -> Plan | None:
+    """Best deterministic plan for a sentence, or None if nothing applies."""
+    best = None
+    for handler in HANDLERS:
+        try:
+            plan = handler(Utterance(text, cwd))
+        except (ValueError, IndexError, KeyError, re.error):
+            continue
+        if plan and (best is None or plan.confidence > best.confidence):
+            best = plan
+    return best
+
+
+# ---- deciding shell vs words ----------------------------------------------------
+
+SHELL_BUILTINS = set("""
+alias bg bind break builtin caller cd command compgen complete continue declare dirs disown
+echo enable eval exec exit export false fc fg getopts hash help history jobs kill let local
+logout mapfile popd printf pushd pwd read readonly return set shift shopt source suspend test
+times trap true type typeset ulimit umask unalias unset wait . [ [[ if for while until case
+function time coproc { (
+""".split())
+# Commands that take free text: always shell, whatever the words.
+TEXT_COMMANDS = {"echo", "printf", "git", "man", "sudo", "ssh", "alias", "export", "read",
+                 "notify-send", "espeak", "say", "python", "python3", "node", "bash", "sh"}
+NL_WORDS = set("""
+the all that which this these those files file folder folders directory directories in on
+with of me my for are is what how larger bigger smaller than from some any every please
+where containing named called memory ram space disk processes process biggest largest
+newest oldest recent empty hidden old big
+""".split())
+
+
+# Real commands that are also everyday English verbs ("go up", "kill firefox",
+# "find big files"). For these, a confident rules parse wins over bash.
+AMBIGUOUS_FIRST = {"go", "kill", "find", "sort", "open", "make", "which", "who", "file",
+                   "time", "du", "df", "free", "locate", "look", "see", "show", "cd", "zip",
+                   "unzip", "watch", "head", "tail", "touch", "less", "more", "split"}
+
+
+def looks_like_shell(line: str, path_env: str | None = None, cwd: str | None = None,
+                     threshold: float = DEFAULTS["threshold"]) -> bool:
+    if not _looks_like_shell(line, path_env):
+        return False
+    # A command word followed by plain words: let the rules have a go first.
+    try:
+        toks = shlex.split(line)
+    except ValueError:
+        return True
+    rest = toks[1:]
+    if (cwd and toks[0] in AMBIGUOUS_FIRST and rest
+            and not any(t.startswith("-") for t in rest)
+            and not re.search(r"[|&;<>`$]", line)
+            and not all(os.path.exists(os.path.join(cwd, os.path.expanduser(t))) for t in rest)):
+        plan = interpret(line, cwd)
+        if plan and plan.confidence >= threshold:
+            return False
+    return True
+
+
+def _looks_like_shell(line: str, path_env: str | None = None) -> bool:
+    if re.match(r"^\s*(?:[A-Za-z_]\w*=\S*\s*)+$", line):
+        return True  # FOO=bar
+    try:
+        toks = shlex.split(line)
+    except ValueError:
+        toks = None
+    if not toks:
+        return False
+    first = toks[0]
+    if first.startswith(("./", "/", "~/", "../")):
+        return True
+    if first not in SHELL_BUILTINS and not shutil.which(first, path=path_env):
+        return False
+    if first in TEXT_COMMANDS:
+        return True
+    rest = toks[1:]
+    if not rest:
+        return True
+    if any(t.startswith("-") for t in rest):
+        return True
+    nl = sum(1 for t in rest if t.lower() in NL_WORDS)
+    paths = sum(1 for t in rest if os.path.exists(os.path.expanduser(t)) or re.search(r"[*?/]", t))
+    if nl == 0:
+        return True
+    return paths > nl
+
+
+# ---- local LLM fallback -----------------------------------------------------------
+
+SYSTEM_PROMPT = """You turn a request into ONE bash command for GNU/Linux.
+Rules:
+- Reply with the command only, on a single line. No explanation, no markdown, no backticks.
+- Use standard tools: ls, find, grep, du, df, ps, cp, mv, mkdir, tar, sort, head, wc, awk, sed.
+- Paths are relative to the current directory unless the request names another place.
+- Prefer safe flags: mv -i, cp -i. Never use sudo unless the request is about system changes.
+- If the request is not something a shell command can do, reply exactly: NONE"""
+
+FEWSHOT = [
+    ("Request: show the 5 biggest files under this folder",
+     "find . -type f -printf '%s\\t%p\\n' | sort -nr | head -n 5"),
+    ("Request: which python files mention requests",
+     "grep -rliF --include='*.py' requests ."),
+    ("Request: rename every .jpeg file here to .jpg",
+     "for f in *.jpeg; do mv -i -- \"$f\" \"${f%.jpeg}.jpg\"; done"),
+    ("Request: how many lines are in all the csv files together",
+     "cat -- *.csv | wc -l"),
+    ("Request: what's the weather like", "NONE"),
+]
+
+
+class LLMError(Exception):
+    pass
+
+
+class LLM:
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+
+    @property
+    def enabled(self) -> bool:
+        return str(self.cfg["llm"]).lower() not in ("off", "0", "no", "false", "none")
+
+    @property
+    def label(self) -> str:
+        return f"{self.cfg['llm_model']} at {self.cfg['llm_url']}"
+
+    def _post(self, messages: list[dict]) -> str:
+        url = self.cfg["llm_url"].rstrip("/") + "/chat/completions"
+        body = json.dumps({"model": self.cfg["llm_model"], "messages": messages,
+                           "temperature": 0, "max_tokens": 256, "stream": False}).encode()
+        headers = {"Content-Type": "application/json"}
+        if self.cfg.get("llm_key"):
+            headers["Authorization"] = f"Bearer {self.cfg['llm_key']}"
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=self.cfg["llm_timeout"]) as r:
+                data = json.load(r)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:300]
+            if e.code == 404 and "model" in detail.lower():
+                raise LLMError(f"model {self.cfg['llm_model']} is not installed "
+                               f"(try: ollama pull {self.cfg['llm_model']})") from None
+            raise LLMError(f"LLM server returned HTTP {e.code}: {detail}") from None
+        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
+            reason = getattr(e, "reason", e)
+            raise LLMError(f"no LLM reachable at {self.cfg['llm_url']} ({reason}). "
+                           f"Start one with: ollama serve & ollama pull {self.cfg['llm_model']}") from None
+        try:
+            return data["choices"][0]["message"]["content"] or ""
+        except (KeyError, IndexError, TypeError):
+            raise LLMError(f"unexpected reply from LLM server: {str(data)[:200]}") from None
+
+    def command_for(self, request: str, cwd: str, hints: str) -> str | None:
+        try:
+            entries = sorted(os.listdir(cwd))
+        except OSError:
+            entries = []
+        shown = [e + ("/" if os.path.isdir(os.path.join(cwd, e)) else "") for e in entries[:60]]
+        more = f" (+{len(entries) - 60} more)" if len(entries) > 60 else ""
+        context = (f"Current directory: {cwd}\n"
+                   f"Entries here: {', '.join(shown) or '(empty)'}{more}\n")
+        if hints:
+            context += f"Partial parse by the rule engine (may be wrong): {hints}\n"
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        for q, a in FEWSHOT:
+            messages += [{"role": "user", "content": q}, {"role": "assistant", "content": a}]
+        messages.append({"role": "user", "content": f"{context}Request: {request}"})
+        for attempt in range(2):
+            raw = self._post(messages)
+            cmd = clean_llm_command(raw)
+            if cmd is None:
+                return None
+            problem = validate_command(cmd)
+            if not problem:
+                return cmd
+            messages += [{"role": "assistant", "content": raw},
+                         {"role": "user", "content": f"That is not a valid command ({problem}). "
+                                                     "Reply with one bash command only."}]
+        raise LLMError(f"the model did not produce a valid command (last try: {cmd})")
+
+
+def clean_llm_command(text: str) -> str | None:
+    text = text.strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+    m = re.search(r"```(?:bash|sh|shell|console)?\s*\n?(.*?)```", text, re.S)
+    if m:
+        text = m.group(1).strip()
+    lines = [l.rstrip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return None
+    joined, buf = [], ""
+    for line in lines:
+        if line.endswith("\\"):
+            buf += line[:-1].strip() + " "
+            continue
+        joined.append((buf + line.strip()).strip())
+        buf = ""
+    cmd = joined[0]
+    cmd = re.sub(r"^(?:\$|>|#)\s+", "", cmd)
+    cmd = re.sub(r"^(?:command|bash)\s*:\s*", "", cmd, flags=re.I)
+    cmd = cmd.strip("`").strip()
+    if cmd.upper().rstrip(".") == "NONE" or not cmd:
+        return None
+    return cmd
+
+
+def validate_command(cmd: str) -> str | None:
+    r = subprocess.run(["bash", "-n", "-c", cmd], capture_output=True, text=True)
+    if r.returncode != 0:
+        return (r.stderr.strip().splitlines() or ["syntax error"])[-1]
+    try:
+        first = shlex.split(cmd)[0]
+    except (ValueError, IndexError):
+        return "cannot parse"
+    if "=" in first or first in SHELL_BUILTINS or first.startswith(("./", "/", "~", "$")) \
+            or first in ("for", "while", "if", "{", "(") or shutil.which(first):
+        return None
+    return f"'{first}' is not an installed command"
+
+
+# ---- memory of approved LLM answers -----------------------------------------------
+
+class Memory:
+    def __init__(self, path: str):
+        self.path = path
+        try:
+            with open(path) as f:
+                self.data = json.load(f)
+        except (OSError, ValueError):
+            self.data = {}
+
+    @staticmethod
+    def key(phrase: str) -> str:
+        return " ".join(re.sub(r"[^\w\s./~*'\"-]", " ", phrase.lower()).split())
+
+    def get(self, phrase: str) -> str | None:
+        hit = self.data.get(self.key(phrase))
+        return hit["command"] if hit else None
+
+    def remember(self, phrase: str, command: str) -> None:
+        k = self.key(phrase)
+        entry = self.data.get(k, {"uses": 0})
+        entry.update(command=command, saved=time.strftime("%Y-%m-%d %H:%M"))
+        entry["uses"] = entry.get("uses", 0) + 1
+        self.data[k] = entry
+        self._save()
+
+    def forget(self, phrase: str) -> bool:
+        if self.data.pop(self.key(phrase), None) is None:
+            return False
+        self._save()
+        return True
+
+    def _save(self) -> None:
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.data, f, indent=2, sort_keys=True)
+        os.replace(tmp, self.path)
+
+
+# ---- the shell --------------------------------------------------------------------
+
+HELP = """aisha — type bash, or say what you want.
+
+  find pdfs bigger than 10mb in downloads
+  show the 5 newest files here
+  which files mention "invoice"
+  what's eating my disk
+  how much ram is free
+  copy notes.txt to backup
+  !ls -la            force plain bash
+  ?<request>         skip the rules and ask the LLM
+  explain <request>  show what would run, run nothing
+  learned            phrases remembered from the LLM
+  forget <request>   drop a remembered phrase
+  llm                check the local LLM
+  exit               leave (or Ctrl-D)
+"""
+
+
+class Shell:
+    def __init__(self, cfg: dict, dry_run: bool = False):
+        self.cfg = cfg
+        self.dry_run = dry_run
+        self.cwd = os.getcwd()
+        self.env = dict(os.environ)
+        self.env["AISHA"] = VERSION
+        self.rc = 0
+        self.memory = Memory(LEARNED_FILE)
+        self.llm = LLM(cfg)
+
+    # -- entry point for one line
+    def handle(self, line: str) -> int:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            return self.rc
+        word = line.split()[0]
+        if line in ("exit", "quit", "logout", "bye"):
+            raise EOFError
+        if line in ("help", "?"):
+            say(HELP)
+            return 0
+        if line == "learned":
+            for k, v in sorted(self.memory.data.items()):
+                say(f"{cyan(k)}\n  $ {v['command']}  {dim('(used %d×)' % v.get('uses', 1))}")
+            if not self.memory.data:
+                say(dim("nothing learned yet"))
+            return 0
+        if word == "forget":
+            say("forgotten" if self.memory.forget(line[6:].strip()) else dim("not in memory"))
+            return 0
+        if line == "llm":
+            return self.llm_status()
+        if line == "history":
+            return self.show_history()
+        if word == "explain":
+            saved, self.dry_run = self.dry_run, True
+            try:
+                return self.natural(line[7:].strip())
+            finally:
+                self.dry_run = saved
+        if line.startswith("!"):
+            self.rc = self.run(line[1:].strip())
+            return self.rc
+        if line.startswith("?"):
+            self.rc = self.via_llm(line[1:].strip(), interpret(line[1:].strip(), self.cwd))
+            return self.rc
+        if looks_like_shell(line, self.env.get("PATH"), self.cwd, self.cfg["threshold"]):
+            self.rc = self.run(line)
+            return self.rc
+        self.rc = self.natural(line)
+        return self.rc
+
+    def natural(self, line: str) -> int:
+        remembered = self.memory.get(line)
+        if remembered:
+            plan = Plan(remembered, "remembered", ["you approved this before"], source="learned",
+                        destructive=looks_destructive(remembered))
+            return self.execute(plan)
+        plan = interpret(line, self.cwd)
+        if plan and plan.confidence >= self.cfg["threshold"]:
+            return self.execute(plan)
+        if self.llm.enabled:
+            return self.via_llm(line, plan)
+        if plan:
+            say(yellow("not sure I understood — best guess:"))
+            plan.source = "guess"
+            return self.execute(plan)
+        say(yellow("I don't know how to do that yet.") + dim(" (no LLM configured: aisha --setup)"))
+        return 1
+
+    def via_llm(self, line: str, partial: Plan | None) -> int:
+        if not self.llm.enabled:
+            say(red("the LLM is turned off (AISHA_LLM=off)"))
+            return 1
+        hints = ""
+        if partial:
+            hints = f"{partial.rationale()}; draft command: {partial.command}"
+            if partial.unknown:
+                hints += f"; words the rules could not place: {' '.join(partial.unknown)}"
+        say(dim(f"… rules not sure, asking {self.cfg['llm_model']}"))
+        t0 = time.time()
+        try:
+            cmd = self.llm.command_for(line, self.cwd, hints)
+        except LLMError as e:
+            say(red(f"LLM: {e}"))
+            if partial:
+                say(yellow("falling back to the rules' best guess:"))
+                partial.source = "guess"
+                return self.execute(partial)
+            return 1
+        if not cmd:
+            say(yellow("that does not look like something a shell command can do."))
+            return 1
+        plan = Plan(cmd, "llm", [f"{self.cfg['llm_model']}, {time.time() - t0:.1f}s"], source="llm",
+                    destructive=looks_destructive(cmd))
+        rc = self.execute(plan, phrase=line)
+        return rc
+
+    # -- showing and running a plan
+    def execute(self, plan: Plan, phrase: str | None = None) -> int:
+        say(dim("→ " + plan.rationale()))
+        say(bold("$ ") + plan.command)
+        if self.dry_run:
+            return 0
+        need = plan.destructive or self.cfg["confirm"] == "always" or \
+            (self.cfg["confirm"] == "llm" and plan.source in ("llm", "guess"))
+        if plan.destructive and plan.preview:
+            self.show_preview(plan.preview)
+        if need:
+            if plan.destructive:
+                say(yellow("! this deletes or changes things"))
+                ans = ask("run? [y/N] ")
+                ok = ans is not None and ans.strip().lower() in ("y", "yes")
+            else:
+                ans = ask("run? [Y/n] ")
+                ok = ans is not None and ans.strip().lower() in ("", "y", "yes")
+            if not ok:
+                say(dim("skipped"))
+                return 1
+        rc = self.run(plan.command)
+        if plan.source == "llm" and phrase and rc == 0:
+            self.memory.remember(phrase, plan.command)
+            say(dim("(remembered — next time this runs without the LLM)"))
+        return rc
+
+    def show_preview(self, cmd: str) -> None:
+        r = subprocess.run(["bash", "-c", cmd], cwd=self.cwd, env=self.env,
+                           capture_output=True, text=True)
+        lines = r.stdout.splitlines()
+        if not lines:
+            say(dim("(nothing matches)"))
+            return
+        say(dim(f"{len(lines)} match{'es' if len(lines) != 1 else ''}:"))
+        for l in lines[:10]:
+            say(dim("  " + l))
+        if len(lines) > 10:
+            say(dim(f"  … and {len(lines) - 10} more"))
+
+    def run(self, cmd: str) -> int:
+        """Run in bash; keep cd and export effects for the next line."""
+        fd, state = tempfile.mkstemp(prefix="aisha-state-")
+        os.close(fd)
+        script = ("__aisha_save() { local rc=$?; { printf '%s\\0' \"$PWD\"; env -0; } "
+                  "> \"$__AISHA_STATE\" 2>/dev/null; exit $rc; }\n"
+                  "trap __aisha_save EXIT\n"
+                  "shopt -s globstar extglob 2>/dev/null\n"
+                  f"{cmd}\n")
+        env = dict(self.env, __AISHA_STATE=state, PWD=self.cwd)
+        old = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            r = subprocess.run(["bash", "-c", script], cwd=self.cwd, env=env,
+                               preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+            rc = r.returncode
+        except FileNotFoundError:
+            say(red("bash not found"))
+            return 127
+        finally:
+            signal.signal(signal.SIGINT, old)
+        try:
+            with open(state, "rb") as f:
+                raw = f.read()
+        except OSError:
+            raw = b""
+        finally:
+            try:
+                os.unlink(state)
+            except OSError:
+                pass
+        if raw:
+            parts = raw.split(b"\0")
+            new_cwd = parts[0].decode(errors="replace")
+            new_env = {}
+            for item in parts[1:]:
+                if b"=" in item:
+                    k, v = item.split(b"=", 1)
+                    new_env[k.decode(errors="replace")] = v.decode(errors="replace")
+            for k in ("__AISHA_STATE", "_", "SHLVL", "BASHOPTS", "SHELLOPTS"):
+                new_env.pop(k, None)
+            if new_env:
+                self.env = new_env
+            if new_cwd and os.path.isdir(new_cwd) and new_cwd != self.cwd:
+                self.env["OLDPWD"] = self.cwd
+                self.cwd = new_cwd
+        if rc < 0:
+            rc = 128 - rc
+        return rc
+
+    def llm_status(self) -> int:
+        if not self.llm.enabled:
+            say("LLM: off")
+            return 1
+        say(f"LLM: {self.llm.label}")
+        try:
+            t0 = time.time()
+            cmd = self.llm.command_for("list the files here", self.cwd, "")
+            say(green(f"ok ({time.time() - t0:.1f}s): ") + str(cmd))
+            return 0
+        except LLMError as e:
+            say(red(str(e)))
+            return 1
+
+    def show_history(self) -> int:
+        try:
+            import readline
+            n = readline.get_current_history_length()
+            for i in range(max(1, n - 50), n + 1):
+                item = readline.get_history_item(i)
+                if item:
+                    print(f"{i:5}  {item}")
+        except ImportError:
+            pass
+        return 0
+
+    # -- interactive loop
+    def prompt(self) -> str:
+        home = os.path.expanduser("~")
+        where = "~" + self.cwd[len(home):] if self.cwd == home or self.cwd.startswith(home + "/") else self.cwd
+        if len(where) > 40:
+            where = "…/" + "/".join(where.rstrip("/").split("/")[-2:])
+        mark = "❯" if self.rc == 0 else "✗"
+        if not (sys.stdout.isatty() and not os.environ.get("NO_COLOR")):
+            return f"aisha {where} {mark} "
+        # \001..\002 tell readline the escapes take no width
+        c = lambda code, s: f"\001\033[{code}m\002{s}\001\033[0m\002"
+        return f"{c('36', 'aisha')} {c('34', where)} {c('32' if self.rc == 0 else '31', mark)} "
+
+    def repl(self) -> int:
+        try:
+            import readline
+            os.makedirs(CFG_DIR, exist_ok=True)
+            try:
+                readline.read_history_file(HISTORY_FILE)
+            except OSError:
+                pass
+            readline.set_history_length(5000)
+            readline.set_completer_delims(" \t\n;|&><")
+            readline.set_completer(self.complete)
+            readline.parse_and_bind("tab: complete")
+        except ImportError:
+            readline = None
+        llm = self.llm.label if self.llm.enabled else "off"
+        say(dim(f"aisha {VERSION} — type bash or plain words. 'help' for examples. LLM fallback: {llm}"))
+        while True:
+            try:
+                line = input(self.prompt())
+            except EOFError:
+                say()
+                break
+            except KeyboardInterrupt:
+                say("^C")
+                continue
+            try:
+                self.handle(line)
+            except EOFError:
+                break
+            except KeyboardInterrupt:
+                say("^C")
+        if readline:
+            try:
+                readline.write_history_file(HISTORY_FILE)
+            except OSError:
+                pass
+        return self.rc
+
+    def complete(self, text: str, state: int):
+        base = os.path.expanduser(text)
+        pattern = (base if os.path.isabs(base) else os.path.join(self.cwd, base)) + "*"
+        matches = []
+        for m in sorted(globmod.glob(pattern)):
+            shown = m if os.path.isabs(base) else os.path.relpath(m, self.cwd)
+            if text.startswith("~"):
+                shown = "~" + m[len(os.path.expanduser("~")):]
+            matches.append(shown + ("/" if os.path.isdir(m) else ""))
+        return matches[state] if state < len(matches) else None
+
+
+# ---- setup helper ------------------------------------------------------------------
+
+def setup() -> int:
+    cfg = load_config()
+    say(bold("aisha LLM fallback setup"))
+    say(f"current: {cfg['llm_model']} at {cfg['llm_url']}")
+    if not shutil.which("ollama"):
+        say("\nThe easiest local backend is Ollama:")
+        say("  curl -fsSL https://ollama.com/install.sh | sh")
+        say(f"  ollama pull {cfg['llm_model']}")
+        say("\nAny OpenAI-compatible server works too (llama.cpp's llama-server, LM Studio):")
+        say(f"  set llm_url / llm_model in {CFG_FILE}, or AISHA_LLM_URL / AISHA_LLM_MODEL")
+        return 1
+    ans = ask(f"Pull {cfg['llm_model']} with ollama now? [Y/n] ")
+    if ans is not None and ans.strip().lower() in ("", "y", "yes"):
+        rc = subprocess.call(["ollama", "pull", cfg["llm_model"]])
+        if rc != 0:
+            return rc
+    os.makedirs(CFG_DIR, exist_ok=True)
+    if not os.path.exists(CFG_FILE):
+        with open(CFG_FILE, "w") as f:
+            json.dump({k: v for k, v in DEFAULTS.items()}, f, indent=2)
+        say(dim(f"wrote {CFG_FILE}"))
+    return Shell(cfg).llm_status()
+
+
+USAGE = """usage: aisha                      interactive shell
+       aisha <request or command>  run one line and exit
+       aisha -c '<line>'           same, bash-style
+       aisha -n <request>          show what would run, run nothing
+       aisha --setup               set up the local LLM fallback
+       aisha --version
+"""
+
+
+def main(argv: list[str]) -> int:
+    cfg = load_config()
+    dry = False
+    args = list(argv)
+    if args and args[0] in ("-h", "--help"):
+        print(USAGE + "\n" + HELP)
+        return 0
+    if args and args[0] == "--version":
+        print(f"aisha {VERSION}")
+        return 0
+    if args and args[0] == "--setup":
+        return setup()
+    if args and args[0] == "-n":
+        dry, args = True, args[1:]
+    if args and args[0] == "-c":
+        args = args[1:]
+    shell = Shell(cfg, dry_run=dry)
+    if args:
+        try:
+            return shell.handle(" ".join(args))
+        except EOFError:
+            return 0
+    if not sys.stdin.isatty():
+        rc = 0
+        for line in sys.stdin:
+            try:
+                rc = shell.handle(line)
+            except EOFError:
+                break
+        return rc
+    return shell.repl()
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

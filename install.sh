@@ -6,6 +6,7 @@ BIN_TARGET=/usr/local/bin/ai
 BROWSER_BIN_TARGET=/usr/local/bin/ai-browser
 DESKTOP_BIN_TARGET=/usr/local/bin/ai-desktop
 CODE_BIN_TARGET=/usr/local/bin/ai-code
+AISHA_BIN_TARGET=/usr/local/bin/aisha
 CFG_DIR_USER="$HOME/.config/ai-bash"
 CFG_KEY_USER="$CFG_DIR_USER/anthropic-api-key"
 # ai-code (local-LLM coding agent) backend config, written after deploy.
@@ -23,6 +24,7 @@ SRC_BIN="$SRC_DIR/ai"
 SRC_BROWSER="$SRC_DIR/ai-browser"
 SRC_DESKTOP="$SRC_DIR/ai-desktop"
 SRC_CODE="$SRC_DIR/ai-code"
+SRC_AISHA="$SRC_DIR/aisha"
 SRC_MODAL="$SRC_DIR/modal/llm_modal.py"
 
 red()    { printf '\033[1;31m%s\033[0m\n' "$*"; }
@@ -60,6 +62,11 @@ fi
 if [ -f "$SRC_CODE" ]; then
     echo "Installing $SRC_CODE -> $CODE_BIN_TARGET"
     sudo install -m 0755 "$SRC_CODE" "$CODE_BIN_TARGET"
+    green "  installed."
+fi
+if [ -f "$SRC_AISHA" ]; then
+    echo "Installing $SRC_AISHA -> $AISHA_BIN_TARGET"
+    sudo install -m 0755 "$SRC_AISHA" "$AISHA_BIN_TARGET"
     green "  installed."
 fi
 
@@ -354,8 +361,10 @@ echo "    ai how much RAM is free"
 if [ -s "$CODE_URL_USER" ]; then
     echo "    ai-code              # interactive coding agent (in any project dir)"
 fi
+echo "    aisha                # natural-language shell, works offline"
 echo
 dim "Notes:"
 dim "  - 'ai ...'      reads the key from \$ANTHROPIC_API_KEY or ~/.config/ai-bash/anthropic-api-key"
 dim "  - 'sudo ai ...' reads the key from /etc/ai-bash/anthropic-api-key (no need for 'sudo -E')"
 dim "  - 'ai-code'     uses the Modal LLM endpoint in ~/.config/ai-bash/code-url"
+dim "  - 'aisha'       needs no key; 'aisha --setup' adds the optional local LLM fallback"

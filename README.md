@@ -31,7 +31,7 @@ The latest stable release of Python is 3.13.x (released Oct 2024).
 
 The installer:
 
-- copies `ai`, `ai-browser`, `ai-desktop`, and `ai-code` to
+- copies `ai`, `ai-browser`, `ai-desktop`, `ai-code`, and `aisha` to
   `/usr/local/bin/` (uses `sudo`),
 - optionally installs browser automation tools (Playwright + Chromium),
 - optionally sets up the **`ai-code`** coding agent's GPU backend on
@@ -293,6 +293,93 @@ command guard as `ai` applies.
 
 You can also just ask `ai` to start it: `ai help me code in this project`
 delegates to `ai-code`.
+
+## Natural-language shell (aisha)
+
+`aisha` is a shell you can talk to. Type bash as usual, or say what you want
+in plain words. It works offline: most requests are handled by a
+deterministic rule engine with no model at all, and a small **local** LLM is
+only consulted when the rules are unsure. No API key, no cloud.
+
+```
+$ aisha
+aisha ~/lab ❯ find files in this folder that have the measurement data
+→ find · here and subfolders · name or content ~ "measur" (from "measurement"); "data" is generic
+$ find . -path '*/.git' -prune -o -type f \( -iname '*measur*' -o -exec grep -IqiF -e measur {} \; \) -print
+./run1/measurements_01.csv
+./run1/notes.txt
+
+aisha ~/lab ❯ git status          # real commands run in bash unchanged
+aisha ~/lab ❯ go to run1          # cd (and export) stick between lines
+aisha ~/lab/run1 ❯ delete all .tmp files
+→ delete · here and subfolders · type: .tmp
+$ find . -type f -iname '*.tmp' -not -path '*/.git/*' -delete
+1 match:
+  ./old.tmp
+! this deletes or changes things
+run? [y/N]
+```
+
+Every line goes through these stages and stops at the first that handles it:
+
+| Stage | What happens | Speed |
+|---|---|---|
+| 1. Shell | A command on `PATH` with flags, paths, pipes or redirects runs in bash unchanged. Everyday verbs that are also commands (`find big files`, `kill firefox`, `go up`) go to the rules when the rules are confident. | instant |
+| 2. Memory | A phrase whose LLM-written command you approved before is replayed without asking the model again. | instant |
+| 3. Rules | The sentence is broken into slots — action, where, file types, size, age, name/content keywords, sort, limit — and the command is built from those. The `→` line shows what it understood. | instant |
+| 4. Local LLM | Only when the rules are below the confidence threshold. The model gets the request, the folder listing, and the rules' partial parse as hints. Its command is always shown and confirmed (Enter runs it). | ~1 s on CPU |
+
+What the rules understand today: listing, finding (by type, name, content,
+size, age, emptiness), text search, counting, sizes and disk usage, showing
+files (`cat`/`head`/`tail`/follow), copy/move/rename/delete, creating files
+and folders, `chmod`, zip/tar and extract, `cd`/`pwd`, memory/CPU/processes,
+OS/IP/ports/drives, services, and packages. Anything else falls through to
+the LLM.
+
+```sh
+aisha                                   # interactive shell
+aisha show the 5 newest files here      # one line, then exit
+aisha -n delete log files older than 30 days   # show the command, run nothing
+```
+
+Inside the shell: `!cmd` forces bash, `?request` skips the rules and asks the
+LLM, `explain <request>` shows what would run, `learned` / `forget <request>`
+manage remembered phrases, `llm` checks the model, `help` lists examples.
+
+Commands that delete or overwrite data always ask `[y/N]` first, and
+deletes show the matching files before asking. The rules never build a
+delete from a vague sentence ("clean up", "delete everything") — that goes
+to the LLM and still needs your `y`.
+
+### Local LLM fallback
+
+Any OpenAI-compatible server works. The default is
+[Ollama](https://ollama.com) with `qwen2.5-coder:1.5b` (~1 GB, runs on a
+laptop CPU):
+
+```sh
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull qwen2.5-coder:1.5b
+aisha --setup        # checks the model answers
+```
+
+`qwen2.5-coder:0.5b` (~400 MB) also works for simple requests. To use
+llama.cpp's `llama-server`, LM Studio or another server, set the endpoint in
+`~/.config/ai-bash/aisha/config.json` or the environment:
+
+| Setting | Env var | Default |
+|---|---|---|
+| `llm_url` | `AISHA_LLM_URL` | `http://127.0.0.1:11434/v1` |
+| `llm_model` | `AISHA_LLM_MODEL` | `qwen2.5-coder:1.5b` |
+| `llm_key` | `AISHA_LLM_KEY` | *(none)* |
+| `llm` | `AISHA_LLM` | `auto` (`off` disables the fallback) |
+| `threshold` | `AISHA_THRESHOLD` | `0.7` (rules below this go to the LLM) |
+| `confirm` | `AISHA_CONFIRM` | `llm` (`always`, or `destructive` only) |
+
+Without a model, aisha still works; requests the rules don't understand get
+the rules' best guess with a confirmation, or a "don't know how yet".
+
+Tests: `python3 -m unittest discover -s tests`.
 
 ## How it works
 
