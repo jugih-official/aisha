@@ -644,6 +644,10 @@ def take_sort_limit(u: Utterance, spec: FindSpec) -> None:
         spec.sort = (key, desc)
     if u.take(r"\balphabetical(?:ly)?\b"):
         spec.sort = ("name", False)
+    if spec.sort and not spec.limit and re.search(
+            r"\b(?:the\s+)?(?:largest|biggest|heaviest|smallest|newest|latest|oldest|most\s+recent)\s+"
+            r"(?:[\w.]+\s+){0,2}?(?:file|folder|directory|one|image|photo|picture|pdf|video|document)\b(?!s)", u.low):
+        spec.limit = 1
     if spec.sort:
         spec.why.append("sorted " + SORT_LABEL[spec.sort])
     if spec.limit:
@@ -1528,6 +1532,24 @@ def resolve_dest(u: Utterance, text: str) -> str:
     return path or t
 
 
+def bulk_transfer(u: Utterance, spec: FindSpec, tool: str, dest_text: str, left: Utterance,
+                  guessed: int = 0) -> Plan:
+    """find the matching files and mv/cp them into a folder, after a preview."""
+    dest = resolve_dest(u, dest_text)
+    u.text = " " * len(u.text)
+    spec.ftype = spec.ftype or "f"
+    if not dest.startswith(("/", "~")):
+        spec.exclude.append(f"./{dest.strip('./')}/*" if spec.root == "." else f"*/{dest.strip('./')}/*")
+    cmd = render_find(spec, f"exec:{tool} -i -t {qpath(dest)} --")
+    if not os.path.isdir(os.path.join(u.cwd, os.path.expanduser(dest))):
+        cmd = f"mkdir -p -- {qpath(dest)} && {cmd}"
+    plan = Plan(cmd, "move" if tool == "mv" else "copy",
+                [where_label(spec, True)] + spec.why + [f"→ {dest}", "asks before overwriting"],
+                destructive=True, preview=render_find(spec, "list"),
+                warning=f"! {'moves' if tool == 'mv' else 'copies'} the files listed above into {dest}")
+    return finish(left, plan, guessed, spec)
+
+
 def h_find_then(u: Utterance) -> Plan | None:
     """'find logs older than 2 months and move them to old/'"""
     m = u.peek(r"^(.*?)\s+(?:and|then)\s+(?:also\s+)?(move|copy)\s+(?:them|those|these|it|all\s+of\s+them|"
@@ -1542,20 +1564,7 @@ def h_find_then(u: Utterance) -> Plan | None:
     guessed = absorb_keywords(left, spec, "any")
     if not spec.narrowed():
         return None   # "find files and move them" would move everything
-    dest = resolve_dest(u, u.o(m, 3))
-    u.text = " " * len(u.text)
-    spec.ftype = spec.ftype or "f"
-    tool = "mv" if m.group(2) == "move" else "cp"
-    if not dest.startswith(("/", "~")):
-        spec.exclude.append(f"./{dest.strip('./')}/*" if spec.root == "." else f"*/{dest.strip('./')}/*")
-    cmd = render_find(spec, f"exec:{tool} -i -t {qpath(dest)} --")
-    if not os.path.isdir(os.path.join(u.cwd, os.path.expanduser(dest))):
-        cmd = f"mkdir -p -- {qpath(dest)} && {cmd}"
-    plan = Plan(cmd, "move" if tool == "mv" else "copy",
-                [where_label(spec, True)] + spec.why + [f"→ {dest}", "asks before overwriting"],
-                destructive=True, preview=render_find(spec, "list"),
-                warning=f"! {'moves' if tool == 'mv' else 'copies'} the files listed above into {dest}")
-    return finish(left, plan, guessed, spec)
+    return bulk_transfer(u, spec, "mv" if m.group(2) == "move" else "cp", u.o(m, 3), left, guessed)
 
 
 def h_copy_move(u: Utterance) -> Plan | None:
@@ -1582,6 +1591,13 @@ def h_copy_move(u: Utterance) -> Plan | None:
         return None
     verb = m.group(1)
     srcs = resolve_sources(u, u.o(m, 2))
+    if not srcs and verb in ("copy", "cp", "move", "mv"):
+        # "move all csv files older than a week to archive"
+        left = Utterance(u.o(m, 2), u.cwd, u.literals)
+        spec = FindSpec()
+        parse_filters(left, spec)
+        if spec.narrowed() and not left.leftover():
+            return bulk_transfer(u, spec, "mv" if verb in ("move", "mv") else "cp", u.o(m, 3), left)
     dest = resolve_dest(u, u.o(m, 3))
     u.text = " " * len(u.text)
     conf = 1.0 if srcs else 0.4

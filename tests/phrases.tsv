@@ -271,3 +271,24 @@ show all users	/etc/passwd
 what groups am i in	groups
 show my crontab	crontab -l
 how many words are in README.md	wc -w < README.md
+
+# -- combined filters, sorts and limits
+find the 5 largest pdf files modified this year	*.pdf ;; -mtime -365 ;; head -n 5 ;; sort -nr
+show the newest csv file in run1	run1 ;; csv ;; head -n 1
+list the 3 oldest log files	*.log ;; head -n 3 ;; sort
+find python files bigger than 1kb changed in the last 2 weeks	*.py ;; -size +1k ;; -mtime -14
+find empty folders in src and delete them	find src ;; -type d ;; -empty ;; -delete
+count pdf files in my downloads	~/Downloads ;; *.pdf ;; wc -l
+find large videos in my home folder	find ~ ;; *.mp4 ;; sort -nr
+search for TODO in python files under src	--include='*.py' ;; TODO ;; src
+find files owned by root that are bigger than 10mb	-user root ;; -size +10M
+which txt files contain error	*.txt ;; -e error
+find files named "report" modified yesterday	*report* ;; -mtime 1
+show the 20 biggest files on my computer	find / ;; head -n 20
+total size of all log files	*.log ;; du -ch
+how many images are in this folder	*.jpg ;; wc -l ;; -maxdepth 1
+find hidden files bigger than 1mb	-name '.*' ;; -size +1M
+list files modified in the last 30 minutes	-mmin -30
+find scripts that are executable	-executable
+delete pdfs older than a year in my downloads	~/Downloads ;; *.pdf ;; -mtime +365 ;; -delete
+move all csv files older than a week to archive	*.csv ;; -mtime +7 ;; mv
