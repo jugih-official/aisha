@@ -49,7 +49,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 # ---- configuration ----------------------------------------------------------
 
@@ -3980,7 +3980,7 @@ def os_name() -> str:
 DATA_DIR = os.path.join(os.path.expanduser(os.environ.get("XDG_DATA_HOME") or "~/.local/share"), "aisha")
 MANAGED_PORT = 18431
 MODELS = {  # size -> (Hugging Face repo, file, approximate download)
-    "0.5b": ("Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF", "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf", "0.4 GB"),
+    "0.5b": ("Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF", "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf", "0.5 GB"),
     "1.5b": ("Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF", "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf", "1.1 GB"),
     "3b": ("Qwen/Qwen2.5-Coder-3B-Instruct-GGUF", "qwen2.5-coder-3b-instruct-q4_k_m.gguf", "2.0 GB"),
 }
@@ -4000,6 +4000,10 @@ def url_open(req, timeout: float):
     if is_local_url(url):
         return urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout)
     return urllib.request.urlopen(req, timeout=timeout)
+
+
+def is_llamafile(server: str) -> bool:
+    return "llamafile" in os.path.basename(server).lower()
 
 
 def server_env(server: str) -> dict:
@@ -4035,9 +4039,26 @@ class Runtime:
         os.makedirs(DATA_DIR, exist_ok=True)
         log_path = os.path.join(DATA_DIR, "llama-server.log")
         server = self.cfg["llm_server"]
-        args = [server, "-m", self.cfg["llm_model_file"], "--host", "127.0.0.1",
-                "--port", str(self.port), "-c", "4096"]
+        base = ["-m", self.cfg["llm_model_file"], "--host", "127.0.0.1", "--port", str(self.port), "-c", "4096"]
+        if is_llamafile(server):   # llamafile wants --server; older ones also open a browser unless told not to
+            variants = [["--server", "--nobrowser"] + base, ["--server"] + base, base]
+        else:
+            variants = [base]
+        launcher = ["sh", server] if self.cfg.get("llm_server_sh") else [server]
+        err = ""
+        for extra in variants:
+            err = self._try_start(launcher + extra, server, log_path)
+            if not err:
+                return
+            if "unknown" not in err.lower() and "unrecognized" not in err.lower() and "invalid" not in err.lower():
+                break                  # a real failure, not an option this version lacks
+        raise LLMError(err)
+
+    def _try_start(self, args: list[str], server: str, log_path: str) -> str:
+        """Start and wait until ready. '' on success, else what went wrong."""
         with open(log_path, "ab") as log:
+            log.write(f"\n--- {time.strftime('%F %T')} {' '.join(args)}\n".encode())
+            start_pos = log.tell()
             self.proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                          env=server_env(server), start_new_session=True)
         atexit.register(self.stop)
@@ -4045,19 +4066,25 @@ class Runtime:
         health = f"http://127.0.0.1:{self.port}/health"
         while time.time() < deadline:
             if self.proc.poll() is not None:
-                raise LLMError(f"llama-server stopped (exit {self.proc.returncode}); "
-                               f"last lines of {log_path}:\n{tail_file(log_path)}")
+                try:
+                    with open(log_path, "rb") as f:
+                        f.seek(start_pos)
+                        out = f.read().decode(errors="replace")
+                except OSError:
+                    out = ""
+                return (f"the model server stopped (exit {self.proc.returncode}); its output:\n"
+                        + "\n".join(out.strip().splitlines()[-8:]))
             try:
                 with url_open(health, timeout=2) as r:
                     if r.status == 200:
-                        return
+                        return ""
             except urllib.error.HTTPError:
                 pass  # 503 while the model loads
             except (urllib.error.URLError, OSError):
                 pass
             time.sleep(0.3)
         self.stop()
-        raise LLMError(f"llama-server did not become ready in time (see {log_path})")
+        return f"the model server did not become ready in time (see {log_path})"
 
     def stop(self) -> None:
         if self.running():
@@ -5195,15 +5222,28 @@ def download(url: str, dest: str, label: str) -> str:
 
 
 def pick_llama_asset(assets: list, machine: str | None = None) -> dict | None:
-    """The plain CPU Linux build for this machine from a llama.cpp release."""
+    """The plain CPU Linux build for this machine from a llama.cpp release, whatever it is called."""
     machine = (machine or platform.machine()).lower()
-    arch = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(machine)
+    arch = {"x86_64": ("x64", "x86_64", "amd64", "x86-64"), "amd64": ("x64", "x86_64", "amd64", "x86-64"),
+            "aarch64": ("arm64", "aarch64"), "arm64": ("arm64", "aarch64")}.get(machine)
     if not arch:
         return None
-    for a in assets:
-        if re.search(rf"-bin-ubuntu-{arch}\.(?:zip|tar\.gz|tgz)$", a.get("name", "")):
-            return a
-    return None
+    gpu_or_other = ("vulkan", "cuda", "cudart", "rocm", "hip", "sycl", "opencl", "musa", "cann", "kompute",
+                    "openvino", "metal", "s390x", "riscv", "win", "macos", "darwin", "ios", "android",
+                    "xcframework", "msvc", "dll", "source", "src")
+    found = []
+    for a_ in assets:
+        name = a_.get("name", "").lower()
+        if not re.search(r"\.(?:zip|tar\.gz|tgz|tar\.xz|tar\.zst)$", name):
+            continue
+        parts = set(re.split(r"[-_.]", name))
+        if not ({"linux", "ubuntu", "debian"} & parts) or not any(x in name for x in arch):
+            continue
+        if any(bad in parts or bad in name.split("-") for bad in gpu_or_other):
+            continue
+        found.append(a_)
+    found.sort(key=lambda a_: ("cpu" not in a_["name"].lower(), len(a_["name"])))
+    return found[0] if found else None
 
 
 def extract_archive(path: str, dest: str) -> None:
@@ -5271,6 +5311,15 @@ def extract_archive(path: str, dest: str) -> None:
             # devices, fifos and the like are skipped
 
 
+def find_llamafile(root: str) -> str | None:
+    try:
+        files = sorted((f for f in os.listdir(root) if f.startswith("llamafile") and not f.endswith(".part")),
+                       key=_version_key, reverse=True)
+    except OSError:
+        return None
+    return os.path.join(root, files[0]) if files else None
+
+
 def find_server(root: str) -> str | None:
     for dirpath, _, files in os.walk(root):
         if "llama-server" in files:
@@ -5281,8 +5330,18 @@ def find_server(root: str) -> str | None:
 
 
 def check_server(server: str) -> tuple[bool, str]:
+    ok, out = _run_version([server], server)
+    if not ok and is_llamafile(server):
+        ok2, out2 = _run_version(["sh", server], server)   # APE binary blocked by a binfmt handler?
+        if ok2:
+            save_config({"llm_server_sh": True})
+            return True, out2
+    return ok, out
+
+
+def _run_version(launcher: list[str], server: str) -> tuple[bool, str]:
     try:
-        r = subprocess.run([server, "--version"], capture_output=True, text=True, timeout=30,
+        r = subprocess.run(launcher + ["--version"], capture_output=True, text=True, timeout=60,
                            env=server_env(server))
     except (OSError, subprocess.TimeoutExpired) as e:
         return False, str(e)
@@ -5295,12 +5354,70 @@ def check_server(server: str) -> tuple[bool, str]:
     return True, out.splitlines()[-1] if out else "ok"
 
 
+HF_BASE = "https://huggingface.co"
+LLAMAFILE_FALLBACK = ("mozilla-ai/llamafile_0.10", "llamafile-0.10.6-thin")
+
+
+def _version_key(text: str) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", text))
+
+
+def latest_llamafile() -> tuple[str, str]:
+    """(repo, file) of the newest CPU llamafile runtime Mozilla publishes on Hugging Face."""
+    try:
+        repos = http_json(f"{HF_BASE}/api/models?author=mozilla-ai&search=llamafile_&limit=50")
+        names = sorted((r["id"] for r in repos if re.fullmatch(r"mozilla-ai/llamafile_[\d.]+", r.get("id", ""))),
+                       key=_version_key, reverse=True)
+        for repo in names[:3]:
+            info = http_json(f"{HF_BASE}/api/models/{repo}")
+            files = [x["rfilename"] for x in info.get("siblings", [])]
+            thin = sorted((f for f in files if re.fullmatch(r"llamafile-[\d.]+-thin", f)), key=_version_key, reverse=True)
+            full = sorted((f for f in files if re.fullmatch(r"llamafile-[\d.]+", f)), key=_version_key, reverse=True)
+            if thin or full:
+                return repo, (thin or full)[0]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return LLAMAFILE_FALLBACK
+
+
+def install_llamafile() -> str:
+    repo, name = latest_llamafile()
+    say(f"  downloading {name} from huggingface.co/{repo} …")
+    path = download(f"{HF_BASE}/{repo}/resolve/main/{name}", os.path.join(DATA_DIR, "llamafile", name), name)
+    os.chmod(path, 0o755)
+    return path
+
+
+def install_runtime() -> str:
+    """A model server for aisha to run: llamafile from Hugging Face, else llama.cpp from GitHub."""
+    problems = []
+    try:
+        return install_llamafile()
+    except (OSError, urllib.error.URLError, ValueError) as e:
+        problems.append(f"llamafile from Hugging Face: {e}")
+    try:
+        return install_llama_runtime()
+    except (OSError, urllib.error.URLError, ValueError) as e:
+        problems.append(f"llama.cpp from GitHub: {e}")
+    raise OSError("could not download a model server:\n  " + "\n  ".join(problems)
+                  + "\n  Or install llama.cpp yourself and run: aisha --setup --runtime /path/to/llama-server")
+
+
 def install_llama_runtime() -> str:
-    say("  asking GitHub for the latest llama.cpp release …")
-    rel = http_json(LLAMA_RELEASES)
-    asset = pick_llama_asset(rel.get("assets", []))
+    say("  asking GitHub for a recent llama.cpp release …")
+    rel, asset = None, None
+    try:
+        releases = http_json(LLAMA_RELEASES.replace("/latest", "?per_page=8"))
+    except (OSError, ValueError):
+        releases = [http_json(LLAMA_RELEASES)]
+    for rel in releases:
+        asset = pick_llama_asset(rel.get("assets", []))
+        if asset:
+            break
     if not asset:
-        raise OSError(f"no prebuilt llama.cpp for {platform.machine()} in release {rel.get('tag_name')}")
+        seen = ", ".join(a.get("name", "?") for a in (releases[0].get("assets", []) if releases else []))[:600]
+        raise OSError(f"no Linux {platform.machine()} build in the recent releases; files in "
+                      f"{releases[0].get('tag_name') if releases else '?'}: {seen or 'none'}")
     tag = rel.get("tag_name", "latest")
     archive = download(asset["browser_download_url"], os.path.join(DATA_DIR, "downloads", asset["name"]),
                        asset["name"])
@@ -5340,7 +5457,7 @@ def setup(args: list[str]) -> int:
         return 0
     say(bold("aisha: optional language model"))
     say(dim("aisha works without one (rules + built-in model). This adds a small language model for the rest,"))
-    say(dim("run by llama.cpp's own server, which aisha starts when needed and stops on exit. No Ollama needed."))
+    say(dim("run by Mozilla's llamafile (llama.cpp in one file), which aisha starts when needed and stops on exit."))
     if "--url" in args:                      # use a server you already run
         i = args.index("--url")
         url = args[i + 1] if i + 1 < len(args) else ""
@@ -5368,15 +5485,25 @@ def setup(args: list[str]) -> int:
         say("language model turned off")
         return 0
     try:
-        server = cfg.get("llm_server") if cfg.get("llm_server") and os.path.isfile(cfg["llm_server"]) else None
-        server = server or shutil.which("llama-server") or find_server(os.path.join(DATA_DIR, "llama"))
-        if not server:
-            if not confirm("Download llama.cpp's llama-server (about 30 MB, MIT license) from GitHub?", yes):
+        server = None
+        if "--runtime" in args:
+            i = args.index("--runtime")
+            server = os.path.abspath(os.path.expanduser(args[i + 1])) if i + 1 < len(args) else ""
+            if not os.path.isfile(server):
+                say(red(f"no such file: {server}"))
                 return 1
-            server = install_llama_runtime()
+        server = server or (cfg.get("llm_server") if cfg.get("llm_server") and os.path.isfile(cfg["llm_server"]) else None)
+        server = (server or shutil.which("llama-server") or shutil.which("llamafile")
+                  or find_server(os.path.join(DATA_DIR, "llama")) or find_llamafile(os.path.join(DATA_DIR, "llamafile")))
+        if not server:
+            if not confirm("Download a model server (Mozilla's llamafile, about 45 MB, Apache-2.0) from Hugging Face?", yes):
+                return 1
+            server = install_runtime()
         ok, msg = check_server(server)
         if not ok:
-            say(red(f"llama-server does not run here:\n{msg}"))
+            say(red(f"the model server does not run here:\n{msg}"))
+            if is_llamafile(server):
+                say(dim("If a Wine/WSL binfmt handler is installed, see https://github.com/mozilla-ai/llamafile#gotchas"))
             return 1
         say(f"  runtime: {server} ({msg})")
         repo, name, approx = MODELS[size]
@@ -5390,7 +5517,7 @@ def setup(args: list[str]) -> int:
         say(red(f"setup failed: {e}"))
         return 1
     save_config({"llm_url": f"http://127.0.0.1:{MANAGED_PORT}/v1", "llm_model": f"qwen2.5-coder-{size}",
-                 "llm_server": server, "llm_model_file": model})
+                 "llm_server": server, "llm_model_file": model, "llm": None})
     say(dim(f"saved to {CFG_FILE}"))
     return Shell(load_config()).llm_status()
 
@@ -5444,7 +5571,7 @@ def doctor() -> int:
         if str(cfg["llm"]).lower() in ("off", "0", "no", "false", "none"):
             line(None, "turned off")
         else:
-            line(None, "not set up", "not needed; 'aisha --setup' adds a 0.5B model run by llama.cpp")
+            line(None, "not set up", "not needed; 'aisha --setup' adds a 0.5B model (llamafile, no Ollama)")
     elif llm.runtime.configured:
         good, msg = check_server(cfg["llm_server"])
         line(good, f"llama-server: {cfg['llm_server']}", msg)
@@ -5468,7 +5595,7 @@ USAGE = """usage: aisha                        interactive shell
        aisha --lines < file          handle stdin line by line, words included
        aisha --setup [0.5b|1.5b|3b] [--yes]
                                      add an optional small language model (llama.cpp, no Ollama)
-       aisha --setup --ollama | --url URL | off
+       aisha --setup --ollama | --url URL | --runtime PATH | off
        aisha --setup remove          delete the downloaded runtime and model
        aisha --doctor                check what aisha relies on
        aisha --version

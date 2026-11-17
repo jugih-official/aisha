@@ -1246,3 +1246,102 @@ l = m.SourceFileLoader("aisha", {AISHA!r}); sp = u.spec_from_loader("aisha", l)
 a = u.module_from_spec(sp); sys.modules["aisha"] = a; l.exec_module(a)
 print(a.LLM(a.load_config()).enabled)"""], env=env, capture_output=True, text=True)
         self.assertEqual(r.stdout.strip(), "False", r.stderr)
+
+
+FAKE_LLAMAFILE = r"""#!/usr/bin/env python3
+import json, sys, time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+if "--version" in sys.argv:
+    print("llamafile v0.10.6"); sys.exit(0)
+if "--nobrowser" in sys.argv:
+    print("error: unknown argument: --nobrowser"); sys.exit(1)      # this version dropped it
+if "--server" not in sys.argv:
+    print("error: no prompt given"); sys.exit(1)
+port = int(sys.argv[sys.argv.index("--port") + 1])
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b"{}")
+    def do_POST(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        self.send_response(200); self.end_headers()
+        self.wfile.write(json.dumps({"choices": [{"message": {"content": "ls -A"}}]}).encode())
+HTTPServer(("127.0.0.1", port), H).serve_forever()
+"""
+
+
+class TestRuntimeSources(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_asset_names_old_and_new(self):
+        names = ["llama-v1.0.0-bin-ubuntu-vulkan-x64.zip", "llama-v1.0.0-bin-win-cpu-x64.zip",
+                 "llama-v1.0.0-bin-macos-arm64.tar.gz", "llama.cpp-1.0.0-linux-x86_64-cuda.tar.gz",
+                 "llama.cpp-1.0.0-linux-x86_64.tar.gz", "llama.cpp-1.0.0-linux-aarch64.tar.gz",
+                 "llama.cpp-1.0.0-source.tar.gz"]
+        pick = lambda m: (aisha.pick_llama_asset([{"name": n} for n in names], m) or {}).get("name")
+        self.assertEqual(pick("x86_64"), "llama.cpp-1.0.0-linux-x86_64.tar.gz")
+        self.assertEqual(pick("aarch64"), "llama.cpp-1.0.0-linux-aarch64.tar.gz")
+        names2 = ["llama-b9000-bin-ubuntu-x64.zip", "llama-b9000-bin-ubuntu-cpu-x64.tar.gz"]
+        self.assertEqual(aisha.pick_llama_asset([{"name": n} for n in names2], "x86_64")["name"],
+                         "llama-b9000-bin-ubuntu-cpu-x64.tar.gz")
+
+    def test_newest_llamafile_on_hugging_face(self):
+        class FakeHF(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                if self.path.startswith("/api/models?"):
+                    body = [{"id": "mozilla-ai/llamafile_0.10"}, {"id": "mozilla-ai/llamafile_0.11"},
+                            {"id": "mozilla-ai/Llama-3.2-1B-Instruct-llamafile"}]
+                elif self.path == "/api/models/mozilla-ai/llamafile_0.11":
+                    body = {"siblings": [{"rfilename": n} for n in
+                                         ["llamafile-0.11.0", "llamafile-0.11.2-thin", "llamafile-0.11.10-thin", "ggml-cuda.so"]]}
+                else:
+                    body = {"siblings": [{"rfilename": "llamafile-0.10.6-thin"}]}
+                out = json.dumps(body).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+        srv = HTTPServer(("127.0.0.1", 0), FakeHF)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        saved = aisha.HF_BASE
+        aisha.HF_BASE = f"http://127.0.0.1:{srv.server_port}"
+        try:
+            self.assertEqual(aisha.latest_llamafile(), ("mozilla-ai/llamafile_0.11", "llamafile-0.11.10-thin"))
+        finally:
+            aisha.HF_BASE = saved
+            srv.shutdown()
+            srv.server_close()
+        aisha.HF_BASE = "http://127.0.0.1:1"          # unreachable: falls back to the known build
+        try:
+            self.assertEqual(aisha.latest_llamafile(), aisha.LLAMAFILE_FALLBACK)
+        finally:
+            aisha.HF_BASE = saved
+
+    def test_llamafile_starts_with_the_options_it_accepts(self):
+        server = os.path.join(self.dir, "llamafile-0.10.6-thin")
+        with open(server, "w") as f:
+            f.write(FAKE_LLAMAFILE.replace("/usr/bin/env python3", sys.executable))
+        os.chmod(server, 0o755)
+        model = os.path.join(self.dir, "m.gguf")
+        open(model, "w").close()
+        self.assertTrue(aisha.is_llamafile(server))
+        self.assertTrue(aisha.check_server(server)[0])
+        saved = aisha.DATA_DIR
+        aisha.DATA_DIR = self.dir
+        cfg = dict(aisha.DEFAULTS, llm="on", llm_url=f"http://127.0.0.1:{free_port()}/v1", llm_server=server,
+                   llm_model_file=model, llm_timeout=20.0)
+        llm = aisha.LLM(cfg)
+        try:
+            self.assertEqual(llm.command_for("list files", self.dir, ""), "ls -A")
+        finally:
+            llm.runtime.stop()
+            aisha.DATA_DIR = saved

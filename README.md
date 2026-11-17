@@ -463,18 +463,21 @@ manage remembered phrases, `llm` checks the model, `help` lists examples.
 aisha does not need one, and uses none unless you set it up:
 
 ```sh
-aisha --setup            # Qwen2.5-Coder 0.5B (0.4 GB) + llama.cpp's own server (~30 MB)
+aisha --setup            # Qwen2.5-Coder 0.5B (0.5 GB) + Mozilla's llamafile server (~45 MB)
 aisha --setup 1.5b       # better, 1.1 GB
 aisha --setup --ollama   # use Ollama instead, if you have it
 aisha --setup --url http://127.0.0.1:8080/v1   # any OpenAI-compatible server you run
+aisha --setup --runtime ~/bin/llama-server   # a llama.cpp/llamafile you already have
 aisha --setup off        # never use a model
 aisha --setup remove     # delete the downloaded runtime and model
 ```
 
-The default needs no Ollama: aisha downloads llama.cpp's `llama-server`
-(MIT) from GitHub and the model (Apache 2.0) from Hugging Face into
-`~/.local/share/aisha`, starts it the first time it is needed and stops it
-when aisha exits. When the rules and the built-in model are unsure, the model
+The default needs no Ollama: aisha uses a `llama-server` or `llamafile` already
+on `PATH`, or downloads Mozilla's llamafile (llama.cpp as one portable file,
+Apache 2.0) and the model (Apache 2.0) from Hugging Face into
+`~/.local/share/aisha`. If Hugging Face is unreachable it falls back to a
+llama.cpp release from GitHub. aisha starts the server the first time it is
+needed and stops it when aisha exits. When the rules and the built-in model are unsure, the model
 is offered as one more option (`?` at the prompt); its commands are always
 shown and confirmed.
 
