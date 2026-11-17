@@ -215,7 +215,7 @@ they their there these those this that which who what whats where when how
 and or also then so up out ok okay hey hi lets let want need wanna like look looks
 give get tell have has had only really actually currently exactly thing things stuff
 item items entries entry everything first one ones whole
-show display check tell see view give report
+show display check tell see view give report but anything nothing instead
 """.split())
 
 # Dates the rules do not parse. They must not become search keywords; they
@@ -402,6 +402,15 @@ CONTRACTIONS = [
 ]
 
 
+# "don't delete them", "without removing", "do not move anything": an action
+# the user rules out is removed before any rule sees it. (Not "modified"/
+# "changed": "not modified in 30 days" is an age filter.)
+NEGATION = re.compile(
+    r"\b(?:do\s+not|dont|never|without|not\s+to|but\s+not|and\s+not|no\s+need\s+to)\s+(?:\w+\s+){0,2}?"
+    r"(delet\w*|remov\w*|eras\w*|mov(?:e|es|ing)\b|renam\w*|kill\w*|overwrit\w*|trash\w*|wip(?:e|ing))"
+    r"(?:\s+(?:them|it|anything|any\s+(?:of\s+)?(?:them|files?)|the\s+files|those|these))?\b")
+
+
 class Utterance:
     """The request, with a mask that slot extractors blank out as they go.
 
@@ -435,6 +444,10 @@ class Utterance:
         self.orig = " ".join(t for t in toks if t)
         self.low = "".join(c.lower() if len(c.lower()) == 1 else c for c in self.orig)
         self.text = self.low
+        self.negated: set[str] = set()
+        for m in NEGATION.finditer(self.low):
+            self.negated.add(m.group(1))
+            self.blank(m.start(), m.end())
 
     # -- masking
     def blank(self, start: int, end: int) -> None:
@@ -489,10 +502,14 @@ class FindSpec:
     exclude: list = field(default_factory=list)     # -not -path patterns
     owner: str | None = None
     broken: bool = False
+    not_exts: list = field(default_factory=list)
+    not_names: list = field(default_factory=list)
+    not_empty: bool = False
 
     def narrowed(self) -> bool:
         return bool(self.exts or self.names or self.hidden or self.empty or self.executable
-                    or self.size or self.time or self.content or self.owner or self.broken)
+                    or self.size or self.time or self.content or self.owner or self.broken
+                    or self.not_exts or self.not_names or self.not_empty)
 
 
 MOD = (r"(?:(?:modif(?:ied|y)|chang(?:ed|e)|edit(?:ed)?|creat(?:ed|e)|updat(?:ed|e)|touch(?:ed)?|"
@@ -693,6 +710,38 @@ def add_exts(spec: FindSpec, exts, label: str | None = None) -> None:
     spec.why.append(f"type: {shown}")
 
 
+ITEM = r"(?:\*?\.[a-z0-9]{1,8}|[a-z][\w+-]*)"
+
+
+def take_exclude(u: Utterance, spec: FindSpec) -> None:
+    """'except python files', 'excluding .log', 'other than pdfs', 'not empty'."""
+    if u.take(r"\b(?:not\s+empty|non-?empty)\b"):
+        spec.not_empty = True
+        spec.why.append("not empty")
+    pat = (rf"\b(?:except(?:\s+for)?|excluding|exclude|but\s+not|other\s+than|apart\s+from|besides|not)\s+"
+           rf"(?:the\s+|any\s+|all\s+)?({ITEM}(?:\s*(?:,|and|or|nor)\s*{ITEM})*)(?:\s+(?:files?|ones))?\b")
+    for m in re.finditer(pat, u.text):
+        items = [i for i in re.split(r"\s*(?:,|\band\b|\bor\b|\bnor\b)\s*", m.group(1)) if i]
+        exts, names = [], []
+        for item in items:
+            if item.startswith((".", "*.")):
+                exts.append(item.lstrip("*."))
+            elif type_word(item):
+                exts += type_word(item)[1]
+            elif not m.group(0).startswith("not") and item not in FILLER and item not in GENERIC:
+                names.append(f"*{item}*")
+            else:
+                exts, names = [], []
+                break
+        if not exts and not names:
+            continue
+        u.blank(m.start(), m.end())
+        spec.not_exts += [e for e in exts if e not in spec.not_exts]
+        spec.not_names += names
+        spec.why.append("except " + " ".join(["." + e for e in exts[:6]] + names))
+        return
+
+
 def take_ext(u: Utterance, spec: FindSpec) -> None:
     for m in list(re.finditer(r"(?<![\w/~.])\*?\.([a-z0-9]{1,8})\b(?![/\w.])", u.text)):
         u.blank(m.start(), m.end())
@@ -861,6 +910,7 @@ def parse_filters(u: Utterance, spec: FindSpec) -> None:
     take_time(u, spec)
     take_sort_limit(u, spec)
     take_location(u, spec)
+    take_exclude(u, spec)
     take_ext(u, spec)
     take_owner(u, spec)
     take_name(u, spec)
@@ -925,6 +975,19 @@ def find_tests(spec: FindSpec) -> list[str]:
         t += ["-name", "'.*'"]
     if spec.empty:
         t += ["-empty"]
+    if spec.not_empty:
+        t += ["-not", "-empty"]
+    if spec.not_exts:
+        globs = [shlex.quote("*." + e) for e in spec.not_exts]
+        if len(globs) == 1:
+            t += ["-not", "-iname", globs[0]]
+        else:
+            grp = []
+            for g in globs:
+                grp += (["-o"] if grp else []) + ["-iname", g]
+            t += ["-not", "\\("] + grp + ["\\)"]
+    for g in spec.not_names:
+        t += ["-not", "-iname", shlex.quote(g)]
     if spec.executable:
         t += ["-executable"]
     t += spec.size
@@ -1101,6 +1164,7 @@ def h_list(u: Utterance) -> Plan | None:
     show_all = with_hidden or bool(re.search(r"\ball\b", u.low))
     rich = (spec.size or spec.time or spec.content or spec.names or spec.hidden
             or spec.empty or spec.executable or spec.rec or len(spec.exts) > 1
+            or spec.not_exts or spec.not_names or spec.not_empty or spec.owner or spec.broken
             or (spec.ftype == "f" and spec.limit))
     if rich:
         cmd = render_find(spec, default_rec=False)

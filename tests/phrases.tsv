@@ -242,3 +242,14 @@ when did the computer boot	who -b || uptime -s
 list installed packages	dpkg-query
 search for a package called htop	search htop
 how do i check disk space	df -h
+
+# -- negation and exclusion
+don't delete anything, just show me old files	-mtime +30 ;; -print
+list old files but do not remove them	-mtime +30
+find big files without deleting them	sort -nr
+find tmp files, don't remove them	*.tmp ;; -print
+find all files except python files	-not ;; *.py
+list everything except pdfs	-not ;; *.pdf
+find files excluding .log files	-not ;; *.log
+find folders that are not empty	-type d ;; -not -empty
+find non-empty files	-not -empty
