@@ -665,3 +665,11 @@ class TestSmallThings(LabTest):
             f.write("ref: refs/heads/aisha\n")
         self.assertEqual(aisha.git_branch(os.path.join(self.lab, "src", "deep")), "aisha")
         self.assertEqual(aisha.git_branch(tempfile.gettempdir()), "")
+
+
+class TestDoctor(unittest.TestCase):
+    def test_doctor_runs(self):
+        env = dict(os.environ, AISHA_LLM="off", AISHA_HOME=tempfile.mkdtemp())
+        r = subprocess.run([sys.executable, AISHA, "--doctor"], capture_output=True, text=True, env=env, timeout=30)
+        self.assertIn("doctor", r.stderr)
+        self.assertIn(r.returncode, (0, 1))

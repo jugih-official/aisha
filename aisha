@@ -2577,18 +2577,29 @@ class Memory:
 
 HELP = """aisha — type bash, or say what you want.
 
-  find pdfs bigger than 10mb in downloads
+Plain words, for example:
+  find recursively files older than 2 months from this folder
+  find logs older than 2 months and move them to archive
+  edit logs.txt with micro
   show the 5 newest files here
   which files mention "invoice"
+  find duplicate files
   what's eating my disk
   how much ram is free
-  copy notes.txt to backup
-  !ls -la            force plain bash
+  how do I delete empty folders        (shows the command, runs nothing)
+
+Shell:
+  any bash command, pipes, loops, aliases, functions
+  Ctrl-Z, jobs, fg, bg, cmd &          job control
+  Tab                                  complete commands and paths
+
+aisha:
+  !<command>         force plain bash
   ?<request>         skip the rules and ask the LLM
   explain <request>  show what would run, run nothing
   learned            phrases remembered from the LLM
   forget <request>   drop a remembered phrase
-  llm                check the local LLM
+  llm                check the local LLM (set it up with: aisha --setup)
   exit               leave (or Ctrl-D)
 """
 
@@ -3386,6 +3397,62 @@ def setup(args: list[str]) -> int:
     return Shell(load_config()).llm_status()
 
 
+def doctor() -> int:
+    """Check what aisha relies on and what it will fall back to."""
+    cfg = load_config()
+    ok = True
+
+    def line(good: bool | None, what: str, note: str = "") -> None:
+        mark = green("ok ") if good else (yellow("-- ") if good is None else red("!! "))
+        say(f"  {mark} {what}" + (dim(f"  {note}") if note else ""))
+
+    say(bold(f"aisha {VERSION} doctor"))
+    py = sys.version_info
+    line(py >= (3, 9), f"Python {py.major}.{py.minor}.{py.micro}", "3.9 or newer needed")
+    ok &= py >= (3, 9)
+    bash = shutil.which("bash")
+    line(bool(bash), f"bash: {bash or 'missing'}")
+    ok &= bool(bash)
+    try:
+        import readline
+        backend = "libedit" if "libedit" in (readline.__doc__ or "") else "GNU readline"
+        line(True, f"line editing: {backend}")
+    except ImportError:
+        line(None, "line editing: none", "no history or Tab completion")
+    say(bold("tools"))
+    for tool, fallback in [("find", None), ("grep", None), ("du", None), ("numfmt", None),
+                           ("sensible-editor", "$EDITOR or nano"), ("less", "cat"),
+                           ("ps", "process questions will not work"), ("free", "/proc/meminfo"),
+                           ("ip", "hostname -I"), ("ss", "/proc/net/tcp"), ("zip", "python3 -m zipfile"),
+                           ("unzip", "python3 -m zipfile"), ("curl", "wget or Python urllib"),
+                           ("xdg-open", "lists the file instead of opening it")]:
+        here = shutil.which(tool)
+        if not here and fallback is None:
+            ok = False
+        line(True if here else (None if fallback else False), tool,
+             "" if here else f"missing → {fallback}" if fallback else "missing — needed")
+    say(bold("settings"))
+    line(True, f"config: {CFG_FILE}", "exists" if os.path.exists(CFG_FILE) else "defaults (no file yet)")
+    rc = [f for f in RC_FILES if os.path.isfile(os.path.expanduser(f))]
+    line(True, "startup files: " + (", ".join(rc) if rc else "none"), "aliases, functions, exports")
+    line(True, f"remembered phrases: {len(Memory(LEARNED_FILE).data)}")
+    say(bold("local model"))
+    llm = LLM(cfg)
+    if not llm.enabled:
+        line(None, "off (AISHA_LLM=off)")
+    elif llm.runtime.configured:
+        good, msg = check_server(cfg["llm_server"])
+        line(good, f"llama-server: {cfg['llm_server']}", msg)
+        size = os.path.getsize(cfg["llm_model_file"]) / 1e9
+        line(True, f"model: {os.path.basename(cfg['llm_model_file'])} ({size:.1f} GB)", "starts when needed")
+    elif server_answers(cfg["llm_url"]):
+        line(True, f"server answering at {cfg['llm_url']}", cfg["llm_model"])
+    else:
+        line(None, "none set up", "the rules still work; 'aisha --setup' adds a model")
+    say(green("all good") if ok else red("something aisha needs is missing"))
+    return 0 if ok else 1
+
+
 # ---- entry point ------------------------------------------------------------------
 
 USAGE = """usage: aisha                        interactive shell
@@ -3397,6 +3464,7 @@ USAGE = """usage: aisha                        interactive shell
        aisha --setup [0.5b|1.5b|3b] [--yes] [--download]
                                      set up the local LLM fallback
        aisha --setup remove          delete the downloaded runtime and model
+       aisha --doctor                check what aisha relies on
        aisha --version
 """
 
@@ -3441,6 +3509,8 @@ def main(argv: list[str]) -> int:
         return 0
     if args and args[0] == "--setup":
         return setup(args[1:])
+    if args and args[0] == "--doctor":
+        return doctor()
     bash = ["bash", "-l"] if login else ["bash"]
     if args and args[0] == "-c":
         # ssh, scp, rsync and editors call $SHELL -c: real commands go straight
