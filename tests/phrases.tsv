@@ -90,7 +90,7 @@ create an empty file notes.md	touch -- notes.md
 make run.sh executable	chmod +x -- run.sh
 compress src into src.tar.gz	tar -czf src.tar.gz src
 zip up run1	run1.zip
-extract data.tar.gz	tar -xf data.tar.gz
+extract data.tar.gz	-xf data.tar.gz
 extract backup.zip	backup.zip
 extract data.tar.gz into out	-C out
 back up README.md	cp -a -- README.md README.md.bak
@@ -231,7 +231,7 @@ can you open logs.txt in nano	nano logs.txt
 show me the first 3 lines of README.md	head -n 3 README.md
 tail app.log	tail -n 10 var/log/app.log
 make a zip of src	src.zip
-unpack data.tar.gz here	tar -xf data.tar.gz
+unpack data.tar.gz here	-xf data.tar.gz
 kill the process named sleep	pkill -- sleep
 end all python processes	pkill -- python
 what is listening on port 22	sport = :22 || grep -w -- 22

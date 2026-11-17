@@ -165,8 +165,8 @@ DESTRUCTIVE_RE = re.compile(
     r"""
     \b( rm | rmdir | shred | unlink | truncate | wipefs | fdisk | parted | sfdisk
       | mkfs(\.[a-z0-9]+)? )\b
-    | \bfind\b[^|;&]*\s-delete\b
-    | \bfind\b[^|;&]*-exec\s+rm\b
+    | \bfind\b(?:[^|;&]|\\;)*\s-delete\b
+    | \bfind\b(?:[^|;&]|\\;)*-exec\s+(?:rm|mv|sed\s+-i)\b
     | \bdd\b[^|;&]*\bof=/dev/
     | >\s*/dev/(sd|nvme|hd|mmc|loop|vd|xvd|md|dm-)
     | \bgit\s+(reset\s+--hard|clean\s+-[a-z]*f)
@@ -225,6 +225,10 @@ monday tuesday wednesday thursday friday saturday sunday last next ago since unt
 january february march april may june july august september october november december
 morning evening tonight night weekend
 """.split())
+
+# Negations the rules could not attach to a filter: never search terms, and
+# the parse is not trusted when one is left over.
+NEG_WORDS = {"not", "no", "never", "none", "without", "nor", "neither"}
 
 # Nouns too vague to be search keywords ("the measurement *data*").
 GENERIC = set("""
@@ -338,7 +342,7 @@ def stem(w: str) -> str:
 
 def qpath(p: str) -> str:
     """Shell-quote a path but keep a leading ~ expandable."""
-    if p == "~":
+    if p in ("~", "~/"):
         return "~"
     if p.startswith("~/"):
         return "~/" + shlex.quote(p[2:])
@@ -406,7 +410,7 @@ CONTRACTIONS = [
 # the user rules out is removed before any rule sees it. (Not "modified"/
 # "changed": "not modified in 30 days" is an age filter.)
 NEGATION = re.compile(
-    r"\b(?:do\s+not|dont|never|without|not\s+to|but\s+not|and\s+not|no\s+need\s+to)\s+(?:\w+\s+){0,2}?"
+    r"\b(?:do\s+not|dont|never|without|not|no\s+need\s+to)\s+(?:\w+\s+){0,2}?"
     r"(delet\w*|remov\w*|eras\w*|mov(?:e|es|ing)\b|renam\w*|kill\w*|overwrit\w*|trash\w*|wip(?:e|ing))"
     r"(?:\s+(?:them|it|anything|any\s+(?:of\s+)?(?:them|files?)|the\s+files|those|these))?\b")
 
@@ -438,7 +442,8 @@ class Utterance:
         # File names and paths become literals too, so word rules never read
         # inside them ("old.tmp" is a name, not the word "old").
         for i, t in enumerate(toks):
-            if is_pathlike(t) and not re.fullmatch(r"\*?\.[A-Za-z0-9]{1,8}|qlit\d+", t, re.I):
+            if ((is_pathlike(t) and not re.fullmatch(r"\*?\.[A-Za-z0-9]{1,8}|qlit\d+", t, re.I))
+                    or (t.startswith(".") and len(t) > 1 and os.path.lexists(os.path.join(cwd, t)))):
                 self.literals.append(t)
                 toks[i] = f"qlit{len(self.literals) - 1}"
         self.orig = " ".join(t for t in toks if t)
@@ -505,11 +510,13 @@ class FindSpec:
     not_exts: list = field(default_factory=list)
     not_names: list = field(default_factory=list)
     not_empty: bool = False
+    not_hidden: bool = False
+    no_ext: bool = False
 
     def narrowed(self) -> bool:
         return bool(self.exts or self.names or self.hidden or self.empty or self.executable
                     or self.size or self.time or self.content or self.owner or self.broken
-                    or self.not_exts or self.not_names or self.not_empty)
+                    or self.not_exts or self.not_names or self.not_empty or self.not_hidden or self.no_ext)
 
 
 MOD = (r"(?:(?:modif(?:ied|y)|chang(?:ed|e)|edit(?:ed)?|creat(?:ed|e)|updat(?:ed|e)|touch(?:ed)?|"
@@ -547,6 +554,16 @@ def take_size(u: Utterance, spec: FindSpec) -> None:
         spec.size += ["-size", size_arg("+", lo, lo_unit), "-size", size_arg("-", hi, hi_unit)]
         spec.why.append(f"size {m.group(1)}{lo_unit}–{m.group(3)}{hi_unit}")
         return
+    m = u.take(rf"\b(?:no|not)\s+(bigger|larger|greater|heavier|more|smaller|less|lighter)\s+{THAN}\s+{NUM}\s*{SUNIT}\b")
+    if m:
+        n, unit = num(m.group(2), 1), m.group(3)
+        if m.group(1) in ("smaller", "less", "lighter"):     # at least n
+            spec.size += ["-size", f"+{max(0, to_bytes(n, unit) - 1)}c"]
+            spec.why.append(f"size ≥ {m.group(2)}{unit}")
+        else:                                               # at most n
+            spec.size += ["-size", f"-{to_bytes(n, unit) + 1}c"]
+            spec.why.append(f"size ≤ {m.group(2)}{unit}")
+        return
     big = (r"(?:bigger|larger|greater|heavier|more|over|above|exceeding|at\s+least|>=?)")
     small = r"(?:smaller|less|lighter|under|below|at\s+most|<=?)"
     for word, sign, label in ((big, "+", ">"), (small, "-", "<")):
@@ -558,14 +575,16 @@ def take_size(u: Utterance, spec: FindSpec) -> None:
 
 
 def time_args(n, unit: str, sign: str) -> list[str]:
-    n = max(1, int(round(n))) if n else 1
+    n = n or 1
     unit = unit.lower()
     if unit.startswith("min"):
-        return ["-mmin", f"{sign}{n}"]
+        return ["-mmin", f"{sign}{max(1, round(n))}"]
     if unit.startswith(("hour", "hr")):
-        return ["-mmin", f"{sign}{n * 60}"]
+        return ["-mmin", f"{sign}{max(1, round(n * 60))}"]
     days = n * {"d": 1, "w": 7, "m": 30, "y": 365}[unit[0]]
-    return ["-mtime", f"{sign}{days}"]
+    if float(days).is_integer():
+        return ["-mtime", f"{sign}{int(days)}"]
+    return ["-mmin", f"{sign}{round(days * 1440)}"]   # 2.5 months is not 2 months
 
 
 def take_time(u: Utterance, spec: FindSpec) -> None:
@@ -577,7 +596,10 @@ def take_time(u: Utterance, spec: FindSpec) -> None:
         spec.daystart, spec.time = True, ["-mtime", "1"]
         spec.why.append("modified yesterday")
         return
-    rules = [  # (pattern, sign, number group, unit group)
+    rules = [  # (pattern, sign); negated forms first so "not modified in the last week" is +7
+        (rf"\b(?:not|never|have\s+not\s+been|has\s+not\s+been)\s+(?:been\s+)?(?:modified|changed|touched|used|accessed|opened|edited)\s+(?:in|for|during|since|within)\s+(?:the\s+)?(?:last|past)?\s*(?:{NUM}\s*)?{TUNIT}\b", "+"),
+        (rf"\b(?:no|not)\s+(?:more|older)\s+{THAN}\s+{NUM}\s*{TUNIT}(?:\s+(?:old|ago))?\b", "-"),
+        (rf"\b(?:no|not)\s+(?:newer|less|younger)\s+{THAN}\s+{NUM}\s*{TUNIT}(?:\s+(?:old|ago))?\b", "+"),
         (rf"\b{MOD}(?:(?:in|within|during|over|from)\s+)?(?:the\s+)?(?:last|past|previous)\s+(?:{NUM}\s*)?{TUNIT}\b", "-"),
         (rf"\b{MOD}(?:newer\s+{THAN}|less\s+{THAN}|under|within)\s+{NUM}\s*{TUNIT}(?:\s+(?:old|ago))?\b", "-"),
         (rf"\b(?:not|never|have\s+not\s+been|has\s+not\s+been)\s+(?:been\s+)?(?:modified|changed|touched|used|accessed|opened|edited)\s+(?:in|for|during|since)\s+(?:the\s+)?(?:last|past)?\s*(?:{NUM}\s*)?{TUNIT}\b", "+"),
@@ -590,7 +612,8 @@ def take_time(u: Utterance, spec: FindSpec) -> None:
             n, unit = num(m.group(1), 1), m.group(2)
             spec.time = time_args(n, unit, sign)
             what = "within the last" if sign == "-" else "older than"
-            days = f" ({spec.time[1].lstrip('+-')} days)" if unit[0] in "wmy" and not unit.startswith("min") else ""
+            days = (f" ({spec.time[1].lstrip('+-')} days)" if spec.time[0] == "-mtime" and unit[0] in "wmy"
+                    and not unit.startswith("min") else "")
             spec.why.append(f"modified {what} {m.group(1) or 1} {unit}{days}")
             return
     m = u.take(rf"\b{MOD}this\s+(week|month|year)\b")
@@ -658,6 +681,20 @@ LOC_PREP = r"(?:in|on|inside|within|under|from|at|across|throughout)"
 
 
 def take_location(u: Utterance, spec: FindSpec) -> None:
+    for m in re.finditer(r"\b(?:not\s+in|outside(?:\s+of)?|except\s+in)\s+(?:the\s+)?(\S+?)(?:\s+(?:folder|directory|dir))?\b",
+                         u.text):
+        d = resolve(u.lit(u.o(m, 1)), u.cwd, "dir")
+        if d:
+            u.blank(m.start(), m.end())
+            spec.exclude.append(f"./{d.strip('./')}/*")
+            spec.why.append(f"not in {d}")
+            break
+    _take_location(u, spec)
+    if spec.root not in ("/", "") and spec.root.endswith("/"):
+        spec.root = spec.root.rstrip("/") or "/"
+
+
+def _take_location(u: Utterance, spec: FindSpec) -> None:
     if u.take(r"\b(?:recursively|recursive|(?:and|including|incl|with|in|plus)\s+(?:all\s+)?(?:the\s+|its\s+)?"
               r"(?:sub-?folders|sub-?directories|subdirs)|in\s+any\s+sub-?folder|all\s+the\s+way\s+down)\b"):
         spec.rec = True
@@ -747,13 +784,22 @@ def take_exclude(u: Utterance, spec: FindSpec) -> None:
 
 
 def take_ext(u: Utterance, spec: FindSpec) -> None:
+    if u.take(r"\b(?:without\s+(?:an?\s+|any\s+)?(?:file\s+)?extensions?|with\s+no\s+(?:file\s+)?extensions?|"
+              r"(?:that\s+have\s+|having\s+)?no\s+(?:file\s+)?extensions?|extensionless)\b"):
+        spec.no_ext = True
+        spec.why.append("no extension")
     for m in list(re.finditer(r"(?<![\w/~.])\*?\.([a-z0-9]{1,8})\b(?![/\w.])", u.text)):
         u.blank(m.start(), m.end())
         add_exts(spec, [m.group(1)])
-    m = u.take(r"\b(?:with\s+|having\s+)?(?:the\s+|an?\s+)?(?:extension|suffix)\s+\.?([a-z0-9]{1,8})\b")
-    m = m or u.take(r"\b\.?([a-z0-9]{1,8})\s+(?:extension|suffix)\b")
-    if m:
-        add_exts(spec, [m.group(1)])
+        if m.group(0).startswith("*") and spec.rec is None:
+            spec.rec = False        # a typed *.log means this folder, as in bash
+    for pat in (r"\b(?:with\s+|having\s+)?(?:the\s+|an?\s+)?(?:extension|suffix)\s+\.?([a-z0-9]{1,8})\b",
+                r"\b\.?([a-z0-9]{1,8})\s+(?:extension|suffix)\b"):
+        m = re.search(pat, u.text)
+        if m and m.group(1) not in FILLER and m.group(1) not in NEG_WORDS:
+            u.blank(m.start(), m.end())
+            add_exts(spec, [m.group(1)])
+            break
 
 
 def take_name(u: Utterance, spec: FindSpec) -> None:
@@ -808,11 +854,11 @@ def add_keywords(u: Utterance, spec: FindSpec, words: list[str], mode: str) -> i
     for w in words:
         if w.startswith("qlit"):
             needle = u.lit(w)
-            spec.content.append((mode, needle, f'"{needle}"'))
+            spec.content.append((mode, needle, f'"{needle}"', needle))
         else:
             s = stem(w)
             shown = f'"{s}"' + (f' (from "{w}")' if s != w else "")
-            spec.content.append((mode, s, shown))
+            spec.content.append((mode, s, shown, w))
         added += 1
     return added
 
@@ -840,8 +886,8 @@ def take_content(u: Utterance, spec: FindSpec) -> None:
                     exts &= set(t[1])
                 add_exts(spec, sorted(exts) if exts else types[0][1], types[0][0])
                 return
-        spec.unparsed += [w for w in words if w in TIMEISH]
-        words = [w for w in words if w not in TIMEISH]
+        spec.unparsed += [w for w in words if w in TIMEISH or w in NEG_WORDS]
+        words = [w for w in words if w not in TIMEISH and w not in NEG_WORDS]
         keys = [w for w in words if w not in GENERIC or w.startswith("qlit")]
         dropped = [w for w in words if w not in keys]
         if not keys:
@@ -893,7 +939,10 @@ def take_types(u: Utterance, spec: FindSpec) -> None:
     if u.take(r"\bempty\b"):
         spec.empty = True
         spec.why.append("empty")
-    if u.take(r"\bhidden\b|\bdot\s*files\b"):
+    if u.take(r"\bnot\s+hidden\b|\bnon-?hidden\b|\bvisible\b"):
+        spec.not_hidden = True
+        spec.why.append("not hidden")
+    elif u.take(r"\bhidden\b|\bdot\s*files\b"):
         spec.hidden = True
         spec.why.append("hidden")
     if u.take(r"\bexecutables?\b|\bexecutable\s+files?\b"):
@@ -932,7 +981,8 @@ kill run execute install send upload download print sort
 
 def absorb_keywords(u: Utterance, spec: FindSpec, mode: str, limit: int = 2) -> int:
     """Leftover nouns become name/content keywords ("find the budget pdf")."""
-    words = [w for w in u.leftover() if w not in TIMEISH and w not in ACTION_WORDS][:limit]
+    words = [w for w in u.leftover() if w not in TIMEISH and w not in ACTION_WORDS
+             and w not in NEG_WORDS][:limit]
     if not words:
         return 0
     for w in words:
@@ -981,6 +1031,10 @@ def find_tests(spec: FindSpec) -> list[str]:
         t += ["-empty"]
     if spec.not_empty:
         t += ["-not", "-empty"]
+    if spec.not_hidden:
+        t += ["-not", "-name", "'.*'"]
+    if spec.no_ext:
+        t += ["-not", "-name", "'*.*'"]
     if spec.not_exts:
         globs = [shlex.quote("*." + e) for e in spec.not_exts]
         if len(globs) == 1:
@@ -1001,7 +1055,7 @@ def find_tests(spec: FindSpec) -> list[str]:
         t += ["-iname", shlex.quote(g)]
     for pat in spec.exclude:
         t += ["-not", "-path", shlex.quote(pat)]
-    for mode, needle, _ in spec.content:
+    for mode, needle, *_ in spec.content:
         grep = ["-exec", "grep", "-IqiF", "-e", shlex.quote(needle), "{}", "\\;"]
         if mode == "content":
             t += grep
@@ -1018,6 +1072,8 @@ def render_find(spec: FindSpec, action: str = "list", default_rec: bool = True) 
     parts = ["find", qpath(spec.root)]
     if not rec:
         parts += ["-maxdepth", "1", "-mindepth", "1"]
+    if rec and (action == "delete" or action.startswith(("exec:", "top"))):
+        parts += ["-mindepth", "1"]          # never the folder you started in
     if action == "delete":   # -delete implies -depth, which makes -prune a no-op error
         parts += find_tests(spec) + ["-not", "-path", "'*/.git/*'"]
     else:
@@ -1026,6 +1082,11 @@ def render_find(spec: FindSpec, action: str = "list", default_rec: bool = True) 
     limit = spec.limit or (10 if spec.sort and spec.sort[0] != "name" else None)
     if action.startswith("exec:"):
         parts += ["-exec"] + action[5:].split() + ["{}", "+"]
+    elif action == "top0":   # the N first by the sort, NUL-separated paths
+        key = "%s" if spec.sort[0] == "size" else "%T@"
+        parts += ["-printf", f"'{key}\\t%p\\0'"]
+        tail = (f" | sort -z -k1,1n{'r' if spec.sort[1] else ''} | head -z -n {spec.limit}"
+                " | cut -z -f2-")
     elif action == "delete":
         if spec.ftype == "d" and not spec.empty:
             parts += ["-prune", "-exec", "rm", "-r", "--", "{}", "+"]
@@ -1093,6 +1154,8 @@ def finish(u: Utterance, plan: Plan, guessed: int = 0, spec: FindSpec | None = N
     if spec:
         plan.keywords = [c[1] for c in spec.content] + [g.strip("*") for g in spec.names]
     plan.confidence *= (UNKNOWN_PENALTY ** len(left)) * (GUESS_PENALTY ** guessed)
+    if NEG_WORDS & set(left):
+        plan.confidence *= 0.5    # a "not" we could not place may flip the meaning
     if left:
         plan.why.append("ignored: " + " ".join(left))
     if looks_destructive(plan.command):
@@ -1161,7 +1224,7 @@ def h_list(u: Utterance) -> Plan | None:
     u.take(r"\b(?:contents?|everything|entries)\b")
     path, _ = first_target(u)
     if path:
-        if not os.path.isdir(os.path.expanduser(os.path.join(u.cwd, path))):
+        if not os.path.isdir(os.path.join(u.cwd, os.path.expanduser(path))):
             return None  # an existing file: that's a read, not a list
         spec.root = path
     guessed = absorb_keywords(u, spec, "name")
@@ -1339,6 +1402,14 @@ EDITORS = {
 }
 
 
+# Programs "open X in/with Y" may name besides editors: things that show files.
+VIEWERS = set("""
+less more most cat bat batcat view evince okular atril mupdf zathura eog feh sxiv imv ristretto gwenview
+geeqie shotwell mpv vlc totem rhythmbox audacious firefox chromium chromium-browser google-chrome
+libreoffice soffice gimp inkscape krita nautilus thunar dolphin glow mdcat w3m lynx hexdump xxd od strings
+""".split())
+
+
 def take_program(u: Utterance):
     """'with micro', 'using vim', 'in nano' -> (command, package). Blanks it."""
     pat = (r"\b(?:with|using|in|via|through)\s+(?:the\s+|my\s+)?(?:editor\s+|program\s+|app\s+)?"
@@ -1348,7 +1419,7 @@ def take_program(u: Utterance):
         if word in EDITORS:
             u.blank(m.start(), m.end())
             return EDITORS[word]
-        if (word not in FILLER and shutil.which(word)
+        if (word in VIEWERS and shutil.which(word)
                 and not os.path.isdir(os.path.join(u.cwd, word))):
             u.blank(m.start(), m.end())
             return (word, None)
@@ -1492,6 +1563,11 @@ def line_count(path: str) -> int:
         return 0
 
 
+def quote_glob(pattern: str) -> str:
+    """Quote everything in a glob except * and ?: 'old report*' -> 'old report'*."""
+    return "".join(p if p in ("*", "?") else shlex.quote(p) for p in re.split(r"([*?])", pattern) if p)
+
+
 def resolve_sources(u: Utterance, text: str) -> list[str] | None:
     """Words like "a.txt and b.txt" or "all the pdfs" -> paths/globs."""
     out = []
@@ -1503,7 +1579,7 @@ def resolve_sources(u: Utterance, text: str) -> list[str] | None:
             out.append(qpath(direct))
             continue
         if re.search(r"[*?]", item_lit) and globmod.glob(os.path.join(u.cwd, os.path.expanduser(item_lit))):
-            out.append(item_lit)
+            out.append(quote_glob(item_lit))
             continue
         spec = FindSpec()
         take_ext(sub, spec)
@@ -1518,6 +1594,19 @@ def resolve_sources(u: Utterance, text: str) -> list[str] | None:
     return out or None
 
 
+def clean_dest(u: Utterance, text: str) -> tuple[str, float]:
+    """'src and then list src' -> ('src', 0.5); 'qlit0 please' -> ('qlit0', 1.0)."""
+    conf = 1.0
+    parts = re.split(r"\s+(?:and|then)\s+|\s*[,;]\s*", text.strip(), maxsplit=1)
+    if len(parts) > 1:
+        text, conf = parts[0], 0.5           # a second instruction: the rules can't do both
+    text = re.sub(r"\s+(?:please|now|thanks|thank\s+you|pls)\s*$", "", text.strip())
+    words = text.split()
+    if len(words) > 1 and not re.fullmatch(r"(?:the|my|a|an)\s+\S+(?:\s+(?:folder|directory|dir))?", text):
+        conf = min(conf, 0.5)                # "old logs.txt": a name with a space, or two things?
+    return text, conf
+
+
 def resolve_dest(u: Utterance, text: str) -> str:
     text = text.strip()
     sub = Utterance(text, u.cwd, u.literals)
@@ -1526,7 +1615,8 @@ def resolve_dest(u: Utterance, text: str) -> str:
     take_location(sub, spec)
     if spec.root:
         return spec.root
-    t = re.sub(r"^(?:the|my|a|an)\s+", "", u.lit(text))
+    t = " ".join(u.lit(w) for w in text.split())
+    t = re.sub(r"^(?:the|my|a|an)\s+", "", t)
     t = re.sub(r"\s+(?:folder|directory|dir)$", "", t)
     path = resolve(t, u.cwd, "dir")
     return path or t
@@ -1564,7 +1654,10 @@ def h_find_then(u: Utterance) -> Plan | None:
     guessed = absorb_keywords(left, spec, "any")
     if not spec.narrowed():
         return None   # "find files and move them" would move everything
-    return bulk_transfer(u, spec, "mv" if m.group(2) == "move" else "cp", u.o(m, 3), left, guessed)
+    dest_text, dconf = clean_dest(u, u.o(m, 3))
+    plan = bulk_transfer(u, spec, "mv" if m.group(2) == "move" else "cp", dest_text, left, guessed)
+    plan.confidence *= dconf
+    return plan
 
 
 def h_copy_move(u: Utterance) -> Plan | None:
@@ -1582,7 +1675,7 @@ def h_copy_move(u: Utterance) -> Plan | None:
     mb = u.peek(r"\b(?:back\s*up|make\s+a\s+backup\s+of|create\s+a\s+backup\s+of)\s+(.+)$")
     if mb:
         srcs = resolve_sources(u, u.o(mb, 1))
-        if not srcs or len(srcs) != 1:
+        if not srcs or len(srcs) != 1 or re.search(r"[*?]", srcs[0]):
             return None
         u.text = " " * len(u.text)
         src = srcs[0]
@@ -1597,10 +1690,14 @@ def h_copy_move(u: Utterance) -> Plan | None:
         spec = FindSpec()
         parse_filters(left, spec)
         if spec.narrowed() and not left.leftover():
-            return bulk_transfer(u, spec, "mv" if verb in ("move", "mv") else "cp", u.o(m, 3), left)
-    dest = resolve_dest(u, u.o(m, 3))
+            dest_text, dconf = clean_dest(u, u.o(m, 3))
+            plan = bulk_transfer(u, spec, "mv" if verb in ("move", "mv") else "cp", dest_text, left)
+            plan.confidence *= dconf
+            return plan
+    dest_text, dconf = clean_dest(u, u.o(m, 3))
+    dest = resolve_dest(u, dest_text)
     u.text = " " * len(u.text)
-    conf = 1.0 if srcs else 0.4
+    conf = (1.0 if srcs else 0.4) * dconf
     srcs = srcs or [shlex.quote(u.lit(u.o(m, 2)))]
     if verb == "rename":
         cmd = f"mv -i -- {srcs[0]} {qpath(dest)}"
@@ -1619,35 +1716,99 @@ def h_copy_move(u: Utterance) -> Plan | None:
     return Plan(cmd, intent, [f"{', '.join(srcs)} → {dest}", "asks before overwriting"], confidence=conf)
 
 
+SENSITIVE_ROOTS = {"/", "/home", "/usr", "/etc", "/var", "/boot", "/bin", "/sbin", "/lib", "/opt", "/srv", "/root"}
+
+
+DESCRIPTORS = {"empty", "old", "hidden", "big", "large", "huge", "small", "tiny", "new", "tmp", "temp",
+               "temporary", "unused", "broken", "duplicate", "useless", "extra", "last", "first", "other"}
+
+
+def explicit_targets(u: Utterance) -> list | None:
+    """Names the user gave: quoted or file-like words, dot files, or a word right
+    before a singular 'file'/'folder'. [] if none; None if one cannot be found."""
+    found, missing = [], False
+    words = u.remaining()
+    for i, (low, orig, start) in enumerate(words):
+        nxt = words[i + 1][0] if i + 1 < len(words) else ""
+        prev = words[i - 1][0] if i else ""
+        lit = u.lit(orig)
+        if prev in ("in", "from", "under", "inside", "within", "at", "on", "across"):
+            continue                 # "... in ~/": a place to look, not a thing to delete
+        named = (low.startswith("qlit") or re.fullmatch(r"\.[\w.-]+", lit)
+                 or nxt in ("file", "folder", "directory", "dir"))
+        if not named or low in FILLER or low in ("file", "folder", "directory", "dir"):
+            continue
+        want = {"folder": "dir", "directory": "dir", "dir": "dir", "file": "file"}.get(nxt)
+        if not low.startswith("qlit") and low in DESCRIPTORS and not resolve(lit, u.cwd, want):
+            continue                 # "the hidden file .env": describes it, is not its name
+        if re.fullmatch(r"\.[a-z0-9]{1,8}", lit) and nxt == "files":
+            continue                 # ".log files" is a type, not a name
+        path = resolve(lit, u.cwd, want)
+        if not path and "/" not in lit and (low.startswith("qlit") or lit.startswith(".")):
+            hits = find_below(lit, u.cwd)
+            path = hits[0] if len(hits) == 1 else None
+        if path:
+            found.append(path)
+            u.blank(start, start + len(orig))
+            if nxt in ("file", "folder", "directory", "dir"):
+                u.take(rf"\b{nxt}\b")
+        elif low.startswith("qlit") or nxt in ("file", "folder", "directory", "dir") or lit.startswith("."):
+            missing = True
+    if missing:
+        return None
+    return found
+
+
 def h_delete(u: Utterance) -> Plan | None:
     if not u.take(r"\b(?:delete|remove|rm|erase|trash|get\s+rid\s+of|clean\s+up|wipe|destroy)\b"):
         return None
     # "find X and delete them" / "delete all X you can find"
     u.take(r"\b(?:find|search\s+for|look\s+for|locate|list|show(?:\s+me)?|get)\b")
     u.take(r"\b(?:and|then)\s+(?:also\s+)?(?=\s*$)|\b(?:them|those|these|all\s+of\s+them|the\s+results?)\b")
-    if u.peek(r"\b(?:package|program|app|application|software)\b"):
+    if u.peek(r"\b(?:package|program|software)\b"):
         return None
+    singular = u.peek(r"\bthe\s+(?:\S+\s+){0,2}?(?:file|folder|directory|dir)\b(?!s)") and not u.peek(r"\b(?:all|every|each)\b")
+    targets = explicit_targets(u)
+    if targets is None:
+        return None                    # a name that is not there: never guess
+    home = os.path.expanduser("~")
+    for t in targets or []:
+        real = os.path.realpath(os.path.join(u.cwd, os.path.expanduser(t)))
+        if real in SENSITIVE_ROOTS or real == home or real == os.path.realpath(u.cwd):
+            return None                # never rm a home, system or the current folder from words
+    if targets:
+        for _ in range(3):   # words describing what was named, not filters
+            u.take(r"\b(?:" + "|".join(sorted(DESCRIPTORS)) + r"|files?|folders?|director(?:y|ies)|dirs?)\b")
+        dirs = [t for t in targets if os.path.isdir(os.path.join(u.cwd, os.path.expanduser(t)))]
+        cmd = f"rm{' -r' if dirs else ''} -- " + " ".join(qpath(t) for t in targets)
+        plan = finish(u, Plan(cmd, "delete", targets))
+        plan.destructive = True
+        return plan
+    if singular:
+        return None                    # "delete the empty file": which one?
     spec = FindSpec()
     parse_filters(u, spec)
-    targets = []
-    while True:
-        path, _ = first_target(u)
-        if not path:
-            break
-        targets.append(path)
-    if targets and not spec.narrowed():
-        dirs = [t for t in targets if os.path.isdir(os.path.join(u.cwd, os.path.expanduser(t)))]
-        flag = " -r" if dirs else ""
-        cmd = f"rm{flag} -- " + " ".join(qpath(t) for t in targets)
-        return finish(u, Plan(cmd, "delete", targets))
     if not spec.narrowed():
         return None  # never "delete everything under here" from a vague sentence
-    if spec.root in ("/", "~") and not (spec.exts or spec.names or spec.content):
+    root = os.path.realpath(os.path.join(u.cwd, os.path.expanduser(spec.root)))
+    if (root in SENSITIVE_ROOTS or root == os.path.expanduser("~")) and not (spec.exts or spec.names or spec.content):
         return None
-    cmd = render_find(spec, "delete")
-    preview = render_find(spec, "list")
-    plan = Plan(cmd, "delete", [where_label(spec, True)] + spec.why, preview=preview)
-    return finish(u, plan)
+    # delete the exact words the user wrote, not their stems
+    spec.content = [(c[0], c[3], f'"{c[3]}"', c[3]) if len(c) > 3 else c for c in spec.content]
+    if spec.sort:
+        if not spec.limit:
+            return None                # "delete the largest files": how many?
+        spec.ftype = spec.ftype or "f"
+        top = render_find(spec, "top0")
+        rm = "rm -r --" if spec.ftype == "d" else "rm --"
+        plan = Plan(f"{top} | xargs -0 -r {rm}", "delete", [where_label(spec, True)] + spec.why,
+                    preview=f"{top} | tr '\\0' '\\n'")
+    else:
+        plan = Plan(render_find(spec, "delete"), "delete", [where_label(spec, True)] + spec.why,
+                    preview=render_find(spec, "list"))
+    plan = finish(u, plan, 0, spec)
+    plan.destructive = True
+    return plan
 
 
 def h_create(u: Utterance) -> Plan | None:
@@ -1721,7 +1882,10 @@ def h_archive(u: Utterance) -> Plan | None:
             dest = m.group(3) and u.lit(u.o(m, 3)) or stemname + (".zip" if use_zip else ".tar.gz")
             cmd = (f"{zipper} {qpath(dest)} {qpath(src)}" if use_zip else
                    f"tar -czf {qpath(dest)} {qpath(src)}")
-        return Plan(cmd, "compress", [f"{src} → {dest}"])
+        plan = Plan(cmd, "compress", [f"{src} → {dest}"])
+        if os.path.exists(os.path.join(u.cwd, os.path.expanduser(dest))):
+            plan.destructive, plan.warning = True, f"! replaces the existing {dest}"
+        return plan
     m = u.peek(r"\b(?:extract|unzip|unpack|decompress|uncompress|untar|open\s+up)\s+(\S+)(?:\s+(?:to|into|in)\s+(\S+))?")
     if not m:
         return None
@@ -1734,11 +1898,18 @@ def h_archive(u: Utterance) -> Plan | None:
     reqs = []
     if low.endswith(".zip"):
         if shutil.which("unzip"):
-            cmd = f"unzip {qpath(src)}" + (f" -d {qpath(dest)}" if dest else "")
+            cmd = f"unzip -n {qpath(src)}" + (f" -d {qpath(dest)}" if dest else "")   # -n: never overwrite
         else:
             cmd = f"python3 -m zipfile -e {qpath(src)} {qpath(dest or '.')}"
+            clash = zip_clashes(os.path.join(u.cwd, os.path.expanduser(src)),
+                                os.path.join(u.cwd, os.path.expanduser(dest or ".")))
+            if clash:
+                plan = Plan(cmd, "extract", [src, f"overwrites {len(clash)} existing file(s): {', '.join(clash[:3])}"],
+                            destructive=True, warning="! overwrites existing files")
+                return plan
     elif re.search(r"\.(tar(\.(gz|bz2|xz|zst))?|tgz|tbz2|txz)$", low):
-        cmd = (f"mkdir -p -- {qpath(dest)} && " if dest else "") + f"tar -xf {qpath(src)}" + (f" -C {qpath(dest)}" if dest else "")
+        cmd = ((f"mkdir -p -- {qpath(dest)} && " if dest else "") + f"tar --keep-old-files -xf {qpath(src)}"
+               + (f" -C {qpath(dest)}" if dest else ""))
     elif low.endswith(".gz"):
         cmd = f"gunzip -k {qpath(src)}"
     elif low.endswith(".7z"):
@@ -1750,6 +1921,15 @@ def h_archive(u: Utterance) -> Plan | None:
     else:
         return None
     return require(Plan(cmd, "extract", [src] + ([f"into {dest}"] if dest else [])), reqs)
+
+
+def zip_clashes(archive: str, dest: str) -> list[str]:
+    import zipfile
+    try:
+        with zipfile.ZipFile(archive) as z:
+            return [n for n in z.namelist() if not n.endswith("/") and os.path.exists(os.path.join(dest, n))]
+    except (OSError, zipfile.BadZipFile):
+        return []
 
 
 def h_cd(u: Utterance) -> Plan | None:
@@ -1947,6 +2127,9 @@ def h_package(u: Utterance) -> Plan | None:
     m = u.peek(r"\b(install|uninstall|remove|purge)\s+(?:the\s+)?(?:package\s+|program\s+|app\s+)?(\S+)(?:\s+(?:package|program|app))?$")
     if m and (m.group(1) in ("install", "uninstall", "purge") or u.peek(r"\b(?:package|program|app)\b")):
         name = u.lit(u.o(m, 2))
+        if name.lower() in ("folder", "file", "directory", "dir", "files", "folders") or \
+                os.path.exists(os.path.join(u.cwd, name)):
+            return None
         cmd = install_cmd([shlex.quote(name)], remove=m.group(1) != "install")
         if not cmd:
             return None
@@ -1983,19 +2166,30 @@ def h_download(u: Utterance) -> Plan | None:
         ("wget", f"wget -O {d} {q}"),
         (None, f"python3 -c 'import sys, urllib.request as u; u.urlretrieve(sys.argv[1], sys.argv[2])' {q} {d}"),
     ])
-    return Plan(cmd, "download", [f"{url} → {dest}"])
+    plan = Plan(cmd, "download", [f"{url} → {dest}"])
+    if os.path.exists(os.path.join(u.cwd, os.path.expanduser(dest))):
+        plan.destructive, plan.warning = True, f"! replaces the existing {dest}"
+    return plan
 
 
 def h_reext(u: Utterance) -> Plan | None:
     """'rename all .jpeg files to .jpg' -> change the extension in bulk."""
-    m = u.peek(r"\b(?:rename|change|convert)\s+(?:the\s+extension\s+of\s+)?(?:all\s+)?(?:the\s+|my\s+)?"
+    m = u.peek(r"\b(?:rename|change)\s+(?:the\s+extension\s+of\s+)?(?:all\s+)?(?:the\s+|my\s+)?"
                r"(?:\*?\.([a-z0-9]{1,8})\s+files|([a-z0-9]{1,8})\s+files|files\s+(?:ending\s+(?:in|with)\s+)?\.([a-z0-9]{1,8}))"
                r"\s+(?:to|into|as)\s+\.?([a-z0-9]{1,8})(?:\s+files)?\s*$")
     if not m:
         return None
     old = next(g for g in m.groups()[:3] if g)
     new = m.group(4)
-    if old == new or (m.group(2) and not type_word(old) and old not in CODE_EXTS):
+    if m.group(2):          # "python files": the type's one extension, or nothing
+        t = type_word(old)
+        if t and len(t[1]) == 1:
+            old = t[1][0]
+        elif not (old in CODE_EXTS or any(old in es for _, es in TYPE_WORDS.values())):
+            return None
+        elif t:
+            return None
+    if old == new:
         return None
     u.text = " " * len(u.text)
     cmd = f'for f in *.{old}; do mv -i -- "$f" "${{f%.{old}}}.{new}"; done'
@@ -2108,7 +2302,7 @@ def h_replace(u: Utterance) -> Plan | None:
     if not spec.exts and not spec.names:
         return None   # never rewrite every file under here from a vague target
     spec.ftype = "f"
-    spec.content.append(("content", old, f'"{old}"'))
+    spec.content.append(("content", old, f'"{old}"', old))
     cmd = render_find(spec, f"exec:sed -i {expr}")
     plan = Plan(cmd, "replace", why + [where_label(spec, True)] + spec.why, destructive=True,
                 preview=render_find(spec), warning="! changes the files listed above in place")
@@ -2182,6 +2376,8 @@ def fix_typos(text: str) -> tuple[str, list[str]]:
         if (not quoted and len(w) >= 4 and w.isalpha() and w not in VOCAB and w not in FILLER
                 and w not in TIMEISH and w not in GENERIC and w not in COMMON):
             cands = sorted(v for v in VOCAB if one_edit_apart(w, v))
+            if any(w.startswith(c) for c in cands):   # "deleted", "removed": real words
+                cands = []
             if len(cands) == 1:
                 fixes.append(f"{w}→{cands[0]}")
                 tok = cands[0]
@@ -2191,7 +2387,8 @@ def fix_typos(text: str) -> tuple[str, list[str]]:
 
 # "how do I ...": show the command, don't run it.
 QUESTION_RE = re.compile(
-    r"^\s*(?:(?:how|what)\s+(?:do|can|would|should)\s+(?:i|you|one|we)\s+(?:use\s+to\s+)?|how\s+to\s+|"
+    r"^\s*(?:(?:hey|hi|hello|ok|okay|so|um|well|please|quick\s+question)[,!.:]*\s+)*"
+    r"(?:(?:how|what)\s+(?:do|can|would|should)\s+(?:i|you|one|we)\s+(?:use\s+to\s+)?|how\s+to\s+|"
     r"what(?:'s|\s+is)\s+the\s+(?:bash\s+|shell\s+|linux\s+)?command\s+(?:to|for)\s+|"
     r"which\s+command\s+(?:do\s+i\s+use\s+to\s+|to\s+use\s+to\s+|)?)", re.I)
 
@@ -2204,8 +2401,11 @@ def interpret(text: str, cwd: str) -> Plan | None:
         if plan:
             plan.show_only = True
             plan.why.append("shown, not run: you asked how")
-        return plan
-    return _interpret_fixing(text, cwd)
+    else:
+        plan = _interpret_fixing(text, cwd)
+    if plan and not plan.destructive and needs_care(plan.command):
+        plan.destructive = True      # whatever built it: changing things always asks
+    return plan
 
 
 def _interpret_fixing(text: str, cwd: str) -> Plan | None:

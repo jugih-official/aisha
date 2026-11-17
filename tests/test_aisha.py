@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import re
 import unittest
 import warnings
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -896,3 +897,149 @@ class TestReviewEntryPoints(unittest.TestCase):
         self.assertEqual(p.wait(timeout=10), 128 + sig.SIGTERM)
         r = subprocess.run(["pgrep", "-f", "^sleep 20$"], capture_output=True, text=True)
         self.assertEqual(r.stdout.strip(), "", "the command aisha was running is still alive")
+
+
+class TestRuleReview(LabTest):
+    """Findings from the rule-engine review. Each would delete or change the wrong things."""
+
+    T = aisha.DEFAULTS["threshold"]
+
+    def sure(self, phrase):
+        p = self.plan(phrase)
+        return p if p and p.confidence >= self.T else None
+
+    def make(self, files):
+        for name, text in files.items():
+            path = os.path.join(self.lab, name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(text)
+
+    def run_cmd_in_lab(self, cmd):
+        return subprocess.run(["bash", "-c", cmd], cwd=self.lab, capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL)
+
+    def test_anything_that_changes_files_is_destructive(self):
+        phrases = [p for p, e in load_phrases() if e not in ("!SHELL",)] + [
+            "delete files containing milk", "find files about budget and remove them", "rm files containing milk",
+            "hey, how do i delete files containing milk?"]
+        for phrase in phrases:
+            p = self.plan(phrase)
+            if p and aisha.needs_care(p.command):
+                self.assertTrue(p.destructive, f"{phrase}: {p.command}")
+
+    def test_question_after_greeting_is_only_shown(self):
+        p = self.plan("hey, how do i delete files containing milk?")
+        self.assertTrue(p is None or p.show_only)
+
+    def test_negated_filters(self):
+        cases = {
+            "delete files that haven't been modified in the last 30 days": "-mtime +30",
+            "delete files not modified in the last week": "-mtime +7",
+            "delete files that are not hidden": "-not -name '.*'",
+            "delete files no bigger than 1kb": "-size -1025c",
+            "delete logs no more than a week old": "-mtime -7",
+            "delete log files that are not in src": "-not -path './src/*'",
+        }
+        for phrase, frag in cases.items():
+            p = self.sure(phrase)
+            if p:
+                self.assertIn(frag, p.command, phrase)
+                self.assertTrue(p.destructive, phrase)
+        for phrase in ["find files that are not hidden", "delete files that are not hidden",
+                       "find logs not in src", "find files with no extension"]:
+            p = self.plan(phrase)
+            if p:
+                self.assertNotIn("*not*", p.command, phrase)
+                self.assertNotIn("-e not", p.command, phrase)
+        p = self.plan("just list old logs, not remove them")
+        self.assertFalse(p and p.destructive, p and p.command)
+
+    def test_delete_with_limit_deletes_only_those(self):
+        self.make({f"l{i}.log": "x" * (i * 100) for i in range(1, 6)})
+        p = self.sure("delete the 2 largest log files")
+        self.assertIsNotNone(p)
+        preview = self.run_cmd_in_lab(p.preview).stdout.split()
+        self.assertEqual(sorted(preview), ["./l4.log", "./l5.log"])
+        self.run_cmd_in_lab(p.command)
+        left = sorted(f for f in os.listdir(self.lab) if f.endswith(".log"))
+        self.assertEqual(left, ["l1.log", "l2.log", "l3.log"])
+        self.assertIsNone(self.sure("delete the largest log files"))   # how many? ask the model
+
+    def test_folder_deletes_keep_the_starting_folder(self):
+        os.makedirs(os.path.join(self.lab, "stuff", "e1"))
+        os.makedirs(os.path.join(self.lab, "stuff", "e2"))
+        p = self.sure("delete empty folders in stuff")
+        self.run_cmd_in_lab(p.command)
+        self.assertTrue(os.path.isdir(os.path.join(self.lab, "stuff")))
+        self.assertEqual(os.listdir(os.path.join(self.lab, "stuff")), [])
+
+    def test_named_targets_are_not_widened(self):
+        self.make({"src/__init__.py": "", ".env": "SECRET=1\n", "sub/.env": "x\n", "keep/new.txt": "x\n"})
+        p = self.sure("delete the empty file notes.txt")
+        self.assertTrue(p is None or p.command == "rm -- run1/notes.txt", p and p.command)
+        self.assertIsNone(self.sure("delete the old folder"))           # there is no folder called old
+        os.makedirs(os.path.join(self.lab, "old"))
+        self.assertEqual(self.sure("delete the old folder").command, "rm -r -- old")
+        self.assertEqual(self.sure("delete .env").command, "rm -- .env")
+        self.assertEqual(self.sure("remove the hidden file .env").command, "rm -- .env")
+        self.assertIn("-maxdepth 1", self.sure("delete *.log").command)
+        self.assertIn("-maxdepth 1", self.sure("replace hello with bye in *.md").command)
+
+    def test_past_tense_is_not_an_order(self):
+        for phrase in ["list files that were deleted today", "which files were removed today"]:
+            p = self.plan(phrase)
+            self.assertFalse(p and p.destructive and p.confidence >= self.T, p and p.command)
+
+    def test_quoted_globs_stay_quoted(self):
+        self.make({"old report 1.txt": "", "old report 2.txt": "", "report.pdf": ""})
+        os.makedirs(os.path.join(self.lab, "old"))
+        p = self.sure("move 'old report*' to archive")
+        self.assertIn("'old report'*", p.command)
+        self.assertIsNone(self.sure("back up the pdfs"))
+
+    def test_destinations(self):
+        p = self.plan("move README.md to src and then list src")
+        self.assertTrue(p is None or p.confidence < self.T or "and then" not in p.command, p and p.command)
+        p = self.sure("copy logs.txt to 'my backup.txt' please")
+        self.assertTrue(p is None or p.command.endswith(" 'my backup.txt'"), p and p.command)
+        self.assertNotIn("qlit", (self.plan("rename README.md to old README.md") or aisha.Plan("", "")).command)
+
+    def test_fractional_times(self):
+        self.assertIn("-mtime +75", self.sure("find files older than 2.5 months").command)
+        self.assertIn("-mmin +15120", self.sure("find files older than 1.5 weeks").command)
+        self.assertIn("-mmin -90", self.sure("find files changed in the last 1.5 hours").command)
+
+    def test_content_deletes_are_not_stemmed(self):
+        self.assertIn("-e statement", self.sure("delete files containing statement").command)
+
+    def test_overwrites_are_flagged_or_avoided(self):
+        self.assertIn("--keep-old-files", self.sure("extract data.tar.gz").command if os.path.exists(
+            os.path.join(self.lab, "data.tar.gz")) else "--keep-old-files")
+        self.make({"data.tar.gz": "x"})
+        self.assertIn("--keep-old-files", self.sure("extract data.tar.gz").command)
+        self.assertTrue(self.sure("compress src as README.md").destructive)
+        self.assertTrue(self.sure("download https://example.com/README.md").destructive)
+        for phrase in ["show run.sh in bash", "open README.md in split view"]:
+            p = self.plan(phrase)
+            self.assertFalse(p and p.confidence >= self.T and re.match(r"(bash|split)\b", p.command), p and p.command)
+
+    def test_home_and_root_need_a_real_filter(self):
+        for phrase in ["delete files older than a year in ~/", "delete files older than a year in /home",
+                       "delete everything in my home folder"]:
+            self.assertIsNone(self.sure(phrase), phrase)
+
+    def test_places_are_not_targets(self):
+        for phrase in ["delete files older than a year in ~/", "delete everything in ~", "remove ~/",
+                       "delete the folder .", "rm -r from /home", "delete files in /"]:
+            p = self.plan(phrase)
+            self.assertFalse(p and re.match(r"rm\b", p.command), f"{phrase}: {p and p.command}")
+        self.assertIn("-not -name '*.*'", self.sure("delete files without an extension").command)
+
+    def test_misc(self):
+        self.assertIsNone(self.sure("convert the .wav files to .mp3"))
+        p = self.sure("rename python files to txt")
+        self.assertTrue(p is None or "*.py;" in p.command, p and p.command)
+        self.assertIn("-not -name '*.*'", self.sure("find files without an extension").command)
+        p = self.plan("remove the app folder")
+        self.assertFalse(p and "apt" in p.command)
