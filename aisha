@@ -31,6 +31,7 @@ Standard library only. Python 3.10+.
 
 from __future__ import annotations
 
+import atexit
 import glob as globmod
 import json
 import os
@@ -41,8 +42,11 @@ import signal
 import subprocess
 import sys
 import tempfile
+import termios
 import time
+import platform
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
@@ -63,6 +67,8 @@ DEFAULTS = {
     "llm_timeout": 60,                      # seconds; CPU models can be slow to load
     "threshold": 0.7,                       # rules below this confidence go to the LLM
     "confirm": "llm",                       # llm | always | destructive
+    "llm_server": "",                       # llama-server binary aisha starts on demand
+    "llm_model_file": "",                   # .gguf model for llm_server
 }
 ENV_KEYS = {
     "llm": "AISHA_LLM",
@@ -72,7 +78,24 @@ ENV_KEYS = {
     "llm_timeout": "AISHA_LLM_TIMEOUT",
     "threshold": "AISHA_THRESHOLD",
     "confirm": "AISHA_CONFIRM",
+    "llm_server": "AISHA_LLM_SERVER",
+    "llm_model_file": "AISHA_LLM_MODEL_FILE",
 }
+
+
+def save_config(updates: dict) -> None:
+    try:
+        with open(CFG_FILE) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    data.update(updates)
+    data = {k: v for k, v in data.items() if v is not None}
+    os.makedirs(CFG_DIR, exist_ok=True)
+    tmp = CFG_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+    os.replace(tmp, CFG_FILE)
 
 
 def load_config() -> dict:
@@ -1315,9 +1338,13 @@ def h_read(u: Utterance) -> Plan | None:
         cmd, intent = f"{program[0]} {q}", "open"
         why.append(f"with {program[0]}")
     elif verb == "open" and not is_text(os.path.join(u.cwd, os.path.expanduser(path))):
-        cmd, intent = f"xdg-open {q}", "open"
-        reqs.append(("xdg-open", "xdg-utils"))
-        why.append("with the default app")
+        intent = "open"
+        if shutil.which("xdg-open") and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            cmd = f"xdg-open {q}"
+            why.append("with the default app")
+        else:
+            cmd = f"ls -l -- {q}"
+            why.append("no desktop session to open it in; showing the file instead")
     else:
         long = line_count(os.path.join(u.cwd, os.path.expanduser(path))) > 200
         cmd, intent = (f"less -FRX {q}", "show file") if long else (f"cat {q}", "show file")
@@ -1532,17 +1559,18 @@ def h_archive(u: Utterance) -> Plan | None:
             return None
         u.text = " " * len(u.text)
         use_zip = m.group(1).startswith("zip") or (m.group(3) or "").endswith(".zip")
+        zipper = "zip -r" if shutil.which("zip") else "python3 -m zipfile -c"
         if src in (".", "./"):
             base = os.path.basename(u.cwd.rstrip("/")) or "archive"
             dest = m.group(3) and u.lit(u.o(m, 3)) or f"../{base}" + (".zip" if use_zip else ".tar.gz")
-            cmd = (f"zip -r {qpath(dest)} ." if use_zip else
+            cmd = (f"{zipper} {qpath(dest)} ." if use_zip else
                    f"tar -czf {qpath(dest)} -C .. {shlex.quote(base)}")
         else:
             stemname = src.rstrip("/")
             dest = m.group(3) and u.lit(u.o(m, 3)) or stemname + (".zip" if use_zip else ".tar.gz")
-            cmd = (f"zip -r {qpath(dest)} {qpath(src)}" if use_zip else
+            cmd = (f"{zipper} {qpath(dest)} {qpath(src)}" if use_zip else
                    f"tar -czf {qpath(dest)} {qpath(src)}")
-        return require(Plan(cmd, "compress", [f"{src} → {dest}"]), [("zip", "zip")] if use_zip else [])
+        return Plan(cmd, "compress", [f"{src} → {dest}"])
     m = u.peek(r"\b(?:extract|unzip|unpack|decompress|uncompress|untar|open\s+up)\s+(\S+)(?:\s+(?:to|into|in)\s+(\S+))?")
     if not m:
         return None
@@ -1554,8 +1582,10 @@ def h_archive(u: Utterance) -> Plan | None:
     low = src.lower()
     reqs = []
     if low.endswith(".zip"):
-        reqs = [("unzip", "unzip")]
-        cmd = f"unzip {qpath(src)}" + (f" -d {qpath(dest)}" if dest else "")
+        if shutil.which("unzip"):
+            cmd = f"unzip {qpath(src)}" + (f" -d {qpath(dest)}" if dest else "")
+        else:
+            cmd = f"python3 -m zipfile -e {qpath(src)} {qpath(dest or '.')}"
     elif re.search(r"\.(tar(\.(gz|bz2|xz|zst))?|tgz|tbz2|txz)$", low):
         cmd = (f"mkdir -p -- {qpath(dest)} && " if dest else "") + f"tar -xf {qpath(src)}" + (f" -C {qpath(dest)}" if dest else "")
     elif low.endswith(".gz"):
@@ -1599,7 +1629,24 @@ def h_pwd(u: Utterance) -> Plan | None:
     return None
 
 
-SYSTEM = [  # (pattern, command, label)
+# Fallbacks use only the base system and Python's standard library, so a
+# minimal Debian without procps/iproute2 still gets an answer.
+PORTS_PY = ("python3 -c 'import os, itertools as i; [print(f[10:], int(l.split()[1].rsplit(\":\", 1)[1], 16)) "
+            "for f in (\"/proc/net/tcp\", \"/proc/net/tcp6\") if os.path.exists(f) "
+            "for l in i.islice(open(f), 1, None) if l.split()[3] == \"0A\"]' | sort -u")
+
+
+def first_available(cmd):
+    """A command string, or [(tool, command), ...]: the first whose tool exists."""
+    if isinstance(cmd, str):
+        return cmd
+    for tool, alt in cmd:
+        if tool is None or shutil.which(tool):
+            return alt
+    return cmd[-1][1]
+
+
+SYSTEM = [  # (pattern, command or alternatives, label)
     (r"\b(?:what|which)\s+(?:is|are|processes?|programs?|apps?)?\s*(?:using|uses?|eating|eats|hogging|consuming|taking)\s+(?:up\s+)?"
      r"(?:the\s+most\s+|all\s+(?:the\s+|my\s+)?|so\s+much\s+|my\s+)?(?:memory|ram)\b|\bmemory\s+hogs?\b|"
      r"\b(?:top\s+)?processes\s+(?:by|sorted\s+by|using\s+the\s+most)\s+(?:memory|ram)\b",
@@ -1610,21 +1657,24 @@ SYSTEM = [  # (pattern, command, label)
      "ps aux --sort=-%cpu | head -n 11", "top processes by CPU"),
     (r"\bhow\s+many\s+(?:cpus?|cores|processors|threads)\b|\bnumber\s+of\s+(?:cores|cpus)\b", "nproc", "CPU cores"),
     (r"\bhow\s+many\s+processes\b", "ps -e --no-headers | wc -l", "process count"),
-    (r"\b(?:free|available|used|how\s+much)?\s*(?:memory|ram)\b(?:\s+(?:is\s+)?(?:free|left|available|used|usage))?", "free -h", "memory"),
+    (r"\b(?:free|available|used|how\s+much)?\s*(?:memory|ram)\b(?:\s+(?:is\s+)?(?:free|left|available|used|usage))?", [("free", "free -h"),
+      (None, "grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree):' /proc/meminfo")], "memory"),
     (r"\b(?:cpu|processor)\s*(?:info|information|details|model|type)?\b|\bwhat\s+(?:cpu|processor)\b", "lscpu", "CPU info"),
     (r"\buptime\b|\bhow\s+long\s+(?:has|have)\s+(?:the\s+|this\s+)?(?:system|computer|machine|server|it)\s+been\s+(?:up|running|on)\b",
-     "uptime", "uptime"),
+     [("uptime", "uptime"),
+      (None, "awk '{printf \"up %d days, %d:%02d\\n\", $1/86400, $1%86400/3600, $1%3600/60}' /proc/uptime")], "uptime"),
     (r"\b(?:os|operating\s+system|distro|distribution|linux)\s+(?:version|release|name|info)\b|"
      r"\bwhat\s+(?:os|linux|distro|operating\s+system)\b|\bkernel(?:\s+version)?\b|\bwhich\s+(?:os|linux|distro)\b",
      "uname -sr && grep -E '^(PRETTY_NAME|VERSION)=' /etc/os-release", "OS and kernel"),
-    (r"\b(?:public|external)\s+ip\b", "curl -s https://ifconfig.me; echo", "public IP (asks ifconfig.me)"),
-    (r"\b(?:my\s+|the\s+|local\s+)?ip(?:\s+address(?:es)?)?\b|\bnetwork\s+interfaces?\b", "ip -br addr", "network addresses"),
+    (r"\b(?:public|external)\s+ip\b", "python3 -c 'import urllib.request as u; print(u.urlopen(\"https://ifconfig.me/ip\", timeout=10).read().decode())'",
+     "public IP (asks ifconfig.me)"),
+    (r"\b(?:my\s+|the\s+|local\s+)?ip(?:\s+address(?:es)?)?\b|\bnetwork\s+interfaces?\b", [("ip", "ip -br addr"), (None, "hostname -I")], "network addresses"),
     (r"\b(?:open|listening|used)\s+ports?\b|\bports?\s+(?:that\s+are\s+)?(?:open|listening|in\s+use)\b|\bwhat\s+is\s+listening\b",
-     "ss -tulpn", "listening ports"),
+     [("ss", "ss -tulpn"), (None, PORTS_PY)], "listening ports"),
     (r"\bwho\s+am\s+i\b|\bmy\s+(?:user\s*name|user|login)\b|\bwhich\s+user\b|\bcurrent\s+user\b", "whoami", "current user"),
     (r"\bwho\s+(?:else\s+)?is\s+(?:logged\s+in|online|on)\b|\blogged[- ]in\s+users\b", "who", "logged-in users"),
     (r"\bwhat\s+day\s+is\s+(?:it|today)\b|\b(?:the\s+)?(?:date|time)(?:\s+is\s+it)?\b|\btoday's\s+date\b", "date", "date and time"),
-    (r"\bcalendar\b", "cal", "calendar"),
+    (r"\bcalendar\b", [("cal", "cal"), (None, "python3 -m calendar $(date '+%Y %-m')")], "calendar"),
     (r"\bhost\s*name\b|\b(?:computer|machine)\s+name\b", "hostname", "hostname"),
     (r"\b(?:usb\s+)?(?:drives|disks|partitions|block\s+devices|usb\s+sticks?|usb\s+devices)\b|\bmounted\s+(?:drives|disks|file\s*systems)\b|\bwhat\s+is\s+mounted\b",
      "lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT", "drives and partitions"),
@@ -1640,7 +1690,7 @@ def h_system(u: Utterance) -> Plan | None:
     for pat, cmd, label in SYSTEM:
         if u.take(pat):
             u.text = re.sub(SYSTEM_FILLER, lambda m: " " * len(m.group(0)), u.text)
-            return finish(u, Plan(cmd, "system", [label]))
+            return finish(u, Plan(first_available(cmd), "system", [label]))
     return None
 
 
@@ -1856,8 +1906,9 @@ PREFER_RULES = {"edit", "open", "view"}
 
 
 def looks_like_shell(line: str, path_env: str | None = None, cwd: str | None = None,
-                     threshold: float = DEFAULTS["threshold"]) -> bool:
-    if not _looks_like_shell(line, path_env):
+                     threshold: float = DEFAULTS["threshold"], known: set | None = None) -> bool:
+    """known: alias and function names, which count as commands."""
+    if not _looks_like_shell(line, path_env, known or set()):
         return False
     # A command word followed by plain words: let the rules have a go first.
     try:
@@ -1880,9 +1931,18 @@ def looks_like_shell(line: str, path_env: str | None = None, cwd: str | None = N
     return True
 
 
-def _looks_like_shell(line: str, path_env: str | None = None) -> bool:
-    if re.match(r"^\s*(?:[A-Za-z_]\w*=\S*\s*)+$", line):
-        return True  # FOO=bar
+SHELL_SYNTAX = re.compile(
+    r"""^\s*(?: function\s+[\w.:-]+      # function f
+              | [\w.:-]+\s*\(\)\s*\{?  # f() {
+              | [({]\s                   # ( subshell ) / { group; }
+              | \[\[?\s                  # [ test ] / [[ test ]]
+              | [A-Za-z_]\w*(?:\[[^]]*\])?\+?=  # FOO=bar, arr[1]=x, PATH+=:x
+              )""", re.VERBOSE)
+
+
+def _looks_like_shell(line: str, path_env: str | None = None, known: set = frozenset()) -> bool:
+    if SHELL_SYNTAX.match(line):
+        return True
     try:
         toks = shlex.split(line)
     except ValueError:
@@ -1891,6 +1951,8 @@ def _looks_like_shell(line: str, path_env: str | None = None) -> bool:
         return False
     first = toks[0]
     if first.startswith(("./", "/", "~/", "../")):
+        return True
+    if first in known:
         return True
     if first not in SHELL_BUILTINS and not shutil.which(first, path=path_env):
         return False
@@ -1935,9 +1997,118 @@ class LLMError(Exception):
     pass
 
 
+# ---- local model runtime ---------------------------------------------------------
+# The only optional extra aisha uses is a model. `aisha --setup` either reuses
+# a server you already run (Ollama, llama-server, LM Studio) or downloads
+# llama.cpp's llama-server and a small Qwen coder model, which aisha then
+# starts on demand and stops when it exits.
+
+DATA_DIR = os.path.join(os.path.expanduser(os.environ.get("XDG_DATA_HOME") or "~/.local/share"), "aisha")
+MANAGED_PORT = 18431
+MODELS = {  # size -> (Hugging Face repo, file, approximate download)
+    "0.5b": ("Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF", "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf", "0.4 GB"),
+    "1.5b": ("Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF", "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf", "1.1 GB"),
+    "3b": ("Qwen/Qwen2.5-Coder-3B-Instruct-GGUF", "qwen2.5-coder-3b-instruct-q4_k_m.gguf", "2.0 GB"),
+}
+LLAMA_RELEASES = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+USER_AGENT = f"aisha/{VERSION}"
+
+
+def is_local_url(url: str) -> bool:
+    host = urllib.parse.urlsplit(url).hostname or ""
+    return host in ("localhost", "127.0.0.1", "::1") or host.startswith("127.")
+
+
+def url_open(req, timeout: float):
+    """urlopen that never sends local requests through an HTTP proxy."""
+    url = req.full_url if isinstance(req, urllib.request.Request) else req
+    if is_local_url(url):
+        return urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def server_env(server: str) -> dict:
+    env = dict(os.environ)
+    libdir = os.path.dirname(os.path.realpath(server))
+    env["LD_LIBRARY_PATH"] = libdir + (":" + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else "")
+    return env
+
+
+class Runtime:
+    """llama-server, started on first use and stopped when aisha exits."""
+
+    def __init__(self, cfg: dict):
+        self.cfg = cfg
+        self.proc: subprocess.Popen | None = None
+
+    @property
+    def configured(self) -> bool:
+        server, model = self.cfg.get("llm_server"), self.cfg.get("llm_model_file")
+        return bool(server and model and os.path.isfile(server) and os.path.isfile(model)
+                    and is_local_url(self.cfg["llm_url"]))
+
+    @property
+    def port(self) -> int:
+        return urllib.parse.urlsplit(self.cfg["llm_url"]).port or MANAGED_PORT
+
+    def running(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def start(self) -> None:
+        if self.running():
+            return
+        os.makedirs(DATA_DIR, exist_ok=True)
+        log_path = os.path.join(DATA_DIR, "llama-server.log")
+        server = self.cfg["llm_server"]
+        args = [server, "-m", self.cfg["llm_model_file"], "--host", "127.0.0.1",
+                "--port", str(self.port), "-c", "4096"]
+        with open(log_path, "ab") as log:
+            self.proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                         env=server_env(server), start_new_session=True)
+        atexit.register(self.stop)
+        deadline = time.time() + max(30.0, self.cfg["llm_timeout"])
+        health = f"http://127.0.0.1:{self.port}/health"
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                raise LLMError(f"llama-server stopped (exit {self.proc.returncode}); "
+                               f"last lines of {log_path}:\n{tail_file(log_path)}")
+            try:
+                with url_open(health, timeout=2) as r:
+                    if r.status == 200:
+                        return
+            except urllib.error.HTTPError:
+                pass  # 503 while the model loads
+            except (urllib.error.URLError, OSError):
+                pass
+            time.sleep(0.3)
+        self.stop()
+        raise LLMError(f"llama-server did not become ready in time (see {log_path})")
+
+    def stop(self) -> None:
+        if self.running():
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        self.proc = None
+
+
+def tail_file(path: str, n: int = 8) -> str:
+    try:
+        with open(path, errors="replace") as f:
+            return "".join(f.readlines()[-n:]).rstrip()
+    except OSError:
+        return ""
+
+
+
+
 class LLM:
     def __init__(self, cfg: dict):
         self.cfg = cfg
+        self.runtime = Runtime(cfg)
+        self._hinted = False
 
     @property
     def enabled(self) -> bool:
@@ -1945,6 +2116,8 @@ class LLM:
 
     @property
     def label(self) -> str:
+        if self.runtime.configured:
+            return f"{self.cfg['llm_model']} (local llama.cpp, starts when needed)"
         return f"{self.cfg['llm_model']} at {self.cfg['llm_url']}"
 
     def _post(self, messages: list[dict]) -> str:
@@ -1956,8 +2129,16 @@ class LLM:
             headers["Authorization"] = f"Bearer {self.cfg['llm_key']}"
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=self.cfg["llm_timeout"]) as r:
-                data = json.load(r)
+            try:
+                with url_open(req, timeout=self.cfg["llm_timeout"]) as r:
+                    data = json.load(r)
+            except urllib.error.URLError as e:
+                if isinstance(e, urllib.error.HTTPError) or not self.runtime.configured or self.runtime.running():
+                    raise
+                say(dim(f"… starting the local model ({os.path.basename(self.cfg['llm_model_file'])})"))
+                self.runtime.start()
+                with url_open(req, timeout=self.cfg["llm_timeout"]) as r:
+                    data = json.load(r)
         except urllib.error.HTTPError as e:
             detail = e.read().decode(errors="replace")[:300]
             if e.code == 404 and "model" in detail.lower():
@@ -1966,8 +2147,9 @@ class LLM:
             raise LLMError(f"LLM server returned HTTP {e.code}: {detail}") from None
         except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
             reason = getattr(e, "reason", e)
-            raise LLMError(f"no LLM reachable at {self.cfg['llm_url']} ({reason}). "
-                           f"Start one with: ollama serve & ollama pull {self.cfg['llm_model']}") from None
+            hint = "" if self._hinted else " Run 'aisha --setup' to add a local model."
+            self._hinted = True
+            raise LLMError(f"no LLM reachable at {self.cfg['llm_url']} ({reason}).{hint}") from None
         try:
             return data["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError, TypeError):
@@ -2102,25 +2284,90 @@ HELP = """aisha — type bash, or say what you want.
 """
 
 
+AISHARC = os.path.join(CFG_DIR, "aisharc")
+RC_FILES = ["~/.bash_aliases", AISHARC]
+
+
+class ExitShell(Exception):
+    def __init__(self, code: int = 0):
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass
+class Job:
+    num: int
+    pid: int
+    cmd: str
+    state: str = "running"          # running | stopped | done
+    files: tuple = ()
+    tmodes: list | None = None      # terminal settings to restore on fg
+
+
+# Commands that take over the terminal and then hand it back as-is.
+RISKY_RE = re.compile(
+    r"""\bsudo\b | \bsu\s | \b(?:reboot|shutdown|poweroff|halt)\b | \bchmod\s+-R\b | \bchown\b
+      | \b(?:curl|wget)\b[^|]*\|\s*(?:sudo\s+)?(?:ba|z|da)?sh\b | \bkill\s+-9\b | \bkillall\b
+      | \bsystemctl\s+(?:stop|disable|mask|restart)\b | \bcrontab\s+-r\b | \bpasswd\b
+      | \buser(?:del|mod)\b | \bapt(?:-get)?\s+(?:remove|purge|autoremove)\b
+      | >\s*/etc/ | \bmv\b[^|;&]*\s/dev/null\b | :\(\)\s*\{""",
+    re.VERBOSE,
+)
+
+
+def needs_care(cmd: str) -> bool:
+    return looks_destructive(cmd) or bool(RISKY_RE.search(cmd))
+
+
 class Shell:
-    def __init__(self, cfg: dict, dry_run: bool = False):
+    def __init__(self, cfg: dict, dry_run: bool = False, interactive: bool = False):
         self.cfg = cfg
         self.dry_run = dry_run
-        self.cwd = os.getcwd()
+        try:
+            self.cwd = os.getcwd()
+        except OSError:
+            self.cwd = os.path.expanduser("~")
         self.env = dict(os.environ)
         self.env["AISHA"] = VERSION
         self.rc = 0
         self.memory = Memory(LEARNED_FILE)
         self.llm = LLM(cfg)
+        self.jobs: list[Job] = []
+        self.names: set[str] = set()        # aliases and functions, for shell detection
+        self.tty = sys.stdin.fileno() if interactive and sys.stdin.isatty() else None
+        self.workdir = tempfile.mkdtemp(prefix="aisha-")
+        self.defs_file = os.path.join(self.workdir, "defs.sh")
+        self._seq = 0
+        self._exit_warned = False
+        self._cmd_cache: tuple | None = None
+        atexit.register(shutil.rmtree, self.workdir, True)
+        if self.tty is not None:
+            for sig in (signal.SIGTSTP, signal.SIGTTOU, signal.SIGTTIN, signal.SIGQUIT):
+                signal.signal(sig, signal.SIG_IGN)
+        self.load_rc()
+
+    def load_rc(self) -> None:
+        """Aliases, functions and exports from ~/.bash_aliases and aisharc."""
+        files = [os.path.expanduser(f) for f in RC_FILES if os.path.isfile(os.path.expanduser(f))]
+        if files:
+            self.run(" ".join(f". {shlex.quote(f)}" for f in files), track=False)
 
     # -- entry point for one line
     def handle(self, line: str) -> int:
         line = line.strip()
         if not line or line.startswith("#"):
             return self.rc
-        word = line.split()[0]
-        if line in ("exit", "quit", "logout", "bye"):
-            raise EOFError
+        try:
+            toks = shlex.split(line)
+        except ValueError:
+            toks = line.split()
+        word = toks[0] if toks else ""
+        if word in ("exit", "quit", "logout", "bye") and len(toks) <= 2:
+            if any(j.state == "stopped" for j in self.jobs) and not self._exit_warned:
+                self._exit_warned = True
+                say("There are stopped jobs. ('exit' again to leave anyway)")
+                return 1
+            raise ExitShell(int(toks[1]) if len(toks) == 2 and toks[1].isdigit() else self.rc)
         if line in ("help", "?"):
             say(HELP)
             return 0
@@ -2137,6 +2384,8 @@ class Shell:
             return self.llm_status()
         if line == "history":
             return self.show_history()
+        if word in ("jobs", "fg", "bg") and len(toks) <= 2:
+            return getattr(self, "job_" + word)(toks[1] if len(toks) == 2 else None)
         if word == "explain":
             saved, self.dry_run = self.dry_run, True
             try:
@@ -2144,22 +2393,28 @@ class Shell:
             finally:
                 self.dry_run = saved
         if line.startswith("!"):
-            self.rc = self.run(line[1:].strip())
+            self.rc = self.run_line(line[1:].strip())
             return self.rc
         if line.startswith("?"):
             self.rc = self.via_llm(line[1:].strip(), interpret(line[1:].strip(), self.cwd))
             return self.rc
-        if looks_like_shell(line, self.env.get("PATH"), self.cwd, self.cfg["threshold"]):
-            self.rc = self.run(line)
+        if looks_like_shell(line, self.env.get("PATH"), self.cwd, self.cfg["threshold"], self.names):
+            self.rc = self.run_line(line)
             return self.rc
         self.rc = self.natural(line)
         return self.rc
+
+    def run_line(self, line: str) -> int:
+        m = re.fullmatch(r"(.*?[^&])\s*&\s*", line)    # "cmd &" but not "a && b"
+        if m and self.tty is not None:
+            return self.run(m.group(1), background=True)
+        return self.run(line)
 
     def natural(self, line: str) -> int:
         remembered = self.memory.get(line)
         if remembered:
             plan = Plan(remembered, "remembered", ["you approved this before"], source="learned",
-                        destructive=looks_destructive(remembered))
+                        destructive=needs_care(remembered))
             return self.execute(plan)
         plan = interpret(line, self.cwd)
         if plan and plan.confidence >= self.cfg["threshold"]:
@@ -2170,7 +2425,7 @@ class Shell:
             say(yellow("not sure I understood — best guess:"))
             plan.source = "guess"
             return self.execute(plan)
-        say(yellow("I don't know how to do that yet.") + dim(" (no LLM configured: aisha --setup)"))
+        say(yellow("I don't know how to do that yet.") + dim(" (no LLM set up: aisha --setup)"))
         return 1
 
     def via_llm(self, line: str, partial: Plan | None) -> int:
@@ -2197,9 +2452,10 @@ class Shell:
             say(yellow("that does not look like something a shell command can do."))
             return 1
         plan = Plan(cmd, "llm", [f"{self.cfg['llm_model']}, {time.time() - t0:.1f}s"], source="llm",
-                    destructive=looks_destructive(cmd))
-        rc = self.execute(plan, phrase=line)
-        return rc
+                    destructive=needs_care(cmd))
+        if plan.destructive and not looks_destructive(cmd):
+            plan.warning = "! this needs extra privileges or changes the system"
+        return self.execute(plan, phrase=line)
 
     # -- showing and running a plan
     def execute(self, plan: Plan, phrase: str | None = None) -> int:
@@ -2241,36 +2497,127 @@ class Shell:
         if len(lines) > 10:
             say(dim(f"  … and {len(lines) - 10} more"))
 
-    def run(self, cmd: str) -> int:
-        """Run in bash; keep cd and export effects for the next line."""
-        fd, state = tempfile.mkstemp(prefix="aisha-state-")
-        os.close(fd)
-        script = ("__aisha_save() { local rc=$?; { printf '%s\\0' \"$PWD\"; env -0; } "
-                  "> \"$__AISHA_STATE\" 2>/dev/null; exit $rc; }\n"
-                  "trap __aisha_save EXIT\n"
-                  "shopt -s globstar extglob 2>/dev/null\n"
-                  f"{cmd}\n")
-        env = dict(self.env, __AISHA_STATE=state, PWD=self.cwd)
-        old = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # -- running bash, keeping cd/export/alias/function effects
+    SCRIPT_HEAD = (
+        '__aisha_state=$1 __aisha_defs=$2 __aisha_out=$3; set --\n'
+        '__aisha_save() { local rc=$?; { printf "%s\\0" "$PWD"; env -0; } > "$__aisha_state" 2>/dev/null; '
+        '{ alias -p; declare -f; } > "$__aisha_out" 2>/dev/null; exit $rc; }\n'
+        'trap __aisha_save EXIT\n'
+        'shopt -s globstar extglob expand_aliases 2>/dev/null\n'
+        '[ -r "$__aisha_defs" ] && . "$__aisha_defs"\n'
+    )
+
+    def run(self, cmd: str, background: bool = False, track: bool = True) -> int:
+        self._seq += 1
+        state = os.path.join(self.workdir, f"state-{self._seq}")
+        defs_out = os.path.join(self.workdir, f"defs-{self._seq}")
+        script = self.SCRIPT_HEAD + cmd + "\n"
+        env = dict(self.env, PWD=self.cwd)
+        job_control = self.tty is not None
+        tmodes = self._tmodes()
+        pid = os.fork()
+        if pid == 0:  # child
+            try:
+                if job_control:
+                    os.setpgid(0, 0)
+                for sig in (signal.SIGINT, signal.SIGQUIT, signal.SIGTSTP, signal.SIGTTIN,
+                            signal.SIGTTOU, signal.SIGPIPE, signal.SIGXFSZ, signal.SIGCHLD):
+                    signal.signal(sig, signal.SIG_DFL)
+                try:
+                    os.chdir(self.cwd)
+                except OSError:
+                    os.chdir("/")
+                os.execvpe("bash", ["bash", "-c", script, "aisha", state, self.defs_file, defs_out], env)
+            except BaseException:
+                pass
+            os._exit(127)
+        job = Job(self._next_job_num(), pid, cmd, files=(state, defs_out))
+        if job_control:
+            try:
+                os.setpgid(pid, pid)
+            except OSError:
+                pass
+        if background:
+            self.jobs.append(job)
+            say(f"[{job.num}] {pid}")
+            return 0
+        if job_control:
+            self._give_terminal(pid)
+        rc = self._wait(job, tmodes)
+        if job.state == "done":
+            if track:
+                self._apply_state(state, defs_out)
+            self._cleanup(job)
+        return rc
+
+    def _wait(self, job: Job, tmodes) -> int:
+        old = None if self.tty is not None else signal.signal(signal.SIGINT, signal.SIG_IGN)
+        rc = 0
         try:
-            r = subprocess.run(["bash", "-c", script], cwd=self.cwd, env=env,
-                               preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
-            rc = r.returncode
-        except FileNotFoundError:
-            say(red("bash not found"))
-            return 127
+            while True:
+                try:
+                    _, status = os.waitpid(job.pid, os.WUNTRACED if self.tty is not None else 0)
+                except InterruptedError:
+                    continue
+                except ChildProcessError:
+                    job.state = "done"
+                    break
+                if os.WIFSTOPPED(status):
+                    job.state = "stopped"
+                    job.tmodes = self._tmodes()
+                    if job not in self.jobs:
+                        self.jobs.append(job)
+                    rc = 128 + os.WSTOPSIG(status)
+                    say(f"\n[{job.num}]+  Stopped                 {job.cmd}")
+                    break
+                rc = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 128 + os.WTERMSIG(status)
+                job.state = "done"
+                break
         finally:
-            signal.signal(signal.SIGINT, old)
+            if old is not None:
+                signal.signal(signal.SIGINT, old)
+            if self.tty is not None:
+                self._give_terminal(os.getpgrp())
+                self._restore_tmodes(tmodes)
+        return rc
+
+    def _tmodes(self):
+        if self.tty is None:
+            return None
+        try:
+            return termios.tcgetattr(self.tty)
+        except termios.error:
+            return None
+
+    def _restore_tmodes(self, modes) -> None:
+        if self.tty is not None and modes:
+            try:
+                termios.tcsetattr(self.tty, termios.TCSADRAIN, modes)
+            except termios.error:
+                pass
+
+    def _give_terminal(self, pgid: int) -> None:
+        try:
+            os.tcsetpgrp(self.tty, pgid)
+        except OSError:
+            pass
+
+    def _next_job_num(self) -> int:
+        return max((j.num for j in self.jobs), default=0) + 1
+
+    def _cleanup(self, job: Job) -> None:
+        for f in job.files:
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+
+    def _apply_state(self, state: str, defs_out: str) -> None:
         try:
             with open(state, "rb") as f:
                 raw = f.read()
         except OSError:
             raw = b""
-        finally:
-            try:
-                os.unlink(state)
-            except OSError:
-                pass
         if raw:
             parts = raw.split(b"\0")
             new_cwd = parts[0].decode(errors="replace")
@@ -2279,17 +2626,104 @@ class Shell:
                 if b"=" in item:
                     k, v = item.split(b"=", 1)
                     new_env[k.decode(errors="replace")] = v.decode(errors="replace")
-            for k in ("__AISHA_STATE", "_", "SHLVL", "BASHOPTS", "SHELLOPTS"):
+            for k in ("_", "SHLVL", "BASHOPTS", "SHELLOPTS"):
                 new_env.pop(k, None)
             if new_env:
                 self.env = new_env
             if new_cwd and os.path.isdir(new_cwd) and new_cwd != self.cwd:
                 self.env["OLDPWD"] = self.cwd
                 self.cwd = new_cwd
-        if rc < 0:
-            rc = 128 - rc
-        return rc
+        try:
+            with open(defs_out, encoding="utf-8", errors="replace") as f:
+                defs = f.read()
+        except OSError:
+            return
+        # keep everything but our own helper function
+        defs = re.sub(r"(?ms)^__aisha_\w+ \(\) \n\{.*?^\}\n?", "", defs)
+        with open(self.defs_file, "w") as f:
+            f.write(defs)
+        self.names = set(re.findall(r"(?m)^alias ([^=\s]+)=", defs)) | \
+            {n for n in re.findall(r"(?m)^(\S+) \(\) $", defs) if not n.startswith("__aisha")}
 
+    # -- jobs
+    def _pick_job(self, spec: str | None, want: tuple = ("stopped", "running")) -> Job | None:
+        self.reap(quiet=True)
+        jobs = [j for j in self.jobs if j.state in want]
+        if spec:
+            n = spec.lstrip("%")
+            jobs = [j for j in jobs if str(j.num) == n or j.cmd.split()[0] == n]
+        if not jobs:
+            say(f"{'fg' if 'running' in want else 'bg'}: no such job")
+            return None
+        return jobs[-1]
+
+    def job_jobs(self, _arg=None) -> int:
+        self.reap()
+        for j in self.jobs:
+            say(f"[{j.num}]{'+' if j is self.jobs[-1] else ' '}  {j.state.capitalize():<22}  {j.cmd}")
+        return 0
+
+    def job_fg(self, spec: str | None) -> int:
+        if self.tty is None:
+            say("fg: no job control in this shell")
+            return 1
+        job = self._pick_job(spec)
+        if not job:
+            return 1
+        say(job.cmd)
+        tmodes = self._tmodes()
+        self._give_terminal(job.pid)
+        self._restore_tmodes(job.tmodes)
+        try:
+            os.killpg(job.pid, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+        job.state = "running"
+        self.rc = self._wait(job, tmodes)
+        if job.state == "done":
+            self.jobs.remove(job)
+            self._cleanup(job)
+        return self.rc
+
+    def job_bg(self, spec: str | None) -> int:
+        job = self._pick_job(spec, ("stopped",))
+        if not job:
+            return 1
+        try:
+            os.killpg(job.pid, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+        job.state = "running"
+        say(f"[{job.num}]+ {job.cmd} &")
+        return 0
+
+    def reap(self, quiet: bool = False) -> None:
+        for job in list(self.jobs):
+            try:
+                pid, status = os.waitpid(job.pid, os.WNOHANG | os.WUNTRACED | os.WCONTINUED)
+            except ChildProcessError:
+                pid, status = job.pid, 0
+            if pid == 0:
+                continue
+            if os.WIFSTOPPED(status):
+                job.state = "stopped"
+            elif os.WIFCONTINUED(status):
+                job.state = "running"
+            else:
+                self.jobs.remove(job)
+                self._cleanup(job)
+                if not quiet:
+                    say(f"[{job.num}]+  Done                    {job.cmd}")
+
+    def hangup_jobs(self) -> None:
+        for job in self.jobs:
+            for sig in (signal.SIGHUP, signal.SIGCONT):
+                try:
+                    os.killpg(job.pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    pass
+
+    # -- misc builtins
     def llm_status(self) -> int:
         if not self.llm.enabled:
             say("LLM: off")
@@ -2338,14 +2772,19 @@ class Shell:
             except OSError:
                 pass
             readline.set_history_length(5000)
-            readline.set_completer_delims(" \t\n;|&><")
+            readline.set_completer_delims(" \t\n;|&><=")
             readline.set_completer(self.complete)
-            readline.parse_and_bind("tab: complete")
+            if "libedit" in (readline.__doc__ or "") or getattr(readline, "backend", "") == "editline":
+                readline.parse_and_bind("bind ^I rl_complete")
+            else:
+                readline.parse_and_bind("tab: complete")
         except ImportError:
             readline = None
         llm = self.llm.label if self.llm.enabled else "off"
         say(dim(f"aisha {VERSION} — type bash or plain words. 'help' for examples. LLM fallback: {llm}"))
-        while True:
+        code = None
+        while code is None:
+            self.reap()
             try:
                 line = input(self.prompt())
             except EOFError:
@@ -2356,68 +2795,312 @@ class Shell:
                 continue
             try:
                 self.handle(line)
-            except EOFError:
-                break
+            except ExitShell as e:
+                code = e.code
             except KeyboardInterrupt:
                 say("^C")
+            except Exception as e:  # never lose the session to a bug
+                say(red(f"aisha: internal error: {type(e).__name__}: {e}"))
+                if os.environ.get("AISHA_DEBUG"):
+                    import traceback
+                    traceback.print_exc()
+                self.rc = 1
+        self.hangup_jobs()
         if readline:
             try:
                 readline.write_history_file(HISTORY_FILE)
             except OSError:
                 pass
-        return self.rc
+        return self.rc if code is None else code
 
     def complete(self, text: str, state: int):
+        if state == 0:
+            self._matches = self._completions(text)
+        return self._matches[state] if state < len(self._matches) else None
+
+    def _completions(self, text: str) -> list[str]:
+        try:
+            import readline
+            before = readline.get_line_buffer()[:readline.get_begidx()]
+        except (ImportError, AttributeError):
+            before = ""
+        first_word = not before.strip() or re.search(r"(?:\|\||&&|[|;&!(])\s*$", before)
+        if first_word and not text.startswith(("/", ".", "~")) and "/" not in text:
+            return sorted(n for n in self._command_names() if n.startswith(text))[:300]
         base = os.path.expanduser(text)
         pattern = (base if os.path.isabs(base) else os.path.join(self.cwd, base)) + "*"
-        matches = []
+        out = []
         for m in sorted(globmod.glob(pattern)):
             shown = m if os.path.isabs(base) else os.path.relpath(m, self.cwd)
             if text.startswith("~"):
                 shown = "~" + m[len(os.path.expanduser("~")):]
-            matches.append(shown + ("/" if os.path.isdir(m) else ""))
-        return matches[state] if state < len(matches) else None
+            if text.startswith("./") and not shown.startswith("./"):
+                shown = "./" + shown
+            out.append(shown + ("/" if os.path.isdir(m) else ""))
+        return out
+
+    def _command_names(self) -> set[str]:
+        path = self.env.get("PATH", "")
+        if not self._cmd_cache or self._cmd_cache[0] != path:
+            names = set()
+            for d in path.split(":"):
+                try:
+                    for e in os.scandir(d or "."):
+                        if os.access(e.path, os.X_OK) and not e.is_dir():
+                            names.add(e.name)
+                except OSError:
+                    pass
+            self._cmd_cache = (path, names)
+        return self._cmd_cache[1] | self.names | SHELL_BUILTINS | {
+            "help", "learned", "forget", "llm", "explain", "jobs", "fg", "bg"}
 
 
-# ---- setup helper ------------------------------------------------------------------
+# ---- setup ------------------------------------------------------------------------
 
-def setup() -> int:
+def http_json(url: str):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"})
+    with url_open(req, timeout=30) as r:
+        return json.load(r)
+
+
+def download(url: str, dest: str, label: str) -> str:
+    """Download with a progress line, resuming a partial .part file."""
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    part = dest + ".part"
+    have = os.path.getsize(part) if os.path.exists(part) else 0
+    headers = {"User-Agent": USER_AGENT}
+    if have:
+        headers["Range"] = f"bytes={have}-"
+    req = urllib.request.Request(url, headers=headers)
+    with url_open(req, timeout=60) as r:
+        if have and r.status != 206:      # server ignored the range: start over
+            have = 0
+        total = int(r.headers.get("Content-Length") or 0) + have
+        mode = "ab" if have else "wb"
+        done, last = have, 0.0
+        with open(part, mode) as f:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if time.time() - last > 0.25 or done == total:
+                    last = time.time()
+                    pct = f"{100 * done / total:5.1f}%" if total else ""
+                    sys.stderr.write(f"\r  {label}: {done / 1e6:8.1f} MB {pct}")
+                    sys.stderr.flush()
+    sys.stderr.write("\n")
+    if total and os.path.getsize(part) != total:
+        raise OSError(f"download incomplete ({os.path.getsize(part)} of {total} bytes); run setup again to resume")
+    os.replace(part, dest)
+    return dest
+
+
+def pick_llama_asset(assets: list, machine: str | None = None) -> dict | None:
+    """The plain CPU Linux build for this machine from a llama.cpp release."""
+    machine = (machine or platform.machine()).lower()
+    arch = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "arm64": "arm64"}.get(machine)
+    if not arch:
+        return None
+    for a in assets:
+        if re.search(rf"-bin-ubuntu-{arch}\.(?:zip|tar\.gz|tgz)$", a.get("name", "")):
+            return a
+    return None
+
+
+def extract_archive(path: str, dest: str) -> None:
+    """Unpack a .zip or .tar.gz into dest, refusing paths that escape it."""
+    os.makedirs(dest, exist_ok=True)
+    root = os.path.realpath(dest)
+
+    def safe(name: str) -> str:
+        target = os.path.realpath(os.path.join(root, name))
+        if target != root and not target.startswith(root + os.sep):
+            raise OSError(f"unsafe path in archive: {name}")
+        return target
+
+    if path.endswith(".zip"):
+        import zipfile
+        with zipfile.ZipFile(path) as z:
+            for info in z.infolist():
+                target = safe(info.filename)
+                z.extract(info, root)
+                mode = (info.external_attr >> 16) & 0o777
+                if mode and not info.is_dir():
+                    os.chmod(target, mode)
+    else:
+        import tarfile
+        with tarfile.open(path) as t:
+            for m in t.getmembers():
+                safe(m.name)
+                if m.issym() or m.islnk():
+                    safe(os.path.join(os.path.dirname(m.name), m.linkname))
+            try:
+                t.extractall(root, filter="data")
+            except TypeError:  # Python without extraction filters
+                t.extractall(root)
+
+
+def find_server(root: str) -> str | None:
+    for dirpath, _, files in os.walk(root):
+        if "llama-server" in files:
+            path = os.path.join(dirpath, "llama-server")
+            os.chmod(path, os.stat(path).st_mode | 0o755)
+            return path
+    return None
+
+
+def check_server(server: str) -> tuple[bool, str]:
+    try:
+        r = subprocess.run([server, "--version"], capture_output=True, text=True, timeout=30,
+                           env=server_env(server))
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return False, str(e)
+    out = (r.stdout + r.stderr).strip()
+    if r.returncode != 0:
+        if "GLIBC" in out:
+            out += ("\nThis prebuilt llama.cpp needs a newer C library than this system has. "
+                    "Use a newer Debian, or install Ollama and run 'aisha --setup' again.")
+        return False, out
+    return True, out.splitlines()[-1] if out else "ok"
+
+
+def install_llama_runtime() -> str:
+    say("  asking GitHub for the latest llama.cpp release …")
+    rel = http_json(LLAMA_RELEASES)
+    asset = pick_llama_asset(rel.get("assets", []))
+    if not asset:
+        raise OSError(f"no prebuilt llama.cpp for {platform.machine()} in release {rel.get('tag_name')}")
+    tag = rel.get("tag_name", "latest")
+    archive = download(asset["browser_download_url"], os.path.join(DATA_DIR, "downloads", asset["name"]),
+                       asset["name"])
+    dest = os.path.join(DATA_DIR, "llama", tag)
+    extract_archive(archive, dest)
+    os.unlink(archive)
+    server = find_server(dest)
+    if not server:
+        raise OSError(f"{asset['name']} has no llama-server in it")
+    return server
+
+
+def server_answers(url: str) -> bool:
+    try:
+        with url_open(url.rstrip("/") + "/models", timeout=3) as r:
+            return r.status == 200
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def confirm(question: str, yes: bool) -> bool:
+    if yes:
+        say(question + " yes")
+        return True
+    ans = ask(question + " [Y/n] ")
+    return ans is not None and ans.strip().lower() in ("", "y", "yes")
+
+
+def setup(args: list[str]) -> int:
     cfg = load_config()
-    say(bold("aisha LLM fallback setup"))
-    say(f"current: {cfg['llm_model']} at {cfg['llm_url']}")
-    if not shutil.which("ollama"):
-        say("\nThe easiest local backend is Ollama:")
-        say("  curl -fsSL https://ollama.com/install.sh | sh")
-        say(f"  ollama pull {cfg['llm_model']}")
-        say("\nAny OpenAI-compatible server works too (llama.cpp's llama-server, LM Studio):")
-        say(f"  set llm_url / llm_model in {CFG_FILE}, or AISHA_LLM_URL / AISHA_LLM_MODEL")
+    yes = "--yes" in args or "-y" in args
+    size = next((a for a in args if a in MODELS), "1.5b")
+    if "remove" in args:
+        shutil.rmtree(DATA_DIR, ignore_errors=True)
+        save_config({"llm_server": None, "llm_model_file": None, "llm_url": None, "llm_model": None})
+        say(f"removed {DATA_DIR} and the local model settings")
+        return 0
+    say(bold("aisha: local LLM setup"))
+    say(dim("The rules work without a model; the model only helps with requests they don't understand."))
+    managed = bool(cfg.get("llm_server"))
+    if not managed and "--download" not in args and server_answers(cfg["llm_url"]):
+        say(f"An LLM server is already answering at {cfg['llm_url']}; using it.")
+        return Shell(load_config()).llm_status()
+    if not managed and "--download" not in args and shutil.which("ollama"):
+        model = f"qwen2.5-coder:{size}"
+        say(f"Ollama is installed: aisha can use it with {model}.")
+        if confirm(f"Pull {model} with ollama now?", yes):
+            rc = subprocess.call(["ollama", "pull", model])
+            if rc != 0:
+                return rc
+            save_config({"llm_url": "http://127.0.0.1:11434/v1", "llm_model": model,
+                         "llm_server": None, "llm_model_file": None})
+            return Shell(load_config()).llm_status()
         return 1
-    ans = ask(f"Pull {cfg['llm_model']} with ollama now? [Y/n] ")
-    if ans is not None and ans.strip().lower() in ("", "y", "yes"):
-        rc = subprocess.call(["ollama", "pull", cfg["llm_model"]])
-        if rc != 0:
-            return rc
-    os.makedirs(CFG_DIR, exist_ok=True)
-    if not os.path.exists(CFG_FILE):
-        with open(CFG_FILE, "w") as f:
-            json.dump({k: v for k, v in DEFAULTS.items()}, f, indent=2)
-        say(dim(f"wrote {CFG_FILE}"))
-    return Shell(cfg).llm_status()
+    try:
+        server = cfg.get("llm_server") if cfg.get("llm_server") and os.path.isfile(cfg["llm_server"]) else None
+        server = server or shutil.which("llama-server") or find_server(os.path.join(DATA_DIR, "llama"))
+        if not server:
+            if not confirm("Download llama.cpp's llama-server (about 30 MB, MIT license) from GitHub?", yes):
+                return 1
+            server = install_llama_runtime()
+        ok, msg = check_server(server)
+        if not ok:
+            say(red(f"llama-server does not run here:\n{msg}"))
+            return 1
+        say(f"  runtime: {server} ({msg})")
+        repo, name, approx = MODELS[size]
+        model = os.path.join(DATA_DIR, "models", name)
+        if not os.path.isfile(model):
+            if not confirm(f"Download {name} ({approx}, Apache-2.0) from Hugging Face?", yes):
+                return 1
+            download(f"https://huggingface.co/{repo}/resolve/main/{name}", model, name)
+        say(f"  model:   {model}")
+    except (OSError, urllib.error.URLError, ValueError) as e:
+        say(red(f"setup failed: {e}"))
+        return 1
+    save_config({"llm_url": f"http://127.0.0.1:{MANAGED_PORT}/v1", "llm_model": f"qwen2.5-coder-{size}",
+                 "llm_server": server, "llm_model_file": model})
+    say(dim(f"saved to {CFG_FILE}"))
+    return Shell(load_config()).llm_status()
 
 
-USAGE = """usage: aisha                      interactive shell
-       aisha <request or command>  run one line and exit
-       aisha -c '<line>'           same, bash-style
-       aisha -n <request>          show what would run, run nothing
-       aisha --setup               set up the local LLM fallback
+# ---- entry point ------------------------------------------------------------------
+
+USAGE = """usage: aisha                        interactive shell
+       aisha <request or command>    run one line and exit
+       aisha -n <request>            show what would run, run nothing
+       aisha -c '<line>' [args]      like bash -c (plain words still work)
+       aisha script.sh [args]        run a script with bash
+       aisha --lines < file          handle stdin line by line, words included
+       aisha --setup [0.5b|1.5b|3b] [--yes] [--download]
+                                     set up the local LLM fallback
+       aisha --setup remove          delete the downloaded runtime and model
        aisha --version
 """
 
 
+def login_env() -> dict:
+    """The environment a bash login shell would have (/etc/profile, ~/.profile)."""
+    try:
+        r = subprocess.run(["bash", "-l", "-c", "env -0"], capture_output=True, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    env = {}
+    for item in r.stdout.split(b"\0"):
+        if b"=" in item:
+            k, v = item.split(b"=", 1)
+            env[k.decode(errors="replace")] = v.decode(errors="replace")
+    return env
+
+
+def is_script(path: str) -> bool:
+    if not os.path.isfile(path):
+        return False
+    if path.endswith((".sh", ".bash")):
+        return True
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"#!"
+    except OSError:
+        return False
+
+
 def main(argv: list[str]) -> int:
-    cfg = load_config()
-    dry = False
     args = list(argv)
+    login = os.path.basename(sys.argv[0]).startswith("-")
+    while args and args[0] in ("-l", "--login", "-i"):
+        login = login or args[0] != "-i"
+        args = args[1:]
     if args and args[0] in ("-h", "--help"):
         print(USAGE + "\n" + HELP)
         return 0
@@ -2425,25 +3108,43 @@ def main(argv: list[str]) -> int:
         print(f"aisha {VERSION}")
         return 0
     if args and args[0] == "--setup":
-        return setup()
-    if args and args[0] == "-n":
-        dry, args = True, args[1:]
+        return setup(args[1:])
+    bash = ["bash", "-l"] if login else ["bash"]
     if args and args[0] == "-c":
-        args = args[1:]
-    shell = Shell(cfg, dry_run=dry)
-    if args:
-        try:
-            return shell.handle(" ".join(args))
-        except EOFError:
-            return 0
-    if not sys.stdin.isatty():
-        rc = 0
+        # ssh, scp, rsync and editors call $SHELL -c: real commands go straight
+        # to bash, so aisha is safe as a login shell.
+        if len(args) < 2:
+            print("aisha: -c: option requires an argument", file=sys.stderr)
+            return 2
+        line, rest = args[1], args[2:]
+        if _looks_like_shell(line) or not line.strip():
+            os.execvp("bash", bash + ["-c", line] + rest)
+        args = [line]
+    if args and args[0] == "--lines":
+        shell, rc = Shell(load_config()), 0
         for line in sys.stdin:
             try:
                 rc = shell.handle(line)
-            except EOFError:
-                break
+            except ExitShell as e:
+                return e.code
         return rc
+    dry = False
+    if args and args[0] == "-n":
+        dry, args = True, args[1:]
+    if args and not dry and is_script(args[0]):
+        os.execvp("bash", bash + args)
+    cfg = load_config()
+    if args:
+        try:
+            return Shell(cfg, dry_run=dry).handle(" ".join(args))
+        except ExitShell as e:
+            return e.code
+    if not sys.stdin.isatty():
+        os.execvp("bash", bash + ["-s"])   # a script on stdin: plain bash semantics
+    shell = Shell(cfg, interactive=True)
+    if login:
+        shell.env.update(login_env())
+        shell.env["AISHA"] = VERSION
     return shell.repl()
 
 

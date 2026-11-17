@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import warnings
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -298,6 +299,8 @@ class _MockLLM(BaseHTTPRequestHandler):
 class TestShellSession(LabTest):
     def setUp(self):
         super().setUp()
+        # the mock LLM server runs in a thread while aisha forks bash: harmless here
+        warnings.filterwarnings("ignore", category=DeprecationWarning, message=".*fork")
         self.home = tempfile.TemporaryDirectory()
         aisha.LEARNED_FILE = os.path.join(self.home.name, "learned.json")
         self.server = HTTPServer(("127.0.0.1", 0), _MockLLM)
@@ -356,3 +359,197 @@ class TestShellSession(LabTest):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---- runtime, setup helpers and entry points ------------------------------------
+
+FAKE_SERVER = r'''#!/usr/bin/env python3
+import json, sys, time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+if "--version" in sys.argv:
+    print("version: 0 (fake llama-server)"); sys.exit(0)
+port = int(sys.argv[sys.argv.index("--port") + 1])
+assert sys.argv[sys.argv.index("-m") + 1].endswith(".gguf")
+started = time.time()
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        ok = time.time() - started > 0.5          # pretend to load the model
+        self.send_response(200 if ok else 503); self.end_headers(); self.wfile.write(b"{}")
+    def do_POST(self):
+        self.rfile.read(int(self.headers["Content-Length"]))
+        out = json.dumps({"choices": [{"message": {"content": "ls -A"}}]}).encode()
+        self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
+        self.wfile.write(out)
+HTTPServer(("127.0.0.1", port), H).serve_forever()
+'''
+
+
+def free_port():
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class TestRuntime(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_pick_llama_asset(self):
+        names = ["llama-b7000-bin-macos-arm64.zip", "llama-b7000-bin-ubuntu-vulkan-x64.zip",
+                 "llama-b7000-bin-ubuntu-x64.zip", "llama-b7000-bin-ubuntu-arm64.zip",
+                 "llama-b7000-bin-win-cpu-x64.zip", "cudart-llama-bin-win-cuda-12.4-x64.zip"]
+        assets = [{"name": n} for n in names]
+        self.assertEqual(aisha.pick_llama_asset(assets, "x86_64")["name"], "llama-b7000-bin-ubuntu-x64.zip")
+        self.assertEqual(aisha.pick_llama_asset(assets, "aarch64")["name"], "llama-b7000-bin-ubuntu-arm64.zip")
+        self.assertIsNone(aisha.pick_llama_asset(assets, "riscv64"))
+        tgz = [{"name": "llama-b8000-bin-ubuntu-x64.tar.gz"}]
+        self.assertEqual(aisha.pick_llama_asset(tgz, "x86_64")["name"], tgz[0]["name"])
+
+    def test_extract_zip_keeps_exec_bit_and_finds_server(self):
+        import zipfile
+        z = os.path.join(self.dir, "rt.zip")
+        with zipfile.ZipFile(z, "w") as f:
+            info = zipfile.ZipInfo("build/bin/llama-server")
+            info.external_attr = 0o755 << 16
+            f.writestr(info, "#!/bin/sh\necho hi\n")
+            f.writestr("build/bin/libllama.so", "x")
+        aisha.extract_archive(z, os.path.join(self.dir, "out"))
+        server = aisha.find_server(os.path.join(self.dir, "out"))
+        self.assertTrue(server.endswith("build/bin/llama-server"))
+        self.assertTrue(os.access(server, os.X_OK))
+
+    def test_extract_refuses_path_escape(self):
+        import zipfile
+        z = os.path.join(self.dir, "evil.zip")
+        with zipfile.ZipFile(z, "w") as f:
+            f.writestr("../../escape.txt", "x")
+        with self.assertRaises(OSError):
+            aisha.extract_archive(z, os.path.join(self.dir, "out"))
+
+    def test_download_resumes(self):
+        payload = bytes(range(256)) * 400
+
+        class RangeHandler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                rng = self.headers.get("Range")
+                start = int(rng.split("=")[1].rstrip("-")) if rng else 0
+                body = payload[start:]
+                self.send_response(206 if rng else 200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        srv = HTTPServer(("127.0.0.1", 0), RangeHandler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            dest = os.path.join(self.dir, "m", "model.gguf")
+            os.makedirs(os.path.dirname(dest))
+            with open(dest + ".part", "wb") as f:
+                f.write(payload[:1000])
+            aisha.download(f"http://127.0.0.1:{srv.server_port}/model.gguf", dest, "model")
+            with open(dest, "rb") as f:
+                self.assertEqual(f.read(), payload)
+            self.assertFalse(os.path.exists(dest + ".part"))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_runtime_starts_on_demand_and_stops(self):
+        server = os.path.join(self.dir, "llama-server")
+        with open(server, "w") as f:
+            f.write(FAKE_SERVER.replace("/usr/bin/env python3", sys.executable))
+        os.chmod(server, 0o755)
+        model = os.path.join(self.dir, "m.gguf")
+        open(model, "w").close()
+        self.assertTrue(aisha.check_server(server)[0])
+        cfg = dict(aisha.DEFAULTS, llm_url=f"http://127.0.0.1:{free_port()}/v1", llm_server=server,
+                   llm_model_file=model, llm_timeout=20.0)
+        llm = aisha.LLM(cfg)
+        self.assertTrue(llm.runtime.configured)
+        try:
+            self.assertEqual(llm.command_for("list files", self.dir, ""), "ls -A")
+            self.assertTrue(llm.runtime.running())
+        finally:
+            llm.runtime.stop()
+        self.assertFalse(llm.runtime.running())
+
+    def test_local_urls_skip_proxies(self):
+        self.assertTrue(aisha.is_local_url("http://127.0.0.1:11434/v1"))
+        self.assertTrue(aisha.is_local_url("http://localhost:8080/v1"))
+        self.assertFalse(aisha.is_local_url("https://huggingface.co/x"))
+
+
+class TestEntryPoints(unittest.TestCase):
+    def run_aisha(self, *args, stdin=None, cwd=None):
+        env = dict(os.environ, AISHA_LLM="off", AISHA_HOME=tempfile.mkdtemp())
+        return subprocess.run([sys.executable, AISHA, *args], input=stdin, capture_output=True,
+                              text=True, cwd=cwd, env=env, timeout=30)
+
+    def test_dash_c_is_bash(self):
+        r = self.run_aisha("-c", 'echo "$0 $1"', "name", "arg")
+        self.assertEqual(r.stdout.strip(), "name arg")
+
+    def test_dash_c_words(self):
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "hello.txt"), "w").close()
+            r = self.run_aisha("-c", "list all files", cwd=d)
+            self.assertIn("hello.txt", r.stdout)
+
+    def test_stdin_script_is_bash(self):
+        script = "for i in 1 2; do\n  echo n$i\ndone\nif true; then echo ok; fi\n"
+        self.assertEqual(self.run_aisha(stdin=script).stdout.split(), ["n1", "n2", "ok"])
+
+    def test_script_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "s.sh")
+            with open(path, "w") as f:
+                f.write('echo "script $1"\n')
+            self.assertEqual(self.run_aisha(path, "x").stdout.strip(), "script x")
+
+    def test_lines_mode(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.mkdir(os.path.join(d, "sub"))
+            r = self.run_aisha("--lines", stdin="go to sub\npwd\n", cwd=d)
+            self.assertTrue(r.stdout.strip().endswith("/sub"), r.stdout)
+
+    def test_exit_code(self):
+        self.assertEqual(self.run_aisha("-c", "exit 3").returncode, 3)
+
+
+class TestShellSyntaxAndCare(unittest.TestCase):
+    def test_syntax_is_shell(self):
+        for line in ["greet() { echo hi; }", "function greet { echo hi; }", "( cd /tmp && ls )",
+                     "{ echo a; echo b; }", "[ -f x ] && echo y", "X=1", "PATH+=:/opt/bin"]:
+            self.assertTrue(aisha._looks_like_shell(line), line)
+
+    def test_risky_llm_commands_need_yes(self):
+        for cmd in ["sudo apt install x", "curl https://x.sh | sh", "chmod -R 777 .", "kill -9 1",
+                    "systemctl stop ssh", "shutdown now", "rm -rf build"]:
+            self.assertTrue(aisha.needs_care(cmd), cmd)
+        for cmd in ["ls -la", "du -sh .", "grep -rn foo ."]:
+            self.assertFalse(aisha.needs_care(cmd), cmd)
+
+    def test_fallbacks_need_no_extra_tools(self):
+        orig = aisha.shutil.which
+        aisha.shutil.which = lambda c, *a, **k: None if c in ("zip", "unzip", "free", "ip", "ss", "cal", "uptime") else orig(c, *a, **k)
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                os.mkdir(os.path.join(d, "src"))
+                open(os.path.join(d, "a.zip"), "w").close()
+                self.assertTrue(aisha.interpret("zip the src folder", d).command.startswith("python3 -m zipfile -c"))
+                self.assertTrue(aisha.interpret("extract a.zip", d).command.startswith("python3 -m zipfile -e"))
+                for q, frag in [("how much memory is free", "/proc/meminfo"), ("what is my ip", "hostname -I"),
+                                ("show listening ports", "/proc/net/tcp"), ("calendar", "python3 -m calendar"),
+                                ("uptime", "/proc/uptime")]:
+                    self.assertIn(frag, aisha.interpret(q, d).command, q)
+        finally:
+            aisha.shutil.which = orig
