@@ -213,6 +213,7 @@ they their there these those this that which who what whats where when how
 and or also then so up out ok okay hey hi lets let want need wanna like look looks
 give get tell have has had only really actually currently exactly thing things stuff
 item items entries entry everything first one ones whole
+show display check tell see view give report
 """.split())
 
 # Dates the rules do not parse. They must not become search keywords; they
@@ -518,6 +519,12 @@ def size_arg(sign: str, n: float, unit: str) -> str:
 
 
 def take_size(u: Utterance, spec: FindSpec) -> None:
+    m = u.take(rf"\bbetween\s+{NUM}\s*{SUNIT}?\s+and\s+{NUM}\s*{SUNIT}\b")
+    if m:
+        lo, lo_unit, hi, hi_unit = num(m.group(1), 0), m.group(2) or m.group(4), num(m.group(3), 0), m.group(4)
+        spec.size += ["-size", size_arg("+", lo, lo_unit), "-size", size_arg("-", hi, hi_unit)]
+        spec.why.append(f"size {m.group(1)}{lo_unit}–{m.group(3)}{hi_unit}")
+        return
     big = (r"(?:bigger|larger|greater|heavier|more|over|above|exceeding|at\s+least|>=?)")
     small = r"(?:smaller|less|lighter|under|below|at\s+most|<=?)"
     for word, sign, label in ((big, "+", ">"), (small, "-", "<")):
@@ -991,6 +998,7 @@ class Plan:
     warning: str | None = None      # replaces the generic "deletes or changes" line
     unknown: list = field(default_factory=list)
     keywords: list = field(default_factory=list)    # words used as search terms
+    show_only: bool = False                         # "how do I ...": print, don't run
     source: str = "rules"           # rules | learned | llm
 
     def rationale(self) -> str:
@@ -1068,6 +1076,7 @@ LIST_V = (r"\b(?:list|ls|show(?:\s+me)?|display|view|see|sort|what\s+do\s+(?:i|w
 def h_list(u: Utterance) -> Plan | None:
     if not u.take(LIST_V):
         return None
+    u.take(r"\bwith\s+(?:their\s+|the\s+|all\s+)?(?:sizes?|details|dates?|permissions|owners?|info)\b")
     with_hidden = bool(u.take(r"\b(?:including|incl|with|plus|and|also)\s+(?:the\s+)?hidden(?:\s+(?:ones|files|items|folders))?\b"))
     spec = FindSpec()
     parse_filters(u, spec)
@@ -1685,16 +1694,26 @@ def first_available(cmd):
 
 
 SYSTEM = [  # (pattern, command or alternatives, label)
+    (r"\bhow\s+many\s+(?:processes|programs|tasks)\b|\bnumber\s+of\s+processes\b", "ps -e --no-headers | wc -l", "process count"),
+    (r"\bsystem\s+(?:info|information|details|summary|overview)\b|\babout\s+this\s+(?:computer|machine|system)\b|"
+     r"\bwhat\s+(?:computer|machine|hardware)\s+(?:is\s+this|am\s+i\s+on)\b",
+     "uname -a && grep -E '^PRETTY_NAME=' /etc/os-release && echo \"cpus: $(nproc)\" && "
+     "grep -E '^(MemTotal|MemAvailable):' /proc/meminfo && uptime", "system summary"),
+    (r"\b(?:check|test)\s+(?:the\s+|my\s+)?(?:internet|network)(?:\s+(?:connection|connectivity|access))?\b|"
+     r"\bam\s+i\s+(?:online|connected)\b|\bis\s+(?:the\s+)?(?:internet|network)\s+(?:up|working|down)\b|"
+     r"\bdo\s+i\s+have\s+internet\b",
+     [("ping", "ping -c 3 1.1.1.1"),
+      (None, "python3 -c 'import urllib.request as u; u.urlopen(\"https://deb.debian.org\", timeout=10); print(\"online\")'")],
+     "internet connection"),
     (r"\b(?:what|which)\s+(?:is|are|processes?|programs?|apps?)?\s*(?:using|uses?|eating|eats|hogging|consuming|taking)\s+(?:up\s+)?"
-     r"(?:the\s+most\s+|all\s+(?:the\s+|my\s+)?|so\s+much\s+|my\s+)?(?:memory|ram)\b|\bmemory\s+hogs?\b|"
+     r"(?:the\s+most\s+|all\s+(?:the\s+|my\s+)?|so\s+much\s+|my\s+|the\s+)?(?:memory|ram)\b|\bmemory\s+hogs?\b|"
      r"\b(?:top\s+)?processes\s+(?:by|sorted\s+by|using\s+the\s+most)\s+(?:memory|ram)\b",
      "ps aux --sort=-%mem | head -n 11", "top processes by memory"),
     (r"\b(?:what|which)\s+(?:is|are|processes?|programs?|apps?)?\s*(?:using|uses?|eating|eats|hogging|consuming|taking)\s+(?:up\s+)?"
-     r"(?:the\s+most\s+|all\s+(?:the\s+|my\s+)?|so\s+much\s+|my\s+)?(?:cpu|processor)\b|\bcpu\s+hogs?\b|"
+     r"(?:the\s+most\s+|all\s+(?:the\s+|my\s+)?|so\s+much\s+|my\s+|the\s+)?(?:cpu|processor)\b|\bcpu\s+hogs?\b|"
      r"\b(?:top\s+)?processes(?:\s+(?:by|sorted\s+by|using\s+the\s+most)\s+cpu)?\b|\btop\s+processes\b",
      "ps aux --sort=-%cpu | head -n 11", "top processes by CPU"),
     (r"\bhow\s+many\s+(?:cpus?|cores|processors|threads)\b|\bnumber\s+of\s+(?:cores|cpus)\b", "nproc", "CPU cores"),
-    (r"\bhow\s+many\s+processes\b", "ps -e --no-headers | wc -l", "process count"),
     (r"\b(?:free|available|used|how\s+much)?\s*(?:memory|ram)\b(?:\s+(?:is\s+)?(?:free|left|available|used|usage))?", [("free", "free -h"),
       (None, "grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree):' /proc/meminfo")], "memory"),
     (r"\b(?:cpu|processor)\s*(?:info|information|details|model|type)?\b|\bwhat\s+(?:cpu|processor)\b", "lscpu", "CPU info"),
@@ -1864,7 +1883,46 @@ def h_reext(u: Utterance) -> Plan | None:
                 warning=f"! renames the .{old} files listed above")
 
 
-HANDLERS = [h_system, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
+def h_power(u: Utterance) -> Plan | None:
+    m = u.peek(r"\b(restart|reboot|shut\s*down|power\s*off|turn\s+off|switch\s+off|suspend|sleep|hibernate)\s+"
+               r"(?:the\s+|my\s+|this\s+)?(?:computer|machine|system|pc|laptop|server|box)(?:\s+now)?\s*$")
+    if not m:
+        return None
+    u.text = " " * len(u.text)
+    word = m.group(1).replace(" ", "")
+    action = {"restart": "reboot", "reboot": "reboot", "suspend": "suspend", "sleep": "suspend",
+              "hibernate": "hibernate"}.get(word, "poweroff")
+    return Plan(f"{sudo()}systemctl {action}", "power", [action], destructive=True,
+                warning=f"! {action}s this computer")
+
+
+def h_version(u: Utterance) -> Plan | None:
+    m = u.peek(r"\b(?:what|which)\s+version\s+of\s+([\w.+-]+)\b|\b([\w.+-]+)\s+version\b|"
+               r"\bversion\s+of\s+([\w.+-]+)\b")
+    if not m:
+        return None
+    prog = next(g for g in m.groups() if g)
+    prog = {"python": "python3", "pip": "pip3", "node.js": "node", "nodejs": "node"}.get(prog, prog)
+    if not shutil.which(prog) or prog in ("linux", "kernel", "os", "debian", "ubuntu"):
+        return None
+    u.text = " " * len(u.text)
+    return Plan(f"{prog} --version", "version", [prog])
+
+
+def h_installed(u: Utterance) -> Plan | None:
+    m = u.peek(r"\bis\s+([\w.+-]+)\s+installed\b|\bdo\s+i\s+have\s+([\w.+-]+)(?:\s+installed)?\s*$|"
+               r"\bwhere\s+is\s+([\w.+-]+)\s+installed\b|\bhave\s+i\s+got\s+([\w.+-]+)\s*$")
+    if not m:
+        return None
+    prog = next(g for g in m.groups() if g)
+    if prog in FILLER or prog in ("internet", "space", "memory", "ram", "files"):
+        return None
+    u.text = " " * len(u.text)
+    q = shlex.quote(prog)
+    return Plan(f"command -v {q} || echo {shlex.quote(prog + ' is not installed')}", "installed?", [prog])
+
+
+HANDLERS = [h_system, h_power, h_version, h_installed, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
             h_find_then, h_reext, h_download, h_copy_move, h_delete, h_read, h_grep, h_count, h_size, h_find, h_list]
 
 
@@ -1921,8 +1979,27 @@ def fix_typos(text: str) -> tuple[str, list[str]]:
     return " ".join(out), fixes
 
 
+# "how do I ...": show the command, don't run it.
+QUESTION_RE = re.compile(
+    r"^\s*(?:(?:how|what)\s+(?:do|can|would|should)\s+(?:i|you|one|we)\s+(?:use\s+to\s+)?|how\s+to\s+|"
+    r"what(?:'s|\s+is)\s+the\s+(?:bash\s+|shell\s+|linux\s+)?command\s+(?:to|for)\s+|"
+    r"which\s+command\s+(?:do\s+i\s+use\s+to\s+|to\s+use\s+to\s+|)?)", re.I)
+
+
 def interpret(text: str, cwd: str) -> Plan | None:
-    """Best deterministic plan for a sentence, retrying once with typos fixed."""
+    """Best deterministic plan for a sentence. "how do I ..." plans are only shown."""
+    q = QUESTION_RE.match(text)
+    if q and text[q.end():].strip():
+        plan = _interpret_fixing(text[q.end():].rstrip(" ?"), cwd)
+        if plan:
+            plan.show_only = True
+            plan.why.append("shown, not run: you asked how")
+        return plan
+    return _interpret_fixing(text, cwd)
+
+
+def _interpret_fixing(text: str, cwd: str) -> Plan | None:
+    """Best plan, retrying once with typos fixed."""
     best = _interpret(text, cwd)
     if best is not None and best.confidence >= 0.999:
         return best
@@ -1978,7 +2055,7 @@ AMBIGUOUS_FIRST = {"go", "kill", "find", "sort", "open", "make", "which", "who",
 
 # On Debian `edit` is run-mailcap and `open` is openvt: nobody typing
 # "edit logs.txt" means those, so the rules always get first go.
-PREFER_RULES = {"edit", "open", "view"}
+PREFER_RULES = {"edit", "open", "view", "read"}
 
 
 def looks_like_shell(line: str, path_env: str | None = None, cwd: str | None = None,
@@ -2543,7 +2620,7 @@ class Shell:
     def execute(self, plan: Plan, phrase: str | None = None) -> int:
         say(dim("→ " + plan.rationale()))
         say(bold("$ ") + plan.command)
-        if self.dry_run:
+        if self.dry_run or plan.show_only:
             return 0
         need = plan.destructive or self.cfg["confirm"] == "always" or \
             (self.cfg["confirm"] == "llm" and plan.source in ("llm", "guess"))

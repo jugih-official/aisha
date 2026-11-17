@@ -47,7 +47,7 @@ def make_corpus(root):
     make_lab(root)
     os.makedirs(os.path.join(root, "var", "log"))
     for path, text in {"var/log/app.log": "error: disk\n", "run.sh": "echo hi\n", "logs.txt": "x\n",
-                       ".hidden": ""}.items():
+                       ".hidden": "", "report.pdf": ""}.items():
         with open(os.path.join(root, path), "w") as f:
             f.write(text)
     with zipfile.ZipFile(os.path.join(root, "backup.zip"), "w") as z:

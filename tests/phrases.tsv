@@ -153,3 +153,58 @@ echo hello	!SHELL
 cd /tmp	!SHELL
 FOO=1 ./run.sh	!SHELL
 for f in *.txt; do echo $f; done	!SHELL
+
+# -- second batch: other wordings
+please list the files	ls -lh
+can you show me all files here	ls -lh
+I want to see the files in src	ls -lh -- src
+display the contents of this directory	ls -lh
+list files with their sizes	ls -lh
+how many lines does README.md have	wc -l < README.md
+how many lines are in README.md	wc -l < README.md
+count the files in run1	find run1 ;; wc -l
+search all files for "disk"	grep -rniIF ;; disk
+look for the word error in var	grep ;; error ;; var
+find all files called notes.txt	-iname notes.txt
+find any csv files under run1	find run1 ;; *.csv
+find files bigger than 2 gigs	-size +2G
+find files smaller than 10 kb	-size -10240c
+find files between 1mb and 10mb	-size +1M ;; -size -10485760c
+show pdfs modified yesterday	*.pdf ;; -mtime 1
+find files I changed today	-daystart -mtime 0
+delete all log files older than 7 days	*.log ;; -mtime +7 ;; -delete
+remove all .pyc files	*.pyc ;; -delete
+copy all pdfs to docs	cp -i -- *.pdf docs
+make a directory named projects	mkdir -p -- projects
+create a new folder projects	mkdir -p -- projects
+mkdir projects	!SHELL
+show me the last lines of app.log	tail -n 10 var/log/app.log
+display the end of app.log	tail -n 10
+what's in README.md	cat README.md
+read notes.txt	cat run1/notes.txt
+open app.log with less	less var/log/app.log
+go into src	cd -- src
+change directory to run1	cd -- run1
+go up one level	cd ..
+take me home	cd ~
+what's the current directory	pwd
+show free memory	free -h || meminfo
+memory usage	free -h || meminfo
+show disk space	df -h
+how full is my disk	df -h
+what is using the cpu	--sort=-%cpu
+list processes	ps aux
+show my ip	ip -br addr || hostname -I
+what's my hostname	hostname
+show system info	uname -a
+check internet connection	ping -c 3 || urlopen
+how many processes are running	ps -e --no-headers | wc -l
+restart the computer	reboot
+shut down the computer	poweroff
+what version of python do i have	python3 --version
+what version of bash is this	bash --version
+is python3 installed	command -v python3
+do i have git	command -v git
+how do i find big files	sort -nr
+how can i delete empty folders	-empty
+what's the command to show memory	free -h || meminfo
