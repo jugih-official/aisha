@@ -26,7 +26,7 @@ handles it:
 
 Commands that delete or overwrite data always ask first.
 
-Standard library only. Python 3.10+.
+Standard library only. Python 3.9+.
 """
 
 from __future__ import annotations
@@ -66,6 +66,7 @@ DEFAULTS = {
     "llm_timeout": 60,                      # seconds; CPU models can be slow to load
     "threshold": 0.7,                       # rules below this confidence go to the LLM
     "confirm": "llm",                       # llm | always | destructive
+    "banner": True,                         # one-line greeting when the shell starts
     "llm_server": "",                       # llama-server binary aisha starts on demand
     "llm_model_file": "",                   # .gguf model for llm_server
 }
@@ -77,6 +78,7 @@ ENV_KEYS = {
     "llm_timeout": "AISHA_LLM_TIMEOUT",
     "threshold": "AISHA_THRESHOLD",
     "confirm": "AISHA_CONFIRM",
+    "banner": "AISHA_BANNER",
     "llm_server": "AISHA_LLM_SERVER",
     "llm_model_file": "AISHA_LLM_MODEL_FILE",
 }
@@ -109,6 +111,7 @@ def load_config() -> dict:
             cfg[key] = os.environ[env]
     cfg["llm_timeout"] = float(cfg["llm_timeout"])
     cfg["threshold"] = float(cfg["threshold"])
+    cfg["banner"] = str(cfg["banner"]).lower() not in ("0", "false", "no", "off")
     return cfg
 
 
@@ -393,7 +396,9 @@ CONTRACTIONS = [
     (r"\bdon't\b", "do not"), (r"\bdoesn't\b", "does not"), (r"\bisn't\b", "is not"),
     (r"\baren't\b", "are not"), (r"\bhaven't\b", "have not"), (r"\bhasn't\b", "has not"),
     (r"\bwasn't\b", "was not"), (r"\bweren't\b", "were not"), (r"\bcan't\b", "cannot"),
-    (r"\blet's\b", "let us"), (r"\bhow's\b", "how is"),
+    (r"\blet's\b", "let us"), (r"\bhow's\b", "how is"), (r"\bi'd\b", "i would"),
+    (r"\bi've\b", "i have"), (r"\bi'll\b", "i will"), (r"\byou're\b", "you are"),
+    (r"\bthere's\b", "there is"), (r"\bhere's\b", "here is"), (r"\bwhats\b", "what is"),
 ]
 
 
@@ -490,7 +495,8 @@ class FindSpec:
                     or self.size or self.time or self.content or self.owner or self.broken)
 
 
-MOD = r"(?:(?:modified|changed|edited|created|updated|touched|saved|made|written)\s+)?"
+MOD = (r"(?:(?:modif(?:ied|y)|chang(?:ed|e)|edit(?:ed)?|creat(?:ed|e)|updat(?:ed|e)|touch(?:ed)?|"
+       r"sav(?:ed|e)|made|make|writ(?:ten|e)|work(?:ed)?\s+on|taken|downloaded|added)\s+)?")
 THAN = r"(?:than|then|that)"   # "older that 2 months" is a typo people make
 
 
@@ -649,7 +655,13 @@ def take_location(u: Utterance, spec: FindSpec) -> None:
         (rf"\b(?:{LOC_PREP}\s+)?(?:my|the)\s+home(?:\s+(?:folder|directory|dir))?\b|\bhome\s+(?:folder|directory|dir)\b", "~"),
         (rf"\b(?:{LOC_PREP}\s+)?(?:the\s+)?(?:whole|entire)\s+(?:system|computer|disk|drive|machine|file\s*system)\b|\beverywhere\b|\bsystem[- ]wide\b", "/"),
         (rf"\b(?:{LOC_PREP}\s+)?(?:the\s+)?parent\s+(?:folder|directory|dir)\b|\bone\s+(?:level|folder|directory)\s+up\b", ".."),
+        (r"\b(?:on|in|across|throughout)\s+(?:my|this|the)\s+(?:computer|machine|system|pc|laptop|disks?|drives?)\b", "/"),
     ]
+    m = u.take(r"\b(?:(?:in|from|under|inside|within)\s+)?my\s+(downloads?|documents|desktop|pictures|music|videos)"
+               r"(?:\s+(?:folder|directory|dir))?\b")
+    if m:
+        spec.root = "~/" + XDG_DIRS[m.group(1)]
+        return
     for pat, root in fixed:
         if u.take(pat):
             spec.root = root
@@ -1336,7 +1348,7 @@ def h_read(u: Utterance) -> Plan | None:
         # a file name that is not here: look further down, or create it when editing
         for low, orig, start in u.remaining():
             name = u.lit(orig)
-            if not low.startswith("qlit") or not is_pathlike(name):
+            if not low.startswith("qlit"):   # quoted text or a file-like word
                 continue
             hits = find_below(os.path.basename(name), u.cwd) if "/" not in name else []
             u.blank(start, start + len(orig))
@@ -1484,6 +1496,16 @@ def h_find_then(u: Utterance) -> Plan | None:
 
 def h_copy_move(u: Utterance) -> Plan | None:
     m = u.peek(r"\b(copy|cp|duplicate|move|mv|rename)\s+(.+?)\s+(?:to|into|in|as|inside|over\s+to)\s+(.+)$")
+    mc = u.peek(r"\b(?:(?:make|create)\s+a\s+copy\s+of|^\s*duplicate)\s+(\S+)\s*$")
+    if mc:
+        srcs = resolve_sources(u, u.o(mc, 1))
+        if not srcs or len(srcs) != 1:
+            return None
+        u.text = " " * len(u.text)
+        src = u.lit(u.o(mc, 1)) if not srcs[0].startswith("'") else srcs[0].strip("'")
+        stem_, ext = os.path.splitext(src.rstrip("/"))
+        dest = f"{stem_}-copy{ext}"
+        return Plan(f"cp -a -- {qpath(src)} {qpath(dest)}", "copy", [f"{src} → {dest}"])
     mb = u.peek(r"\b(?:back\s*up|make\s+a\s+backup\s+of|create\s+a\s+backup\s+of)\s+(.+)$")
     if mb:
         srcs = resolve_sources(u, u.o(mb, 1))
@@ -1592,9 +1614,12 @@ def h_chmod(u: Utterance) -> Plan | None:
 
 
 def h_archive(u: Utterance) -> Plan | None:
-    m = u.peek(r"\b(zip(?:\s+up)?|compress|archive|pack(?:\s+up)?|tar(?:\s+up)?)\s+(.+?)(?:\s+(?:into|as|to)\s+(\S+))?$")
+    m = u.peek(r"\b(?:make|create)\s+an?\s+(zip|tarball|archive|tar(?:\.gz)?)\s+(?:file\s+)?(?:of|from)\s+(.+?)"
+               r"(?:\s+(?:called|named)\s+(\S+))?$")
+    if not m:
+        m = u.peek(r"\b(zip(?:\s+up)?|compress|archive|pack(?:\s+up)?|tar(?:\s+up)?)\s+(.+?)(?:\s+(?:into|as|to)\s+(\S+))?$")
     if m:
-        what = re.sub(r"^(?:the\s+|my\s+)", "", u.o(m, 2))
+        what = re.sub(r"^(?:(?:of|up|the|my)\s+)+", "", u.o(m, 2))
         what = re.sub(r"\s+(?:folder|directory|dir)$", "", what)
         sub = Utterance(what, u.cwd, u.literals)
         spec = FindSpec()
@@ -1715,6 +1740,18 @@ SYSTEM = [  # (pattern, command or alternatives, label)
     (r"\bhow\s+many\s+(?:cpus?|cores|processors|threads)\b|\bnumber\s+of\s+(?:cores|cpus)\b", "nproc", "CPU cores"),
     (r"\b(?:free|available|used|how\s+much)?\s*(?:memory|ram)\b(?:\s+(?:is\s+)?(?:free|left|available|used|usage))?", [("free", "free -h"),
       (None, "grep -E '^(MemTotal|MemAvailable|SwapTotal|SwapFree):' /proc/meminfo")], "memory"),
+    (r"\b(?:cpu\s+|processor\s+|system\s+|core\s+)?temp(?:erature)?s?\b|\bhow\s+hot\b",
+     "for z in /sys/class/thermal/thermal_zone*; do [ -r \"$z/temp\" ] && "
+     "echo \"$(cat \"$z/type\"): $(( $(cat \"$z/temp\") / 1000 ))°C\"; done", "temperatures"),
+    (r"\bbattery\b", "grep -H . /sys/class/power_supply/BAT*/capacity /sys/class/power_supply/BAT*/status 2>/dev/null "
+     "|| echo 'no battery found'", "battery"),
+    (r"\bwhen\s+did\s+(?:the\s+|this\s+|my\s+)?(?:computer|system|machine|pc|server|it)\s+(?:boot|start)(?:\s+up)?\b|"
+     r"\b(?:last\s+)?(?:boot|reboot)\s+time\b|\blast\s+(?:boot|reboot)(?:ed)?\b",
+     [("uptime", "uptime -s"), (None, "who -b")], "boot time"),
+    (r"\binstalled\s+(?:packages|programs|software|apps|applications)\b|"
+     r"\b(?:packages|programs|software)\s+(?:that\s+are\s+|are\s+)?installed\b",
+     [("dpkg-query", "dpkg-query -W -f='${Package} ${Version}\\n'"), ("rpm", "rpm -qa"), (None, "ls /usr/bin")],
+     "installed packages"),
     (r"\b(?:cpu|processor)\s*(?:info|information|details|model|type)?\b|\bwhat\s+(?:cpu|processor)\b", "lscpu", "CPU info"),
     (r"\buptime\b|\bhow\s+long\s+(?:has|have)\s+(?:the\s+|this\s+)?(?:system|computer|machine|server|it)\s+been\s+(?:up|running|on)\b",
      [("uptime", "uptime"),
@@ -1812,8 +1849,9 @@ def h_process(u: Utterance) -> Plan | None:
         su = "" if act == "status" else sudo()
         return Plan(f"{su}systemctl {act} {shlex.quote(name)}", "service", [f"{act} {name}"],
                     destructive=act != "status")
-    m = u.peek(r"\b(?:kill|stop|terminate|end|close|quit|force\s+quit)\s+(?:the\s+|all\s+)?(?:process(?:es)?\s+)?(\S+)(?:\s+process(?:es)?)?$")
-    if m and u.peek(r"\b(?:kill|process|terminate|force\s+quit)\b"):
+    m = u.peek(r"\b(?:kill|stop|terminate|end|close|quit|force\s+quit)\s+(?:the\s+|all\s+(?:the\s+)?)?"
+               r"(?:process(?:es)?\s+|programs?\s+)?(?:(?:named|called)\s+)?(\S+)(?:\s+(?:process(?:es)?|programs?))?$")
+    if m and u.peek(r"\b(?:kill|process(?:es)?|terminate|force\s+quit)\b"):
         u.text = " " * len(u.text)
         target = u.lit(u.o(m, 1))
         cmd = f"kill {target}" if target.isdigit() else f"pkill -- {shlex.quote(target)}"
@@ -1921,7 +1959,31 @@ def h_installed(u: Utterance) -> Plan | None:
     return Plan(f"command -v {q} || echo {shlex.quote(prog + ' is not installed')}", "installed?", [prog])
 
 
-HANDLERS = [h_system, h_power, h_version, h_installed, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
+def h_port(u: Utterance) -> Plan | None:
+    m = u.peek(r"\b(?:listening|using|on|bound\s+to|open\s+on|at)\s+port\s+(\d{1,5})\b|\bport\s+(\d{1,5})\b")
+    if not m:
+        return None
+    port = m.group(1) or m.group(2)
+    u.text = " " * len(u.text)
+    cmd = first_available([("ss", f"ss -ltnup 'sport = :{port}'"),
+                           (None, f"{PORTS_PY} | grep -w -- {port} || echo 'nothing listening on port {port}'")])
+    return Plan(cmd, "port", [f"what is listening on port {port}"])
+
+
+def h_pkg_search(u: Utterance) -> Plan | None:
+    m = u.peek(r"\b(?:search|look|find)\s+(?:for\s+)?(?:an?\s+|the\s+)?(?:package|program|app|software)s?\s+"
+               r"(?:called\s+|named\s+|for\s+)?(\S+)\s*$")
+    pm = pkg_manager()
+    if not m or not pm:
+        return None
+    u.text = " " * len(u.text)
+    name = shlex.quote(u.lit(u.o(m, 1)))
+    verb = {"apt": "apt search", "dnf": "dnf search", "pacman": "pacman -Ss", "zypper": "zypper search",
+            "apk": "apk search", "brew": "brew search"}[pm]
+    return Plan(f"{verb} {name}", "packages", [f"search {pm} for {u.lit(u.o(m, 1))}"])
+
+
+HANDLERS = [h_system, h_power, h_version, h_installed, h_port, h_pkg_search, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
             h_find_then, h_reext, h_download, h_copy_move, h_delete, h_read, h_grep, h_count, h_size, h_find, h_list]
 
 
@@ -2372,6 +2434,10 @@ def clean_llm_command(text: str) -> str | None:
     lines = [l.rstrip() for l in text.splitlines() if l.strip()]
     if not lines:
         return None
+    if m and len(lines) > 1 and not any(l.lstrip().startswith(("$ ", "# ")) for l in lines):
+        block = "\n".join(lines)          # a fenced multi-line script, kept whole if it parses
+        if subprocess.run(["bash", "-n", "-c", block], capture_output=True).returncode == 0:
+            return block
     joined, buf = [], ""
     for line in lines:
         if line.endswith("\\"):
@@ -2496,6 +2562,24 @@ RISKY_RE = re.compile(
 
 def needs_care(cmd: str) -> bool:
     return looks_destructive(cmd) or bool(RISKY_RE.search(cmd))
+
+
+def git_branch(cwd: str) -> str:
+    """Current git branch (or short commit) by reading .git/HEAD; no git needed."""
+    d = cwd
+    while True:
+        head = os.path.join(d, ".git", "HEAD")
+        if os.path.isfile(head):
+            try:
+                with open(head) as f:
+                    ref = f.read().strip()
+            except OSError:
+                return ""
+            return ref[16:] if ref.startswith("ref: refs/heads/") else ref[:7]
+        parent = os.path.dirname(d)
+        if parent == d:
+            return ""
+        d = parent
 
 
 class Shell:
@@ -2936,11 +3020,13 @@ class Shell:
         if len(where) > 40:
             where = "…/" + "/".join(where.rstrip("/").split("/")[-2:])
         mark = "❯" if self.rc == 0 else "✗"
+        branch = git_branch(self.cwd)
         if not (sys.stdout.isatty() and not os.environ.get("NO_COLOR")):
-            return f"aisha {where} {mark} "
+            return f"aisha {where}{' (' + branch + ')' if branch else ''} {mark} "
         # \001..\002 tell readline the escapes take no width
         c = lambda code, s: f"\001\033[{code}m\002{s}\001\033[0m\002"
-        return f"{c('36', 'aisha')} {c('34', where)} {c('32' if self.rc == 0 else '31', mark)} "
+        git = f" {c('35', branch)}" if branch else ""
+        return f"{c('36', 'aisha')} {c('34', where)}{git} {c('32' if self.rc == 0 else '31', mark)} "
 
     def repl(self) -> int:
         try:
@@ -2959,8 +3045,9 @@ class Shell:
                 readline.parse_and_bind("tab: complete")
         except ImportError:
             readline = None
-        llm = self.llm.label if self.llm.enabled else "off"
-        say(dim(f"aisha {VERSION} — type bash or plain words. 'help' for examples. LLM fallback: {llm}"))
+        if self.cfg["banner"]:
+            llm = self.llm.label if self.llm.enabled else "off"
+            say(dim(f"aisha {VERSION} — type bash or plain words. 'help' for examples. LLM fallback: {llm}"))
         code = None
         while code is None:
             self.reap()

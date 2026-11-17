@@ -208,3 +208,37 @@ do i have git	command -v git
 how do i find big files	sort -nr
 how can i delete empty folders	-empty
 what's the command to show memory	free -h || meminfo
+
+# -- third batch: politeness, home folders, system details
+could you please list all the files in this folder	ls -lhA
+I'd like to see the biggest files	ls -lhS || sort -nr
+show me everything in my home folder	ls -lh -- ~
+find all the mp3s on my computer	find / ;; *.mp3
+find photos taken this month	*.jpg ;; -mtime -30
+search my documents for budget	~/Documents ;; budget
+what files did i change today	-daystart -mtime 0
+get rid of all the .bak files	*.bak ;; -delete
+clean up temp files	*.tmp ;; -delete
+make a copy of README.md	cp -a -- README.md README-copy.md
+duplicate README.md	cp -a -- README.md README-copy.md
+what's the size of run1	du -sh run1
+how much space does src take	du -sh src
+whats eating my disk space	du -h --max-depth=1
+show hidden files in my home	-name '.*' ;; ~
+list the contents of run1	ls -lh -- run1
+I need to edit run.sh	run.sh
+can you open logs.txt in nano	nano logs.txt
+show me the first 3 lines of README.md	head -n 3 README.md
+tail app.log	tail -n 10 var/log/app.log
+make a zip of src	src.zip
+unpack data.tar.gz here	tar -xf data.tar.gz
+kill the process named sleep	pkill -- sleep
+end all python processes	pkill -- python
+what is listening on port 22	sport = :22 || grep -w -- 22
+which process is using port 8080	sport = :8080 || grep -w -- 8080
+how much battery is left	power_supply
+what's the cpu temperature	thermal
+when did the computer boot	who -b || uptime -s
+list installed packages	dpkg-query
+search for a package called htop	search htop
+how do i check disk space	df -h

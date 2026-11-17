@@ -640,3 +640,20 @@ class TestInjection(LabTest):
         found = [os.path.join(r, f) for r, _, fs in os.walk(self.lab) for f in fs if f.startswith("PWNED")]
         found += [f for f in os.listdir(tempfile.gettempdir()) if f.startswith("PWNED")]
         self.assertEqual(found, [])
+
+
+class TestSmallThings(LabTest):
+    def test_quoted_new_file_with_space(self):
+        self.assertTrue(self.cmd("edit 'my notes.txt'").endswith(" 'my notes.txt'"))
+
+    def test_multiline_llm_script(self):
+        text = "```bash\nfor f in *.txt; do\n  echo \"$f\"\ndone\n```"
+        self.assertEqual(aisha.clean_llm_command(text), 'for f in *.txt; do\n  echo "$f"\ndone')
+        self.assertEqual(aisha.clean_llm_command("ls -la\nThis lists files."), "ls -la")
+
+    def test_git_branch(self):
+        os.makedirs(os.path.join(self.lab, "src", "deep"))
+        with open(os.path.join(self.lab, ".git", "HEAD"), "w") as f:
+            f.write("ref: refs/heads/aisha\n")
+        self.assertEqual(aisha.git_branch(os.path.join(self.lab, "src", "deep")), "aisha")
+        self.assertEqual(aisha.git_branch(tempfile.gettempdir()), "")

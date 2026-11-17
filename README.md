@@ -429,8 +429,8 @@ packaging/debian/build-deb.sh            # -> dist/aisha_<version>_all.deb
 sudo apt install ./dist/aisha_*_all.deb  # /usr/bin/aisha, man aisha
 ```
 
-or `./install.sh`, which puts it in `/usr/local`. Needs Python 3.10+
-(Debian 12 or newer). `man aisha` documents the options.
+or `./install.sh`, which puts it in `/usr/local`. Needs Python 3.9+
+(Debian 11 or newer). `man aisha` documents the options.
 
 ### Roadmap
 

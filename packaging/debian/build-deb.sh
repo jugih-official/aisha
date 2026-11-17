@@ -67,7 +67,7 @@ Section: utils
 Priority: optional
 Architecture: all
 Installed-Size: $SIZE_KB
-Depends: python3 (>= 3.10), bash, coreutils, findutils, grep, debianutils
+Depends: python3 (>= 3.9), bash, coreutils, findutils, grep, debianutils
 Recommends: procps, iproute2, sensible-utils, less
 Suggests: zip, unzip, xdg-utils
 Maintainer: $MAINTAINER
