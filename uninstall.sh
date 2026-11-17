@@ -7,6 +7,8 @@ BROWSER_BIN_TARGET=/usr/local/bin/ai-browser
 DESKTOP_BIN_TARGET=/usr/local/bin/ai-desktop
 CODE_BIN_TARGET=/usr/local/bin/ai-code
 AISHA_BIN_TARGET=/usr/local/bin/aisha
+AISHA_LIB_DIR=/usr/local/lib/aisha
+AISHA_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/aisha"
 BROWSER_PREFIX=/opt/ai-bash
 CFG_DIR_USER="$HOME/.config/ai-bash"
 CFG_DIR_SYS=/etc/ai-bash
@@ -37,6 +39,7 @@ remove_path "$BROWSER_BIN_TARGET" sudo
 remove_path "$DESKTOP_BIN_TARGET" sudo
 remove_path "$CODE_BIN_TARGET" sudo
 remove_path "$AISHA_BIN_TARGET" sudo
+remove_path "$AISHA_LIB_DIR" sudo
 remove_path "$BROWSER_PREFIX" sudo
 
 # ai-code's Modal GPU backend, if it was deployed. Offer to stop it so it
@@ -51,6 +54,17 @@ if command -v modal >/dev/null 2>&1 && modal profile current >/dev/null 2>&1; th
             *)     dim "  left it running (it scales to zero when idle)." ;;
         esac
     fi
+fi
+
+# aisha's downloaded local model (llama.cpp + GGUF), if any.
+if [ -e "$AISHA_DATA_DIR" ]; then
+    echo
+    yellow "aisha's local model files are in $AISHA_DATA_DIR ($(du -sh "$AISHA_DATA_DIR" 2>/dev/null | cut -f1))."
+    read -r -p "Delete them? [y/N] " yn
+    case "${yn,,}" in
+        y|yes) remove_path "$AISHA_DATA_DIR" user ;;
+        *)     dim "  kept them." ;;
+    esac
 fi
 
 # API-key files. Ask before deleting — they hold secrets the user may

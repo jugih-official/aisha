@@ -297,21 +297,24 @@ delegates to `ai-code`.
 ## Natural-language shell (aisha)
 
 `aisha` is a shell you can talk to. Type bash as usual, or say what you want
-in plain words. It works offline: most requests are handled by a
-deterministic rule engine with no model at all, and a small **local** LLM is
-only consulted when the rules are unsure. No API key, no cloud.
+in plain words. It needs nothing beyond a stock Debian system — Python's
+standard library and the base tools. Most requests are handled by a
+deterministic rule engine with no model at all; an optional small **local**
+LLM is consulted only when the rules are unsure. No API key, no cloud.
 
 ```
 $ aisha
-aisha ~/lab ❯ find files in this folder that have the measurement data
-→ find · here and subfolders · name or content ~ "measur" (from "measurement"); "data" is generic
-$ find . -path '*/.git' -prune -o -type f \( -iname '*measur*' -o -exec grep -IqiF -e measur {} \; \) -print
-./run1/measurements_01.csv
-./run1/notes.txt
+aisha ~/lab ❯ find recursively files older that 2 months from this folder
+→ find · here and subfolders · modified older than 2 months (60 days)
+$ find . -path '*/.git' -prune -o -type f -mtime +60 -print
+./run1/old-results.csv
 
-aisha ~/lab ❯ git status          # real commands run in bash unchanged
-aisha ~/lab ❯ go to run1          # cd (and export) stick between lines
-aisha ~/lab/run1 ❯ delete all .tmp files
+aisha ~/lab ❯ edit logs.txt with micro
+→ edit · logs.txt · with micro
+$ micro logs.txt
+
+aisha ~/lab ❯ git status                  # real commands run in bash unchanged
+aisha ~/lab ❯ delete all .tmp files
 → delete · here and subfolders · type: .tmp
 $ find . -type f -iname '*.tmp' -not -path '*/.git/*' -delete
 1 match:
@@ -320,105 +323,126 @@ $ find . -type f -iname '*.tmp' -not -path '*/.git/*' -delete
 run? [y/N]
 ```
 
-Every line goes through these stages and stops at the first that handles it:
+### How a line is handled
 
 | Stage | What happens | Speed |
 |---|---|---|
-| 1. Shell | A command on `PATH` with flags, paths, pipes or redirects runs in bash unchanged. Everyday verbs that are also commands (`find big files`, `kill firefox`, `go up`) go to the rules when the rules are confident. | instant |
-| 2. Memory | A phrase whose LLM-written command you approved before is replayed without asking the model again. | instant |
-| 3. Rules | The sentence is broken into slots — action, where, file types, size, age, name/content keywords, sort, limit — and the command is built from those. The `→` line shows what it understood. | instant |
-| 4. Local LLM | Only when the rules are below the confidence threshold. The model gets the request, the folder listing, and the rules' partial parse as hints. Its command is always shown and confirmed (Enter runs it). | ~1 s on CPU |
+| 1. Shell | A command on `PATH`, an alias or function, shell syntax (`for`, `f() {`, `X=1`), pipes or redirects run in bash unchanged. Everyday verbs that are also commands (`find big files`, `kill firefox`, `go up`, `install htop`, `edit x`) go to the rules when the rules are confident. | instant |
+| 2. Memory | A phrase whose LLM-written command you approved before is replayed without the model. | instant |
+| 3. Rules | The sentence is broken into slots — action, where, file types, size, age, owner, name/content keywords, sort, limit — and the command is built from those. The `→` line shows what it understood. Typos are retried once (`recursivly`, `oldr`, `fiels`). | < 2 ms |
+| 4. Local LLM | Only below the confidence threshold. The model gets the request, the OS, the installed tools, the folder listing and the rules' partial parse. Its command is always shown and confirmed. | ~1 s on CPU |
 
-What the rules understand today: listing, finding (by type, name, content,
-size, age, emptiness), text search, counting, sizes and disk usage, showing
-and editing files, copy/move/rename/delete, creating files and folders,
-`chmod`, zip/tar and extract, `cd`/`pwd`, memory/CPU/processes,
-OS/IP/ports/drives, services, and packages. Anything else falls through to
-the LLM.
+Questions — "how do I delete empty folders?" — show the command without
+running it.
 
-Everyday phrases and how they come out:
+### What the rules understand
+
+Listing; finding by type, name, content, size (incl. ranges), age, owner,
+emptiness, broken links, duplicates; text search; counting; sizes and disk
+usage; showing, following and editing files; copy/move/rename/delete, also
+"find … and delete/move/copy them"; bulk extension renames; creating files
+and folders; `chmod`; zip/tar/extract; downloads; `cd`/`pwd`; memory, CPU,
+processes, OS, IP, ports, drives, internet check, versions, "is X
+installed"; services, packages, reboot/shutdown. `tests/phrases.tsv` lists
+the 180+ requests the test suite checks.
 
 | You type | aisha runs |
 |---|---|
 | `find recursively files older that 2 months from this folder` | `find . … -type f -mtime +60 -print` |
-| `find files over 2 months old` / `find 2 month old files` | same |
-| `find logs older than 2 months and move them to archive` | `mkdir -p -- archive && find . … -iname '*.log' -mtime +60 … -exec mv -i -t archive -- {} +` (preview, then `[y/N]`) |
-| `delete files older than 2 months` | `find . -type f -mtime +60 … -delete` (preview, then `[y/N]`) |
-| `edit logs.txt` | `sensible-editor logs.txt` — your `$VISUAL`/`$EDITOR`, else Debian's `editor` |
-| `edit logs.txt with micro` / `… using micro` / `open logs.txt in micro` | `micro logs.txt` |
-| `edit app.log` (when it is in `var/log/`) | `sensible-editor var/log/app.log` |
+| `find logs older than 2 months and move them to archive` | `mkdir -p -- archive && find . … -iname '*.log' -mtime +60 … -exec mv -i -t archive -- {} +` (preview, `[y/N]`) |
+| `edit logs.txt` | `sensible-editor logs.txt` — `$VISUAL`/`$EDITOR`, else Debian's `editor` |
+| `edit logs.txt with micro` / `using micro` / `open logs.txt in micro` | `micro logs.txt` (installed with apt first if missing, after asking) |
+| `edit app.log` (it is in `var/log/`) | `sensible-editor var/log/app.log` |
+| `find duplicate files` | `find … -print0 \| xargs -0 -r md5sum \| sort \| uniq -w32 --all-repeated=separate` |
+| `rename all .jpeg files to .jpg` | `for f in *.jpeg; do mv -i -- "$f" "${f%.jpeg}.jpg"; done` (preview, `[y/N]`) |
+| `what's using all my memory` | `ps aux --sort=-%mem \| head -n 11` |
 
-Typos are retried once against the words the rules know: `find recursivly
-files oldr than 2 months` works, and the `→` line says `read
-recursivly→recursively, oldr→older`. "older that" is read as "older than".
-When a named tool is missing (`micro`, `zip`, `unzip`, `7z`) the command
-installs it first with apt, and asks before running.
+Where a tool might be missing on a minimal system, aisha falls back to
+Python's standard library or `/proc`: zip/unzip → `python3 -m zipfile`,
+downloads → `urllib`, `free`/`uptime`/`ss`/`ip`/`cal` → `/proc` or
+`python3`.
+
+### A real shell
+
+- `cd`, `export`, aliases and functions persist between lines;
+  `~/.bash_aliases` and `~/.config/ai-bash/aisha/aisharc` are loaded at
+  start.
+- Job control: Ctrl-Z, `jobs`, `fg`, `bg`, `cmd &`.
+- Tab completes commands and paths; history is kept in
+  `~/.config/ai-bash/aisha/history`.
+- `aisha -c '…'`, `aisha script.sh` and scripts on stdin run in plain bash,
+  so aisha is safe as a login shell (`chsh -s /usr/bin/aisha` after
+  installing the Debian package, which registers it in `/etc/shells`).
 
 ```sh
 aisha                                   # interactive shell
 aisha show the 5 newest files here      # one line, then exit
 aisha -n delete log files older than 30 days   # show the command, run nothing
+aisha --lines < requests.txt            # several plain-language lines
 ```
 
 Inside the shell: `!cmd` forces bash, `?request` skips the rules and asks the
 LLM, `explain <request>` shows what would run, `learned` / `forget <request>`
 manage remembered phrases, `llm` checks the model, `help` lists examples.
 
-Commands that delete or overwrite data always ask `[y/N]` first, and
-deletes show the matching files before asking. The rules never build a
-delete from a vague sentence ("clean up", "delete everything") — that goes
-to the LLM and still needs your `y`.
+Commands that delete or overwrite data always ask `[y/N]` first, and deletes
+and bulk moves show the matching files before asking. The rules never build
+a delete from a vague sentence ("clean up", "delete everything"). Model
+commands with `sudo`, recursive `chmod`, `curl | sh`, service stops and the
+like also ask `[y/N]`.
 
-### Local LLM fallback
-
-Any OpenAI-compatible server works. The default is
-[Ollama](https://ollama.com) with `qwen2.5-coder:1.5b` (~1 GB, runs on a
-laptop CPU):
+### Local LLM (optional)
 
 ```sh
-curl -fsSL https://ollama.com/install.sh | sh
-ollama pull qwen2.5-coder:1.5b
-aisha --setup        # checks the model answers
+aisha --setup            # Qwen2.5-Coder 1.5B (1.1 GB)
+aisha --setup 0.5b       # smaller and faster (0.4 GB), simpler requests
+aisha --setup 3b         # better, slower (2 GB)
+aisha --setup remove     # delete the downloaded runtime and model
 ```
 
-`qwen2.5-coder:0.5b` (~400 MB) also works for simple requests. To use
-llama.cpp's `llama-server`, LM Studio or another server, set the endpoint in
-`~/.config/ai-bash/aisha/config.json` or the environment:
+`--setup` uses whatever is already there — a server answering at the
+configured URL, Ollama, or a `llama-server` on `PATH`. Otherwise it downloads
+llama.cpp's `llama-server` (MIT, ~30 MB) from GitHub and the model (Apache
+2.0) from Hugging Face into `~/.local/share/aisha`, with resumable downloads.
+aisha starts the model the first time the rules need help and stops it when
+aisha exits; nothing runs in the background otherwise.
+
+Settings live in `~/.config/ai-bash/aisha/config.json` or the environment:
 
 | Setting | Env var | Default |
 |---|---|---|
-| `llm_url` | `AISHA_LLM_URL` | `http://127.0.0.1:11434/v1` |
+| `llm_url` | `AISHA_LLM_URL` | `http://127.0.0.1:11434/v1` (Ollama); `--setup` sets its own |
 | `llm_model` | `AISHA_LLM_MODEL` | `qwen2.5-coder:1.5b` |
+| `llm_server` / `llm_model_file` | `AISHA_LLM_SERVER` / `AISHA_LLM_MODEL_FILE` | set by `--setup` |
 | `llm_key` | `AISHA_LLM_KEY` | *(none)* |
-| `llm` | `AISHA_LLM` | `auto` (`off` disables the fallback) |
-| `threshold` | `AISHA_THRESHOLD` | `0.7` (rules below this go to the LLM) |
+| `llm` | `AISHA_LLM` | `auto` (`off` disables the model) |
+| `threshold` | `AISHA_THRESHOLD` | `0.7` (rules below this go to the model) |
 | `confirm` | `AISHA_CONFIRM` | `llm` (`always`, or `destructive` only) |
 
-Without a model, aisha still works; requests the rules don't understand get
+Without a model, aisha still works: requests the rules don't understand get
 the rules' best guess with a confirmation, or a "don't know how yet".
 
-### Debian package
+### Install
 
 ```sh
 packaging/debian/build-deb.sh            # -> dist/aisha_<version>_all.deb
-sudo apt install ./dist/aisha_*_all.deb
+sudo apt install ./dist/aisha_*_all.deb  # /usr/bin/aisha, man aisha
 ```
 
-The package installs `/usr/bin/aisha` and `man aisha`. It needs Python 3.10+
-(Debian 12 or newer) and recommends `procps`, `iproute2` and
-`sensible-utils`. `install.sh` instead copies the script to
-`/usr/local/bin`, which comes first in `PATH`; use one or the other.
+or `./install.sh`, which puts it in `/usr/local`. Needs Python 3.10+
+(Debian 12 or newer). `man aisha` documents the options.
 
 ### Roadmap
 
 - **Windows.** The rule engine (words → slots) is platform-neutral; the
   command builder and the executor are bash/GNU-specific. The Windows port
-  adds a second builder that turns the same slots into PowerShell
+  adds a builder that turns the same slots into PowerShell
   (`Get-ChildItem -Recurse -File | Where-Object LastWriteTime -lt …`) and runs
   it through `pwsh`.
-- Login-shell use (job control, `.bashrc` aliases).
 
-Tests: `python3 -m unittest discover -s tests`.
+Tests: `python3 -m unittest discover -s tests` (unit tests, the phrase
+corpus, a pty-free shell session, injection checks, and the model runtime
+against a stand-in server).
 
 ## How it works
 

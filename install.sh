@@ -7,6 +7,7 @@ BROWSER_BIN_TARGET=/usr/local/bin/ai-browser
 DESKTOP_BIN_TARGET=/usr/local/bin/ai-desktop
 CODE_BIN_TARGET=/usr/local/bin/ai-code
 AISHA_BIN_TARGET=/usr/local/bin/aisha
+AISHA_LIB_DIR=/usr/local/lib/aisha
 CFG_DIR_USER="$HOME/.config/ai-bash"
 CFG_KEY_USER="$CFG_DIR_USER/anthropic-api-key"
 # ai-code (local-LLM coding agent) backend config, written after deploy.
@@ -65,8 +66,14 @@ if [ -f "$SRC_CODE" ]; then
     green "  installed."
 fi
 if [ -f "$SRC_AISHA" ]; then
-    echo "Installing $SRC_AISHA -> $AISHA_BIN_TARGET"
-    sudo install -m 0755 "$SRC_AISHA" "$AISHA_BIN_TARGET"
+    # aisha's code goes in a lib dir as a module so Python caches its bytecode;
+    # /usr/local/bin/aisha is a small launcher.
+    echo "Installing $SRC_AISHA -> $AISHA_LIB_DIR/aisha.py (+ launcher $AISHA_BIN_TARGET)"
+    sudo install -Dm0644 "$SRC_AISHA" "$AISHA_LIB_DIR/aisha.py"
+    printf '#!/usr/bin/env python3\nimport sys\nsys.path.insert(0, "%s")\nimport aisha\naisha.cli()\n' \
+        "$AISHA_LIB_DIR" | sudo tee "$AISHA_BIN_TARGET" >/dev/null
+    sudo chmod 0755 "$AISHA_BIN_TARGET"
+    sudo python3 -m compileall -q "$AISHA_LIB_DIR" || true
     green "  installed."
 fi
 

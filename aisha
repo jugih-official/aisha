@@ -47,10 +47,9 @@ import time
 import platform
 import urllib.error
 import urllib.parse
-import urllib.request
 from dataclasses import dataclass, field
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 # ---- configuration ----------------------------------------------------------
 
@@ -2134,7 +2133,8 @@ def _looks_like_shell(line: str, path_env: str | None = None, known: set = froze
 SYSTEM_PROMPT = """You turn a request into ONE bash command for GNU/Linux.
 Rules:
 - Reply with the command only, on a single line. No explanation, no markdown, no backticks.
-- Use standard tools: ls, find, grep, du, df, ps, cp, mv, mkdir, tar, sort, head, wc, awk, sed.
+- Use tools every Debian system has: ls, find, grep, du, df, ps, cp, mv, mkdir, tar, sort, head, wc,
+  awk, sed, xargs, stat, date, python3. Use other programs only if they are listed as installed.
 - Paths are relative to the current directory unless the request names another place.
 - Prefer safe flags: mv -i, cp -i. Never use sudo unless the request is about system changes.
 - If the request is not something a shell command can do, reply exactly: NONE"""
@@ -2154,6 +2154,22 @@ FEWSHOT = [
 
 class LLMError(Exception):
     pass
+
+
+# Programs the model may only use when they are really here.
+OPTIONAL_TOOLS = ["curl", "wget", "zip", "unzip", "7z", "rsync", "git", "jq", "convert", "ffmpeg",
+                  "docker", "lsof", "tree", "fd", "rg", "bc", "file", "xdg-open"]
+
+
+def os_name() -> str:
+    try:
+        with open("/etc/os-release") as f:
+            for line in f:
+                if line.startswith("PRETTY_NAME="):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return platform.system()
 
 
 # ---- local model runtime ---------------------------------------------------------
@@ -2180,6 +2196,7 @@ def is_local_url(url: str) -> bool:
 
 def url_open(req, timeout: float):
     """urlopen that never sends local requests through an HTTP proxy."""
+    import urllib.request  # only needed for the LLM and downloads; keeps startup fast
     url = req.full_url if isinstance(req, urllib.request.Request) else req
     if is_local_url(url):
         return urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout)
@@ -2286,6 +2303,7 @@ class LLM:
         headers = {"Content-Type": "application/json"}
         if self.cfg.get("llm_key"):
             headers["Authorization"] = f"Bearer {self.cfg['llm_key']}"
+        import urllib.request
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
             try:
@@ -2321,7 +2339,9 @@ class LLM:
             entries = []
         shown = [e + ("/" if os.path.isdir(os.path.join(cwd, e)) else "") for e in entries[:60]]
         more = f" (+{len(entries) - 60} more)" if len(entries) > 60 else ""
-        context = (f"Current directory: {cwd}\n"
+        context = (f"System: {os_name()}\n"
+                   f"Installed extras: {', '.join(t for t in OPTIONAL_TOOLS if shutil.which(t)) or 'none'}\n"
+                   f"Current directory: {cwd}\n"
                    f"Entries here: {', '.join(shown) or '(empty)'}{more}\n")
         if hints:
             context += f"Partial parse by the rule engine (may be wrong): {hints}\n"
@@ -3017,6 +3037,7 @@ class Shell:
 # ---- setup ------------------------------------------------------------------------
 
 def http_json(url: str):
+    import urllib.request
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"})
     with url_open(req, timeout=30) as r:
         return json.load(r)
@@ -3030,6 +3051,7 @@ def download(url: str, dest: str, label: str) -> str:
     headers = {"User-Agent": USER_AGENT}
     if have:
         headers["Range"] = f"bytes={have}-"
+    import urllib.request
     req = urllib.request.Request(url, headers=headers)
     with url_open(req, timeout=60) as r:
         if have and r.status != 206:      # server ignored the range: start over
@@ -3307,8 +3329,13 @@ def main(argv: list[str]) -> int:
     return shell.repl()
 
 
-if __name__ == "__main__":
+def cli() -> None:
+    """Entry point for the installed launcher (/usr/bin/aisha imports this module)."""
     try:
         sys.exit(main(sys.argv[1:]))
     except KeyboardInterrupt:
         sys.exit(130)
+
+
+if __name__ == "__main__":
+    cli()

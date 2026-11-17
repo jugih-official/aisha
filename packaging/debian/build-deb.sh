@@ -22,7 +22,18 @@ STAGE="$(mktemp -d)"
 trap 'rm -rf "$STAGE"' EXIT
 PKG="$STAGE/aisha_${VERSION}_all"
 
-install -Dm0755 "$SRC" "$PKG/usr/bin/aisha"
+# The code lives in /usr/lib/aisha as a module so its bytecode is cached
+# (compiled in postinst); /usr/bin/aisha is a three-line launcher.
+install -Dm0644 "$SRC" "$PKG/usr/lib/aisha/aisha.py"
+install -d "$PKG/usr/bin"
+cat > "$PKG/usr/bin/aisha" <<'EOF'
+#!/usr/bin/python3
+import sys
+sys.path.insert(0, "/usr/lib/aisha")
+import aisha
+aisha.cli()
+EOF
+chmod 0755 "$PKG/usr/bin/aisha"
 install -Dm0644 "$HERE/aisha.1" "$PKG/usr/share/man/man1/aisha.1"
 gzip -9n "$PKG/usr/share/man/man1/aisha.1"
 install -d "$PKG/usr/share/doc/aisha"
@@ -56,9 +67,9 @@ Section: utils
 Priority: optional
 Architecture: all
 Installed-Size: $SIZE_KB
-Depends: python3 (>= 3.10), bash, coreutils, findutils, grep
+Depends: python3 (>= 3.10), bash, coreutils, findutils, grep, debianutils
 Recommends: procps, iproute2, sensible-utils, less
-Suggests: micro, zip, unzip, xdg-utils, ollama
+Suggests: zip, unzip, xdg-utils
 Maintainer: $MAINTAINER
 Homepage: https://github.com/jugih-official/ai-prompt
 Description: natural-language shell with a local LLM fallback
@@ -69,6 +80,28 @@ Description: natural-language shell with a local LLM fallback
  ask a small local model through any OpenAI-compatible server (for
  example Ollama). Commands that delete or change data always ask first.
 EOF
+
+cat > "$PKG/DEBIAN/postinst" <<'EOF'
+#!/bin/sh
+set -e
+if [ "$1" = configure ]; then
+    python3 -m compileall -q /usr/lib/aisha || true
+    add-shell /usr/bin/aisha
+fi
+EOF
+cat > "$PKG/DEBIAN/prerm" <<'EOF'
+#!/bin/sh
+set -e
+rm -rf /usr/lib/aisha/__pycache__
+EOF
+cat > "$PKG/DEBIAN/postrm" <<'EOF'
+#!/bin/sh
+set -e
+if [ "$1" = remove ] || [ "$1" = purge ]; then
+    remove-shell /usr/bin/aisha
+fi
+EOF
+chmod 0755 "$PKG/DEBIAN/postinst" "$PKG/DEBIAN/prerm" "$PKG/DEBIAN/postrm"
 
 mkdir -p "$OUT"
 dpkg-deb --build --root-owner-group "$PKG" "$OUT/aisha_${VERSION}_all.deb" >/dev/null

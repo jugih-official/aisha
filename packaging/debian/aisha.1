@@ -1,4 +1,4 @@
-.TH AISHA 1 "November 2026" "aisha" "User Commands"
+.TH AISHA 1 "November 2026" "aisha 0.2.0" "User Commands"
 .SH NAME
 aisha \- natural-language shell with a local LLM fallback
 .SH SYNOPSIS
@@ -13,7 +13,18 @@ aisha \- natural-language shell with a local LLM fallback
 .B aisha \-c
 .I line
 .br
+.B aisha
+.I script.sh
+.RI [ args ]
+.br
+.B aisha \-\-lines
+.RI < file
+.br
 .B aisha \-\-setup
+.RB [ 0.5b | 1.5b | 3b ]
+.RB [ \-\-yes ]
+.br
+.B aisha \-\-setup remove
 .SH DESCRIPTION
 .B aisha
 is an interactive shell that accepts both bash and plain-language requests.
@@ -24,6 +35,22 @@ words and prints what it understood on a line starting with \(->.
 Only when the rules are not confident is a small local language model asked,
 through any OpenAI-compatible server; its command is always shown and
 confirmed before it runs, and approved answers are remembered.
+.PP
+It is also a regular shell:
+.BR cd ,
+.BR export ,
+aliases and functions persist between lines; Ctrl-Z,
+.BR jobs ,
+.BR fg ,
+.B bg
+and
+.I "cmd &"
+work; Tab completes commands and paths.
+.B "aisha \-c"
+and scripts run in plain bash, so aisha can be a login shell.
+.PP
+Questions such as "how do I delete empty folders" print the command without
+running it.
 .PP
 Commands that delete or change data always ask
 .B [y/N]
@@ -62,11 +89,26 @@ leave
 .B \-n
 print the command that would run, and run nothing
 .TP
-.B \-c
-run one line and exit
+.BI \-c " line"
+like
+.BR "bash \-c" :
+real commands go straight to bash, plain words are interpreted
+.TP
+.BR \-l ", " \-\-login
+load the login environment (/etc/profile, ~/.profile)
+.TP
+.B \-\-lines
+read plain-language lines from standard input, one at a time
 .TP
 .B \-\-setup
-set up and check the local LLM fallback
+set up the optional local model: reuses a running server, Ollama or
+.B llama-server
+on PATH, otherwise downloads llama.cpp and a Qwen2.5-Coder model
+(0.5b, 1.5b or 3b) into ~/.local/share/aisha.
+.B \-\-yes
+answers yes to the download questions;
+.B remove
+deletes the downloads
 .SH ENVIRONMENT
 .TP
 .B AISHA_LLM_URL
@@ -90,6 +132,12 @@ editor used by "edit FILE" (through sensible-editor on Debian)
 .TP
 .I ~/.config/ai-bash/aisha/config.json
 settings (same keys as the environment variables, lower case without AISHA_)
+.TP
+.I ~/.config/ai-bash/aisha/aisharc
+bash aliases, functions and exports loaded at start (as is ~/.bash_aliases)
+.TP
+.I ~/.local/share/aisha
+downloaded llama.cpp runtime and model
 .TP
 .I ~/.config/ai-bash/aisha/learned.json
 remembered phrases

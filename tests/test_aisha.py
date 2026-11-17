@@ -613,3 +613,30 @@ class TestShellSyntaxAndCare(unittest.TestCase):
                     self.assertIn(frag, aisha.interpret(q, d).command, q)
         finally:
             aisha.shutil.which = orig
+
+
+class TestInjection(LabTest):
+    """Names and search terms with shell code must reach bash quoted, never run."""
+
+    PHRASES = [
+        'find files containing "$(touch PWNED1)"',
+        "create a folder called '$(touch PWNED2)'",
+        'search for "`touch PWNED3`" in all files',
+        "find files named ';touch PWNED4;'",
+        'copy README.md to "$(touch PWNED5)"',
+        "make a new file named '`touch PWNED6`'",
+        'find files with "$(touch PWNED7)" in the name',
+        "edit '$(touch PWNED8).txt' with cat",
+        'which files mention "a\'b$(touch PWNED9)"',
+    ]
+
+    def test_no_injection(self):
+        for phrase in self.PHRASES:
+            plan = self.plan(phrase)
+            if plan is None:
+                continue
+            subprocess.run(["bash", "-c", plan.command], cwd=self.lab, capture_output=True,
+                           stdin=subprocess.DEVNULL, timeout=20)
+        found = [os.path.join(r, f) for r, _, fs in os.walk(self.lab) for f in fs if f.startswith("PWNED")]
+        found += [f for f in os.listdir(tempfile.gettempdir()) if f.startswith("PWNED")]
+        self.assertEqual(found, [])
