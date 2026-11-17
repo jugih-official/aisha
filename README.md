@@ -370,10 +370,13 @@ downloads → `urllib`, `free`/`uptime`/`ss`/`ip`/`cal` → `/proc` or
 
 ### A real shell
 
-- `cd`, `export`, aliases and functions persist between lines;
+- `cd`, variables (plain and exported, arrays too), `umask`, `shopt`
+  options, aliases and functions persist between lines;
   `~/.bash_aliases` and `~/.config/ai-bash/aisha/aisharc` are loaded at
-  start.
-- Job control: Ctrl-Z, `jobs`, `fg`, `bg`, `cmd &`.
+  start. (Traps and `set -o` options do not carry over.)
+- Job control: Ctrl-Z, `jobs`, `fg`, `bg`, `cmd &`, `kill %N`.
+- Closing the terminal or `kill`ing aisha passes the signal on to the
+  running command, hangs up jobs, stops the model and saves history.
 - Tab completes commands and paths; history is kept in
   `~/.config/ai-bash/aisha/history`.
 - `aisha -c '…'`, `aisha script.sh` and scripts on stdin run in plain bash,
