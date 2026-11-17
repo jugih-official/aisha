@@ -150,6 +150,78 @@ class TestRules(LabTest):
         self.assertEqual(self.cmd("count lines in README.md"), "wc -l < README.md")
 
 
+class TestEverydayPhrases(LabTest):
+    """The phrases people type most, with the variants and typos they type them with."""
+
+    def old(self, name):
+        path = os.path.join(self.lab, name)
+        t = 1_500_000_000  # 2017
+        os.utime(path, (t, t))
+
+    def test_older_than_months(self):
+        self.old("run1/shopping.txt")
+        for phrase in ["find recursively files older that 2 months from this folder",
+                       "find files older than 2 months",
+                       "find files that are older than two months in this folder and its subfolders",
+                       "find files over 2 months old",
+                       "find 2 month old files",
+                       "find recursivly files oldr than 2 months"]:
+            cmd = self.cmd(phrase)
+            self.assertIn("-mtime +60", cmd, phrase)
+            self.assertEqual(self.run_cmd(cmd), ["./run1/shopping.txt"], phrase)
+
+    def test_edit_default_editor(self):
+        cmd = self.cmd("edit README.md")
+        self.assertTrue(cmd.endswith(" README.md"), cmd)
+        self.assertTrue(cmd.startswith(("sensible-editor", "${VISUAL")), cmd)
+
+    def test_edit_with_named_editor(self):
+        for phrase in ["edit README.md with micro", "edit README.md using micro",
+                       "open README.md in micro", "edit README.md wiht micro"]:
+            cmd = self.cmd(phrase)
+            self.assertTrue(cmd.endswith("micro README.md"), f"{phrase}: {cmd}")
+
+    def test_edit_finds_file_below_or_creates_it(self):
+        self.assertTrue(self.cmd("edit notes.txt").endswith(" run1/notes.txt"))
+        self.assertTrue(self.cmd("edit brand-new.md").endswith(" brand-new.md"))
+
+    def test_missing_editor_is_installed_first(self):
+        orig = aisha.shutil.which
+        aisha.shutil.which = lambda c, *a, **k: None if c == "micro" else orig(c, *a, **k)
+        try:
+            p = self.plan("edit README.md with micro")
+        finally:
+            aisha.shutil.which = orig
+        if aisha.pkg_manager():
+            self.assertIn("install micro && micro README.md", p.command)
+            self.assertTrue(p.destructive)
+
+    def test_find_then_delete(self):
+        p = self.plan("find files older than 2 months and delete them")
+        self.assertEqual(p.intent, "delete")
+        self.assertIn("-mtime +60", p.command)
+        self.assertIn("-delete", p.command)
+        self.assertTrue(p.destructive)
+
+    def test_find_then_move(self):
+        self.old("run1/notes.txt")
+        p = self.plan("find txt files older than 2 months and move them to archive")
+        self.assertTrue(p.destructive)
+        r = subprocess.run(["bash", "-c", p.command], cwd=self.lab, input="", text=True)
+        self.assertEqual(r.returncode, 0)
+        self.assertTrue(os.path.exists(os.path.join(self.lab, "archive", "notes.txt")))
+
+    def test_action_words_are_never_keywords(self):
+        p = self.plan("find files and move them to x")   # nothing narrows it: not a mass move
+        self.assertNotIn("-exec mv", p.command)
+        self.assertNotIn("*move*", p.command)
+
+    def test_edit_and_open_beat_debian_commands(self):
+        # /usr/bin/edit is run-mailcap and /usr/bin/open is openvt on Debian
+        self.assertFalse(aisha.looks_like_shell("edit README.md", None, self.lab))
+        self.assertFalse(aisha.looks_like_shell("open README.md in nano", None, self.lab))
+
+
 class TestSafety(LabTest):
     def test_deletes_are_flagged(self):
         p = self.plan("delete all .tmp files")

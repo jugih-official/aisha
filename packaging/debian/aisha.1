@@ -1,0 +1,102 @@
+.TH AISHA 1 "November 2026" "aisha" "User Commands"
+.SH NAME
+aisha \- natural-language shell with a local LLM fallback
+.SH SYNOPSIS
+.B aisha
+.br
+.B aisha
+.I request-or-command
+.br
+.B aisha \-n
+.I request
+.br
+.B aisha \-c
+.I line
+.br
+.B aisha \-\-setup
+.SH DESCRIPTION
+.B aisha
+is an interactive shell that accepts both bash and plain-language requests.
+Real commands (a program on PATH with flags, paths, pipes or redirects) run in
+bash unchanged.
+Other lines go to a deterministic rule engine that builds the command from the
+words and prints what it understood on a line starting with \(->.
+Only when the rules are not confident is a small local language model asked,
+through any OpenAI-compatible server; its command is always shown and
+confirmed before it runs, and approved answers are remembered.
+.PP
+Commands that delete or change data always ask
+.B [y/N]
+first, and deletes list the matching files before asking.
+.SH EXAMPLES
+.nf
+find recursively files older than 2 months from this folder
+find logs older than 2 months and move them to archive
+edit logs.txt
+edit logs.txt with micro
+show the 5 newest files here
+which files mention "invoice"
+what's eating my disk
+.fi
+.SH INSIDE THE SHELL
+.TP
+.BI ! command
+run in bash, skipping the rules
+.TP
+.BI ? request
+skip the rules and ask the LLM
+.TP
+.BI explain " request"
+show what would run, run nothing
+.TP
+.BR learned ", " forget " \fIrequest\fR"
+list or drop remembered LLM answers
+.TP
+.B llm
+check the local model
+.TP
+.BR exit ", Ctrl-D"
+leave
+.SH OPTIONS
+.TP
+.B \-n
+print the command that would run, and run nothing
+.TP
+.B \-c
+run one line and exit
+.TP
+.B \-\-setup
+set up and check the local LLM fallback
+.SH ENVIRONMENT
+.TP
+.B AISHA_LLM_URL
+OpenAI-compatible endpoint (default http://127.0.0.1:11434/v1, Ollama)
+.TP
+.B AISHA_LLM_MODEL
+model name (default qwen2.5-coder:1.5b)
+.TP
+.B AISHA_LLM
+set to off to disable the LLM fallback
+.TP
+.B AISHA_THRESHOLD
+confidence below which the rules defer to the LLM (default 0.7)
+.TP
+.B AISHA_CONFIRM
+llm (default), always, or destructive
+.TP
+.BR VISUAL ", " EDITOR
+editor used by "edit FILE" (through sensible-editor on Debian)
+.SH FILES
+.TP
+.I ~/.config/ai-bash/aisha/config.json
+settings (same keys as the environment variables, lower case without AISHA_)
+.TP
+.I ~/.config/ai-bash/aisha/learned.json
+remembered phrases
+.TP
+.I ~/.config/ai-bash/aisha/history
+command history
+.SH SEE ALSO
+.BR bash (1),
+.BR find (1),
+.BR sensible-editor (1)

@@ -331,10 +331,28 @@ Every line goes through these stages and stops at the first that handles it:
 
 What the rules understand today: listing, finding (by type, name, content,
 size, age, emptiness), text search, counting, sizes and disk usage, showing
-files (`cat`/`head`/`tail`/follow), copy/move/rename/delete, creating files
-and folders, `chmod`, zip/tar and extract, `cd`/`pwd`, memory/CPU/processes,
+and editing files, copy/move/rename/delete, creating files and folders,
+`chmod`, zip/tar and extract, `cd`/`pwd`, memory/CPU/processes,
 OS/IP/ports/drives, services, and packages. Anything else falls through to
 the LLM.
+
+Everyday phrases and how they come out:
+
+| You type | aisha runs |
+|---|---|
+| `find recursively files older that 2 months from this folder` | `find . … -type f -mtime +60 -print` |
+| `find files over 2 months old` / `find 2 month old files` | same |
+| `find logs older than 2 months and move them to archive` | `mkdir -p -- archive && find . … -iname '*.log' -mtime +60 … -exec mv -i -t archive -- {} +` (preview, then `[y/N]`) |
+| `delete files older than 2 months` | `find . -type f -mtime +60 … -delete` (preview, then `[y/N]`) |
+| `edit logs.txt` | `sensible-editor logs.txt` — your `$VISUAL`/`$EDITOR`, else Debian's `editor` |
+| `edit logs.txt with micro` / `… using micro` / `open logs.txt in micro` | `micro logs.txt` |
+| `edit app.log` (when it is in `var/log/`) | `sensible-editor var/log/app.log` |
+
+Typos are retried once against the words the rules know: `find recursivly
+files oldr than 2 months` works, and the `→` line says `read
+recursivly→recursively, oldr→older`. "older that" is read as "older than".
+When a named tool is missing (`micro`, `zip`, `unzip`, `7z`) the command
+installs it first with apt, and asks before running.
 
 ```sh
 aisha                                   # interactive shell
@@ -378,6 +396,27 @@ llama.cpp's `llama-server`, LM Studio or another server, set the endpoint in
 
 Without a model, aisha still works; requests the rules don't understand get
 the rules' best guess with a confirmation, or a "don't know how yet".
+
+### Debian package
+
+```sh
+packaging/debian/build-deb.sh            # -> dist/aisha_<version>_all.deb
+sudo apt install ./dist/aisha_*_all.deb
+```
+
+The package installs `/usr/bin/aisha` and `man aisha`. It needs Python 3.10+
+(Debian 12 or newer) and recommends `procps`, `iproute2` and
+`sensible-utils`. `install.sh` instead copies the script to
+`/usr/local/bin`, which comes first in `PATH`; use one or the other.
+
+### Roadmap
+
+- **Windows.** The rule engine (words → slots) is platform-neutral; the
+  command builder and the executor are bash/GNU-specific. The Windows port
+  adds a second builder that turns the same slots into PowerShell
+  (`Get-ChildItem -Recurse -File | Where-Object LastWriteTime -lt …`) and runs
+  it through `pwsh`.
+- Login-shell use (job control, `.bashrc` aliases).
 
 Tests: `python3 -m unittest discover -s tests`.
 

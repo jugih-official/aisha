@@ -458,6 +458,7 @@ class FindSpec:
     limit: int | None = None
     why: list = field(default_factory=list)
     unparsed: list = field(default_factory=list)    # words seen but not understood
+    exclude: list = field(default_factory=list)     # -not -path patterns
 
     def narrowed(self) -> bool:
         return bool(self.exts or self.names or self.hidden or self.empty
@@ -465,6 +466,7 @@ class FindSpec:
 
 
 MOD = r"(?:(?:modified|changed|edited|created|updated|touched|saved|made|written)\s+)?"
+THAN = r"(?:than|then|that)"   # "older that 2 months" is a typo people make
 
 
 def to_bytes(n: float, unit: str) -> int:
@@ -494,7 +496,7 @@ def take_size(u: Utterance, spec: FindSpec) -> None:
     big = (r"(?:bigger|larger|greater|heavier|more|over|above|exceeding|at\s+least|>=?)")
     small = r"(?:smaller|less|lighter|under|below|at\s+most|<=?)"
     for word, sign, label in ((big, "+", ">"), (small, "-", "<")):
-        m = u.take(rf"(?:\b|(?=[<>])){word}\s*(?:than\s+)?{NUM}\s*{SUNIT}\b")
+        m = u.take(rf"(?:\b|(?=[<>])){word}\s*(?:{THAN}\s+)?{NUM}\s*{SUNIT}\b")
         if m:
             n = num(m.group(1), 1)
             spec.size += ["-size", size_arg(sign, n, m.group(2))]
@@ -523,9 +525,9 @@ def take_time(u: Utterance, spec: FindSpec) -> None:
         return
     rules = [  # (pattern, sign, number group, unit group)
         (rf"\b{MOD}(?:(?:in|within|during|over|from)\s+)?(?:the\s+)?(?:last|past|previous)\s+(?:{NUM}\s*)?{TUNIT}\b", "-"),
-        (rf"\b{MOD}(?:newer\s+than|less\s+than|under|within)\s+{NUM}\s*{TUNIT}(?:\s+(?:old|ago))?\b", "-"),
+        (rf"\b{MOD}(?:newer\s+{THAN}|less\s+{THAN}|under|within)\s+{NUM}\s*{TUNIT}(?:\s+(?:old|ago))?\b", "-"),
         (rf"\b(?:not|never|have\s+not\s+been|has\s+not\s+been)\s+(?:been\s+)?(?:modified|changed|touched|used|accessed|opened|edited)\s+(?:in|for|during|since)\s+(?:the\s+)?(?:last|past)?\s*(?:{NUM}\s*)?{TUNIT}\b", "+"),
-        (rf"\b{MOD}(?:older\s+than|more\s+than|over|at\s+least)\s+{NUM}\s*{TUNIT}(?:\s+(?:old|ago))?\b", "+"),
+        (rf"\b{MOD}(?:older\s+{THAN}|more\s+{THAN}|over|at\s+least)\s+{NUM}\s*{TUNIT}(?:\s+(?:old|ago))?\b", "+"),
         (rf"\b{NUM}\s*{TUNIT}\s+old\b", "+"),
     ]
     for pat, sign in rules:
@@ -534,7 +536,8 @@ def take_time(u: Utterance, spec: FindSpec) -> None:
             n, unit = num(m.group(1), 1), m.group(2)
             spec.time = time_args(n, unit, sign)
             what = "within the last" if sign == "-" else "older than"
-            spec.why.append(f"modified {what} {m.group(1) or 1} {unit}")
+            days = f" ({spec.time[1].lstrip('+-')} days)" if unit[0] in "wmy" and not unit.startswith("min") else ""
+            spec.why.append(f"modified {what} {m.group(1) or 1} {unit}{days}")
             return
     m = u.take(rf"\b{MOD}this\s+(week|month|year)\b")
     if m:
@@ -803,9 +806,17 @@ def parse_filters(u: Utterance, spec: FindSpec) -> None:
     take_types(u, spec)
 
 
+# Verbs that ask for an action. In a find they mean "and then do X", never a
+# search keyword; left unplaced they lower confidence instead.
+ACTION_WORDS = set("""
+delete remove erase trash move copy rename compress zip archive edit open show list count
+kill run execute install send upload download print sort
+""".split())
+
+
 def absorb_keywords(u: Utterance, spec: FindSpec, mode: str, limit: int = 2) -> int:
     """Leftover nouns become name/content keywords ("find the budget pdf")."""
-    words = [w for w in u.leftover() if w not in TIMEISH][:limit]
+    words = [w for w in u.leftover() if w not in TIMEISH and w not in ACTION_WORDS][:limit]
     if not words:
         return 0
     for w in words:
@@ -855,6 +866,8 @@ def find_tests(spec: FindSpec) -> list[str]:
         t += (["-daystart"] if spec.daystart else []) + spec.time
     for g in spec.names:
         t += ["-iname", shlex.quote(g)]
+    for pat in spec.exclude:
+        t += ["-not", "-path", shlex.quote(pat)]
     for mode, needle, _ in spec.content:
         grep = ["-exec", "grep", "-IqiF", "-e", shlex.quote(needle), "{}", "\\;"]
         if mode == "content":
@@ -878,7 +891,9 @@ def render_find(spec: FindSpec, action: str = "list", default_rec: bool = True) 
         parts += ["-path", "'*/.git'", "-prune", "-o"] + find_tests(spec)
     tail = ""
     limit = spec.limit or (10 if spec.sort and spec.sort[0] != "name" else None)
-    if action == "delete":
+    if action.startswith("exec:"):
+        parts += ["-exec"] + action[5:].split() + ["{}", "+"]
+    elif action == "delete":
         if spec.ftype == "d" and not spec.empty:
             parts += ["-prune", "-exec", "rm", "-r", "--", "{}", "+"]
         else:
@@ -925,7 +940,9 @@ class Plan:
     confidence: float = 1.0
     destructive: bool = False
     preview: str | None = None      # shown before a destructive run
+    warning: str | None = None      # replaces the generic "deletes or changes" line
     unknown: list = field(default_factory=list)
+    keywords: list = field(default_factory=list)    # words used as search terms
     source: str = "rules"           # rules | learned | llm
 
     def rationale(self) -> str:
@@ -939,6 +956,8 @@ GUESS_PENALTY = 0.92     # per leftover word it turned into a keyword
 def finish(u: Utterance, plan: Plan, guessed: int = 0, spec: FindSpec | None = None) -> Plan:
     left = u.leftover() + (spec.unparsed if spec else [])
     plan.unknown = left
+    if spec:
+        plan.keywords = [c[1] for c in spec.content] + [g.strip("*") for g in spec.names]
     plan.confidence *= (UNKNOWN_PENALTY ** len(left)) * (GUESS_PENALTY ** guessed)
     if left:
         plan.why.append("ignored: " + " ".join(left))
@@ -968,10 +987,13 @@ def split_items(text: str) -> list[str]:
 # Each takes a fresh Utterance and returns a Plan or None. interpret() runs
 # them all and keeps the most confident plan.
 
+FIND_VERB = (r"\b(?:find|search(?:\s+for)?|look(?:ing)?\s+for|locate|show\s+me\s+where|"
+             r"where\s+(?:is|are|did\s+i\s+(?:put|save))|hunt\s+for|track\s+down|seek|"
+             r"(?:which|what)(?=\s+(?:\S+\s+){0,2}?(?:files?|folders?|directories|pdfs?|images?|photos?|videos?|scripts?|documents?|docs)\b))\b")
+
+
 def h_find(u: Utterance) -> Plan | None:
-    m = u.take(r"\b(?:find|search(?:\s+for)?|look(?:ing)?\s+for|locate|show\s+me\s+where|"
-               r"where\s+(?:is|are|did\s+i\s+(?:put|save))|hunt\s+for|track\s+down|seek|"
-               r"(?:which|what)(?=\s+(?:\S+\s+){0,2}?(?:files?|folders?|directories|pdfs?|images?|photos?|videos?|scripts?|documents?|docs)\b))\b")
+    m = u.take(FIND_VERB)
     if not m:
         return None
     by_name = m.group(0).startswith(("where", "locate", "show me where"))
@@ -1159,13 +1181,70 @@ def h_size(u: Utterance) -> Plan | None:
     return finish(u, Plan(f"du -sh {qpath(target)}", "size", [target]))
 
 
+# Editors people name ("edit logs.txt with micro"): word -> (command, Debian package)
+EDITORS = {
+    "micro": ("micro", "micro"), "nano": ("nano", "nano"), "vim": ("vim", "vim"),
+    "vi": ("vi", "vim"), "nvim": ("nvim", "neovim"), "neovim": ("nvim", "neovim"),
+    "emacs": ("emacs", "emacs"), "helix": ("hx", None), "hx": ("hx", None),
+    "kakoune": ("kak", "kakoune"), "kak": ("kak", "kakoune"), "joe": ("joe", "joe"),
+    "ne": ("ne", "ne"), "jed": ("jed", "jed"), "mcedit": ("mcedit", "mc"),
+    "gedit": ("gedit", "gedit"), "kate": ("kate", "kate"), "mousepad": ("mousepad", "mousepad"),
+    "geany": ("geany", "geany"), "xed": ("xed", "xed"), "pluma": ("pluma", "pluma"),
+    "code": ("code", None), "vscode": ("code", None), "vs": ("code", None),
+}
+
+
+def take_program(u: Utterance):
+    """'with micro', 'using vim', 'in nano' -> (command, package). Blanks it."""
+    pat = (r"\b(?:with|using|in|via|through)\s+(?:the\s+|my\s+)?(?:editor\s+|program\s+|app\s+)?"
+           r"([a-z][\w.+-]*)(?:\s+code)?(?:\s+(?:editor|program|app))?\b")
+    for m in re.finditer(pat, u.text):
+        word = m.group(1)
+        if word in EDITORS:
+            u.blank(m.start(), m.end())
+            return EDITORS[word]
+        if (word not in FILLER and shutil.which(word)
+                and not os.path.isdir(os.path.join(u.cwd, word))):
+            u.blank(m.start(), m.end())
+            return (word, None)
+    return None
+
+
+SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", ".cache", ".tox"}
+
+
+def find_below(name: str, cwd: str, max_depth: int = 4, max_entries: int = 20000) -> list[str]:
+    """Relative paths of files called `name` under cwd (shallow first)."""
+    hits, seen = [], 0
+    base_depth = cwd.rstrip(os.sep).count(os.sep)
+    for root, dirs, files in os.walk(cwd):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith("."))
+        if root.count(os.sep) - base_depth >= max_depth:
+            dirs[:] = []
+        seen += len(files)
+        for f in files:
+            if f.lower() == name.lower():
+                hits.append(os.path.relpath(os.path.join(root, f), cwd))
+        if seen > max_entries:
+            break
+    return sorted(hits, key=lambda p: (p.count(os.sep), p))
+
+
+def default_editor() -> tuple[str, str]:
+    # Debian's sensible-editor honours $VISUAL/$EDITOR, then the `editor` alternative.
+    if shutil.which("sensible-editor"):
+        return "sensible-editor", "your default editor ($VISUAL/$EDITOR, else Debian's 'editor')"
+    return "${VISUAL:-${EDITOR:-nano}}", "your default editor ($VISUAL/$EDITOR, else nano)"
+
+
 def h_read(u: Utterance) -> Plan | None:
-    m = u.take(r"\b(?:show|print|display|cat|read|view|open|output|dump|see|look\s+at|check|edit|head|tail|"
-               r"follow|watch|what\s+is\s+in|contents?\s+of)\b")
+    m = u.take(r"\b(?:show|print|display|cat|read|view|open|output|dump|see|look\s+at|check|edit|modify|"
+               r"head|tail|follow|watch|what\s+is\s+in|contents?\s+of)\b")
     verb = m.group(0) if m else ""
     if not m and not u.peek(r"\b(?:first|top|last|bottom)\s+(?:\S+\s+)?lines?\b|\b(?:beginning|start|end)\s+of\b"):
         return None
-    u.take(r"\b(?:the\s+)?contents?\s+of\b|\bcontents?\b")
+    u.take(r"\b(?:the\s+)?contents?\s+of\b|\bcontents?\b|\bfor\s+editing\b")
+    program = take_program(u)
     n = None
     mode = "cat"
     mh = u.take(rf"\b(?:first|top)\s+(?:{NUM}\s+)?lines?\b|\b(?:beginning|start|head)\s+of\b")
@@ -1180,27 +1259,72 @@ def h_read(u: Utterance) -> Plan | None:
         mode, n = "head", n or 10
     if verb == "tail" and mode != "follow":
         mode, n = "tail", n or 10
-    if verb == "edit":
+    if verb in ("edit", "modify") or (program and program[0] in {c for c, _ in EDITORS.values()}):
         mode = "edit"
+    elif program:
+        mode = "program"
+
+    why: list[str] = []
+    conf = 1.0
     path, _ = first_target(u, "file")
     if not path:
+        # a file name that is not here: look further down, or create it when editing
+        for low, orig, start in u.remaining():
+            name = u.lit(orig)
+            if not low.startswith("qlit") or not is_pathlike(name):
+                continue
+            hits = find_below(os.path.basename(name), u.cwd) if "/" not in name else []
+            u.blank(start, start + len(orig))
+            if len(hits) == 1:
+                path = hits[0]
+                why.append(f"found at {path}")
+            elif len(hits) > 1:
+                path = hits[0]
+                why.append(f"{len(hits)} files named {name}; using the nearest")
+                why.append("others: " + ", ".join(hits[1:4]) + (" …" if len(hits) > 4 else ""))
+                conf = 0.8
+            elif mode == "edit":
+                path = name
+                why.append("new file")
+            break
+    if not path:
         return None
-    u.take(r"\b(?:log|file|text)\b")
+    u.take(r"\b(?:log|file|text|document)\b")
     q = qpath(path)
+    reqs = []
     if mode == "head":
-        cmd, why = f"head -n {int(n)} {q}", [f"first {int(n)} lines"]
+        cmd, intent = f"head -n {int(n)} {q}", "show file"
+        why.append(f"first {int(n)} lines")
     elif mode == "tail":
-        cmd, why = f"tail -n {int(n)} {q}", [f"last {int(n)} lines"]
+        cmd, intent = f"tail -n {int(n)} {q}", "show file"
+        why.append(f"last {int(n)} lines")
     elif mode == "follow":
-        cmd, why = f"tail -f {q}", ["follow new lines (Ctrl-C stops)"]
+        cmd, intent = f"tail -f {q}", "show file"
+        why.append("follow new lines (Ctrl-C stops)")
     elif mode == "edit":
-        cmd, why = f"${{EDITOR:-nano}} {q}", ["open in $EDITOR"]
+        intent = "edit"
+        if program:
+            cmd = f"{program[0]} {q}"
+            reqs.append(program)
+            why.append(f"with {program[0]}")
+        else:
+            editor, label = default_editor()
+            cmd = f"{editor} {q}"
+            why.append(label)
+    elif mode == "program":
+        cmd, intent = f"{program[0]} {q}", "open"
+        why.append(f"with {program[0]}")
     elif verb == "open" and not is_text(os.path.join(u.cwd, os.path.expanduser(path))):
-        cmd, why = f"xdg-open {q}", ["open with the default app"]
+        cmd, intent = f"xdg-open {q}", "open"
+        reqs.append(("xdg-open", "xdg-utils"))
+        why.append("with the default app")
     else:
         long = line_count(os.path.join(u.cwd, os.path.expanduser(path))) > 200
-        cmd, why = (f"less -FRX {q}", ["long file, paged"]) if long else (f"cat {q}", [])
-    return finish(u, Plan(cmd, "show file", [path] + why))
+        cmd, intent = (f"less -FRX {q}", "show file") if long else (f"cat {q}", "show file")
+        if long:
+            why.append("long file, paged")
+    plan = finish(u, Plan(cmd, intent, [path] + why, confidence=conf))
+    return require(plan, reqs)
 
 
 def is_text(path: str) -> bool:
@@ -1259,6 +1383,36 @@ def resolve_dest(u: Utterance, text: str) -> str:
     return path or t
 
 
+def h_find_then(u: Utterance) -> Plan | None:
+    """'find logs older than 2 months and move them to old/'"""
+    m = u.peek(r"^(.*?)\s+(?:and|then)\s+(?:also\s+)?(move|copy)\s+(?:them|those|these|it|all\s+of\s+them|"
+               r"the\s+results?)\s+(?:to|into|in|inside)\s+(.+)$")
+    if not m:
+        return None
+    left = Utterance(u.o(m, 1), u.cwd, u.literals)
+    if not left.take(FIND_VERB) and not left.take(r"\b(?:list|show|get)\b"):
+        return None
+    spec = FindSpec()
+    parse_filters(left, spec)
+    guessed = absorb_keywords(left, spec, "any")
+    if not spec.narrowed():
+        return None   # "find files and move them" would move everything
+    dest = resolve_dest(u, u.o(m, 3))
+    u.text = " " * len(u.text)
+    spec.ftype = spec.ftype or "f"
+    tool = "mv" if m.group(2) == "move" else "cp"
+    if not dest.startswith(("/", "~")):
+        spec.exclude.append(f"./{dest.strip('./')}/*" if spec.root == "." else f"*/{dest.strip('./')}/*")
+    cmd = render_find(spec, f"exec:{tool} -i -t {qpath(dest)} --")
+    if not os.path.isdir(os.path.join(u.cwd, os.path.expanduser(dest))):
+        cmd = f"mkdir -p -- {qpath(dest)} && {cmd}"
+    plan = Plan(cmd, "move" if tool == "mv" else "copy",
+                [where_label(spec, True)] + spec.why + [f"→ {dest}", "asks before overwriting"],
+                destructive=True, preview=render_find(spec, "list"),
+                warning=f"! {'moves' if tool == 'mv' else 'copies'} the files listed above into {dest}")
+    return finish(left, plan, guessed, spec)
+
+
 def h_copy_move(u: Utterance) -> Plan | None:
     m = u.peek(r"\b(copy|cp|duplicate|move|mv|rename)\s+(.+?)\s+(?:to|into|in|as|inside|over\s+to)\s+(.+)$")
     mb = u.peek(r"\b(?:back\s*up|make\s+a\s+backup\s+of|create\s+a\s+backup\s+of)\s+(.+)$")
@@ -1297,6 +1451,9 @@ def h_copy_move(u: Utterance) -> Plan | None:
 def h_delete(u: Utterance) -> Plan | None:
     if not u.take(r"\b(?:delete|remove|rm|erase|trash|get\s+rid\s+of|clean\s+up|wipe|destroy)\b"):
         return None
+    # "find X and delete them" / "delete all X you can find"
+    u.take(r"\b(?:find|search\s+for|look\s+for|locate|list|show(?:\s+me)?|get)\b")
+    u.take(r"\b(?:and|then)\s+(?:also\s+)?(?=\s*$)|\b(?:them|those|these|all\s+of\s+them|the\s+results?)\b")
     if u.peek(r"\b(?:package|program|app|application|software)\b"):
         return None
     spec = FindSpec()
@@ -1385,7 +1542,7 @@ def h_archive(u: Utterance) -> Plan | None:
             dest = m.group(3) and u.lit(u.o(m, 3)) or stemname + (".zip" if use_zip else ".tar.gz")
             cmd = (f"zip -r {qpath(dest)} {qpath(src)}" if use_zip else
                    f"tar -czf {qpath(dest)} {qpath(src)}")
-        return Plan(cmd, "compress", [f"{src} → {dest}"])
+        return require(Plan(cmd, "compress", [f"{src} → {dest}"]), [("zip", "zip")] if use_zip else [])
     m = u.peek(r"\b(?:extract|unzip|unpack|decompress|uncompress|untar|open\s+up)\s+(\S+)(?:\s+(?:to|into|in)\s+(\S+))?")
     if not m:
         return None
@@ -1395,7 +1552,9 @@ def h_archive(u: Utterance) -> Plan | None:
     u.text = " " * len(u.text)
     dest = resolve_dest(u, u.o(m, 2)) if m.group(2) else None
     low = src.lower()
+    reqs = []
     if low.endswith(".zip"):
+        reqs = [("unzip", "unzip")]
         cmd = f"unzip {qpath(src)}" + (f" -d {qpath(dest)}" if dest else "")
     elif re.search(r"\.(tar(\.(gz|bz2|xz|zst))?|tgz|tbz2|txz)$", low):
         cmd = (f"mkdir -p -- {qpath(dest)} && " if dest else "") + f"tar -xf {qpath(src)}" + (f" -C {qpath(dest)}" if dest else "")
@@ -1403,11 +1562,13 @@ def h_archive(u: Utterance) -> Plan | None:
         cmd = f"gunzip -k {qpath(src)}"
     elif low.endswith(".7z"):
         cmd = f"7z x {qpath(src)}" + (f" -o{qpath(dest)}" if dest else "")
+        reqs = [("7z", "p7zip-full")]
     elif low.endswith(".rar"):
         cmd = f"unrar x {qpath(src)}" + (f" {qpath(dest)}/" if dest else "")
+        reqs = [("unrar", "unrar-free")]
     else:
         return None
-    return Plan(cmd, "extract", [src] + ([f"into {dest}"] if dest else []))
+    return require(Plan(cmd, "extract", [src] + ([f"into {dest}"] if dest else [])), reqs)
 
 
 def h_cd(u: Utterance) -> Plan | None:
@@ -1490,6 +1651,46 @@ def pkg_manager() -> str | None:
     return None
 
 
+def sudo() -> str:
+    """'sudo ' unless already root (Debian without sudo: run aisha as root)."""
+    geteuid = getattr(os, "geteuid", None)
+    return "" if geteuid and geteuid() == 0 else "sudo "
+
+
+INSTALL = {"apt": "apt install", "dnf": "dnf install", "pacman": "pacman -S",
+           "zypper": "zypper install", "apk": "apk add", "brew": "install"}
+UNINSTALL = {"apt": "apt remove", "dnf": "dnf remove", "pacman": "pacman -R",
+             "zypper": "zypper remove", "apk": "apk del", "brew": "uninstall"}
+
+
+def install_cmd(pkgs: list[str], remove: bool = False) -> str | None:
+    pm = pkg_manager()
+    if not pm:
+        return None
+    verb = (UNINSTALL if remove else INSTALL)[pm]
+    if pm == "brew":
+        return f"brew {verb} {' '.join(pkgs)}"
+    return f"{sudo()}{verb} {' '.join(pkgs)}"
+
+
+def require(plan: Plan, reqs: list) -> Plan:
+    """Prefix an install step when a tool the plan needs is missing."""
+    missing = [(c, p) for c, p in reqs if not shutil.which(c)]
+    if not missing:
+        return plan
+    names = ", ".join(c for c, _ in missing)
+    pkgs = [p for _, p in missing if p]
+    inst = install_cmd(pkgs) if len(pkgs) == len(missing) else None
+    if inst:
+        plan.command = f"{inst} && {plan.command}"
+        plan.why.append(f"{names} is not installed — installs {' '.join(pkgs)} first")
+        plan.destructive = True
+        plan.warning = f"! installs {' '.join(pkgs)} (needs your password)"
+    else:
+        plan.why.append(f"{names} is not installed")
+    return plan
+
+
 def h_process(u: Utterance) -> Plan | None:
     m = u.peek(r"\bis\s+(\S+)\s+(?:running|up|alive|active)\b")
     if m:
@@ -1501,8 +1702,8 @@ def h_process(u: Utterance) -> Plan | None:
         u.text = " " * len(u.text)
         act = "status" if m.group(1).startswith(("status", "check")) else m.group(1)
         name = u.lit(u.o(m, 2))
-        sudo = "" if act == "status" else "sudo "
-        return Plan(f"{sudo}systemctl {act} {shlex.quote(name)}", "service", [f"{act} {name}"],
+        su = "" if act == "status" else sudo()
+        return Plan(f"{su}systemctl {act} {shlex.quote(name)}", "service", [f"{act} {name}"],
                     destructive=act != "status")
     m = u.peek(r"\b(?:kill|stop|terminate|end|close|quit|force\s+quit)\s+(?:the\s+|all\s+)?(?:process(?:es)?\s+)?(\S+)(?:\s+process(?:es)?)?$")
     if m and u.peek(r"\b(?:kill|process|terminate|force\s+quit)\b"):
@@ -1514,36 +1715,103 @@ def h_process(u: Utterance) -> Plan | None:
 
 
 def h_package(u: Utterance) -> Plan | None:
-    pm = pkg_manager()
     m = u.peek(r"\b(install|uninstall|remove|purge)\s+(?:the\s+)?(?:package\s+|program\s+|app\s+)?(\S+)(?:\s+(?:package|program|app))?$")
     if m and (m.group(1) in ("install", "uninstall", "purge") or u.peek(r"\b(?:package|program|app)\b")):
-        if not pm:
+        name = u.lit(u.o(m, 2))
+        cmd = install_cmd([shlex.quote(name)], remove=m.group(1) != "install")
+        if not cmd:
             return None
         u.text = " " * len(u.text)
-        name = shlex.quote(u.lit(u.o(m, 2)))
-        add = {"apt": "sudo apt install", "dnf": "sudo dnf install", "pacman": "sudo pacman -S",
-               "zypper": "sudo zypper install", "apk": "sudo apk add", "brew": "brew install"}[pm]
-        rem = {"apt": "sudo apt remove", "dnf": "sudo dnf remove", "pacman": "sudo pacman -R",
-               "zypper": "sudo zypper remove", "apk": "sudo apk del", "brew": "brew uninstall"}[pm]
-        verb = add if m.group(1) == "install" else rem
-        return Plan(f"{verb} {name}", "packages", [f"{m.group(1)} {u.lit(u.o(m, 2))} with {pm}"], destructive=True)
+        return Plan(cmd, "packages", [f"{m.group(1)} {name} with {pkg_manager()}"], destructive=True,
+                    warning="! changes installed software")
     if u.peek(r"\b(?:update|upgrade)\s+(?:the\s+|my\s+|all\s+)?(?:system|packages|software|everything|computer)\b|^(?:update|upgrade)$"):
+        pm = pkg_manager()
         if not pm:
             return None
         u.text = " " * len(u.text)
-        cmd = {"apt": "sudo apt update && sudo apt upgrade", "dnf": "sudo dnf upgrade",
-               "pacman": "sudo pacman -Syu", "zypper": "sudo zypper update", "apk": "sudo apk upgrade",
+        su = sudo()
+        cmd = {"apt": f"{su}apt update && {su}apt upgrade", "dnf": f"{su}dnf upgrade",
+               "pacman": f"{su}pacman -Syu", "zypper": f"{su}zypper update", "apk": f"{su}apk upgrade",
                "brew": "brew update && brew upgrade"}[pm]
-        return Plan(cmd, "packages", [f"upgrade everything with {pm}"], destructive=True)
+        return Plan(cmd, "packages", [f"upgrade everything with {pm}"], destructive=True,
+                    warning="! changes installed software")
     return None
 
 
 HANDLERS = [h_system, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
-            h_copy_move, h_delete, h_read, h_grep, h_count, h_size, h_find, h_list]
+            h_find_then, h_copy_move, h_delete, h_read, h_grep, h_count, h_size, h_find, h_list]
+
+
+# Words the rules key on. A leftover word one typo away from one of these is
+# retried as that word ("recursivly", "fodler", "modifed").
+VOCAB = set("""
+find search locate list show display delete remove copy move rename create make edit open
+extract compress files file folder folders directory directories recursively recursive
+subfolders older newer bigger larger smaller modified changed created today yesterday
+minutes hours days weeks months years containing contain contains named called empty
+hidden largest biggest smallest newest oldest recent sorted size count lines memory disk
+space processes running install uninstall update upgrade executable everything inside
+with using than from into this that here
+""".split()) | set(TYPE_WORDS) | {w + "s" for w in TYPE_WORDS} | set(EDITORS)
+
+
+def one_edit_apart(a: str, b: str) -> bool:
+    """Levenshtein distance 1, or one swap of neighbours."""
+    if a == b or abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        diff = [i for i in range(len(a)) if a[i] != b[i]]
+        return len(diff) == 1 or (len(diff) == 2 and diff[1] == diff[0] + 1
+                                  and a[diff[0]] == b[diff[1]] and a[diff[1]] == b[diff[0]])
+    if len(a) > len(b):
+        a, b = b, a
+    return any(b[:i] + b[i + 1:] == a for i in range(len(b)))
+
+
+# Real words one letter away from VOCAB words; never "corrected".
+COMMON = set("""
+last past most must just lost cost post host test best rest fast list lift life mile fine
+fold hold told sold cold bold gold mold role hole pole line lines mine nine pine wine time
+tile pile bile size side wide ride hide made make take sake same name game came fame code
+mode node move love live give five dive data date gate late fate rate hate mate copy cope
+show shoe slow snow know flow glow grow fine find kind mind bind wind
+""".split()) - VOCAB
+
+
+def fix_typos(text: str) -> tuple[str, list[str]]:
+    """Replace whole plain words (never file names or quotes) one typo off VOCAB."""
+    fixes, out, quoted = [], [], False
+    for tok in text.split(" "):
+        if tok.count('"') % 2 or tok.count("'") % 2:
+            quoted = not quoted
+        w = tok.lower()
+        if (not quoted and len(w) >= 4 and w.isalpha() and w not in VOCAB and w not in FILLER
+                and w not in TIMEISH and w not in GENERIC and w not in COMMON):
+            cands = sorted(v for v in VOCAB if one_edit_apart(w, v))
+            if len(cands) == 1:
+                fixes.append(f"{w}→{cands[0]}")
+                tok = cands[0]
+        out.append(tok)
+    return " ".join(out), fixes
 
 
 def interpret(text: str, cwd: str) -> Plan | None:
-    """Best deterministic plan for a sentence, or None if nothing applies."""
+    """Best deterministic plan for a sentence, retrying once with typos fixed."""
+    best = _interpret(text, cwd)
+    if best is not None and best.confidence >= 0.999:
+        return best
+    fixed, fixes = fix_typos(text)
+    if fixes:
+        again = _interpret(fixed, cwd)
+        targets = {f.split("→")[1] for f in fixes}
+        used_as_keyword = any(stem(t) in again.keywords or t in again.keywords for t in targets) if again else True
+        if again and not used_as_keyword and (best is None or again.confidence > best.confidence):
+            again.why.append("read " + ", ".join(fixes))
+            return again
+    return best
+
+
+def _interpret(text: str, cwd: str) -> Plan | None:
     best = None
     for handler in HANDLERS:
         try:
@@ -1582,6 +1850,11 @@ AMBIGUOUS_FIRST = {"go", "kill", "find", "sort", "open", "make", "which", "who",
                    "unzip", "watch", "head", "tail", "touch", "less", "more", "split"}
 
 
+# On Debian `edit` is run-mailcap and `open` is openvt: nobody typing
+# "edit logs.txt" means those, so the rules always get first go.
+PREFER_RULES = {"edit", "open", "view"}
+
+
 def looks_like_shell(line: str, path_env: str | None = None, cwd: str | None = None,
                      threshold: float = DEFAULTS["threshold"]) -> bool:
     if not _looks_like_shell(line, path_env):
@@ -1592,6 +1865,11 @@ def looks_like_shell(line: str, path_env: str | None = None, cwd: str | None = N
     except ValueError:
         return True
     rest = toks[1:]
+    if (cwd and toks[0] in PREFER_RULES and rest and not any(t.startswith("-") for t in rest)
+            and not re.search(r"[|&;<>`$]", line)):
+        plan = interpret(line, cwd)
+        if plan and plan.confidence >= threshold:
+            return False
     if (cwd and toks[0] in AMBIGUOUS_FIRST and rest
             and not any(t.startswith("-") for t in rest)
             and not re.search(r"[|&;<>`$]", line)
@@ -1935,7 +2213,7 @@ class Shell:
             self.show_preview(plan.preview)
         if need:
             if plan.destructive:
-                say(yellow("! this deletes or changes things"))
+                say(yellow(plan.warning or "! this deletes or changes things"))
                 ans = ask("run? [y/N] ")
                 ok = ans is not None and ans.strip().lower() in ("y", "yes")
             else:
