@@ -1164,6 +1164,83 @@ class TestRunThings(LabTest):
                          and not p.command.startswith(("cat", "less")))
 
 
+class TestNetwork(LabTest):
+    """Interfaces are simulated: eno1 (wired) and wlp3s0 (Wi-Fi)."""
+
+    def setUp(self):
+        super().setUp()
+        self.saved = (aisha.net_ifaces, aisha.nm_running, aisha.sudo, aisha.iface_with_addr)
+        aisha.net_ifaces = lambda: [{"name": "eno1", "wireless": False, "virtual": False},
+                                    {"name": "wlp3s0", "wireless": True, "virtual": False}]
+        aisha.sudo = lambda: "sudo "
+        aisha.iface_with_addr = lambda a: "eno1" if a.startswith("192.168.20.1") else None
+        self.nm(True)
+
+    def tearDown(self):
+        aisha.net_ifaces, aisha.nm_running, aisha.sudo, aisha.iface_with_addr = self.saved
+        super().tearDown()
+
+    def nm(self, on):
+        aisha.nm_running = lambda: on
+
+    def change(self, phrase):
+        self.assertFalse(aisha.looks_like_shell(phrase, None, self.lab), phrase)
+        p = self.plan(phrase)
+        self.assertIsNotNone(p, phrase)
+        self.assertGreaterEqual(p.confidence, 0.7, f"{phrase}: {p.rationale()}")
+        self.assertTrue(p.destructive, phrase)             # network changes always ask
+        return p.command
+
+    def test_static_address_in_any_order(self):
+        for phrase, dev in [("set ip 192.168.20.1/24 to interface eno1", "eno1"),
+                            ("set ip 192.168.20.1/24 to wifi interface", "wlp3s0"),
+                            ("assign 192.168.20.1/24 to eno1", "eno1"),
+                            ("give the wired card the address 192.168.20.1/24", "eno1"),
+                            ("eno1 should have ip 192.168.20.1/24", "eno1"),
+                            ("change the ip address of the wireless interface to 192.168.20.1/24", "wlp3s0"),
+                            ("set dhcp off on 192.168.20.1", "eno1")]:
+            cmd = self.change(phrase)
+            self.assertIn(f"device show {dev})", cmd, phrase)
+            self.assertIn("ipv4.method manual ipv4.addresses 192.168.20.1/24", cmd, phrase)
+
+    def test_netmask_gateway_and_dns(self):
+        cmd = self.change("set static ip 192.168.20.5 netmask 255.255.0.0 on eno1 gateway 192.168.20.254 dns 1.1.1.1 8.8.8.8")
+        self.assertIn("ipv4.addresses 192.168.20.5/16", cmd)
+        self.assertIn("ipv4.gateway 192.168.20.254", cmd)
+        self.assertIn('ipv4.dns "1.1.1.1 8.8.8.8"', cmd)
+        self.assertIn("ipv4.gateway 192.168.20.254", self.change("set the gateway of eno1 to 192.168.20.254"))
+        self.assertNotIn("ipv4.addresses", self.change("set the gateway of eno1 to 192.168.20.254"))
+
+    def test_add_remove_dhcp_and_static(self):
+        self.assertIn("+ipv4.addresses 10.0.0.5/24", self.change("add another ip 10.0.0.5/24 to eno1"))
+        self.assertIn("-ipv4.addresses 10.0.0.5/24", self.change("remove 10.0.0.5/24 from eno1"))
+        self.assertIn("ipv4.method auto", self.change("use dhcp on the wifi interface"))
+        self.assertIn("ipv4.method manual", self.change("disable dhcp on eno1"))   # keeps the current address
+
+    def test_without_networkmanager_it_uses_ip(self):
+        self.nm(False)
+        self.assertEqual(self.change("set ip 192.168.20.1/24 to interface eno1"),
+                         "sudo ip address flush dev eno1 && sudo ip address add 192.168.20.1/24 dev eno1")
+        self.assertEqual(self.change("bring eno1 down"), "sudo ip link set dev eno1 down")
+
+    def test_interfaces_up_down_and_radios(self):
+        self.assertEqual(self.change("enable eno1"), "nmcli device connect eno1")
+        self.assertEqual(self.change("take the wired interface down"), "nmcli device disconnect eno1")
+        self.assertEqual(self.change("turn wifi off"), "nmcli radio wifi off")
+        self.assertIn("rfkill block bluetooth", self.change("turn off bluetooth"))
+        self.assertIn("nmcli radio all off", self.change("airplane mode on"))
+
+    def test_unknown_or_unclear_interface_asks(self):
+        for phrase in ["set ip 192.168.20.5/24 to eth7", "set ip 192.168.20.5/24"]:
+            p = self.plan(phrase)
+            self.assertTrue(p.show_only, phrase)                # says which interfaces there are, runs nothing
+
+    def test_real_network_commands_are_left_alone(self):
+        for line in ["ip address add 10.0.0.1/24 dev eno1", "nmcli device status", "ip link set eno1 up"]:
+            p = self.plan(line)
+            self.assertFalse(p and p.intent in ("network", "radio"), line)
+
+
 class zipfile_lab:
     def __init__(self, lab):
         self.lab = lab

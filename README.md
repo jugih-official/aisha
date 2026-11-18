@@ -98,6 +98,25 @@ About 240 kinds of request, without a model:
   networks/name/password, ssh, scp to and from a server, sync folders,
   firewall (block or open a port), active connections, devices on my wifi,
   renew my IP.
+- **Network interfaces and radios**, in any word order: list interfaces,
+  details, up or down, link speed; set, add or remove an address (with
+  netmask, gateway and DNS), DHCP on or off, gateway, DNS, MTU, MAC
+  address; Wi-Fi and Bluetooth on or off, airplane mode, radio status;
+  connect to or forget a Wi-Fi network, its password, a hotspot. aisha reads
+  the real interfaces from `/sys/class/net`, so "the wifi" or "the wired
+  card" become `wlp3s0` or `eno1`. With NetworkManager running, changes go
+  through `nmcli` and last; without it they use `ip` and last until reboot.
+  Every change asks `[y/N]`; commands you type (`ip …`, `nmcli …`) run as
+  they are.
+
+  | You type | aisha runs (NetworkManager) |
+  |---|---|
+  | `set ip 192.168.20.1/24 to interface eno1` | `nmcli connection modify <eno1's connection> ipv4.method manual ipv4.addresses 192.168.20.1/24 && nmcli connection up …` |
+  | `give the wifi interface 10.0.0.5/24 with gateway 10.0.0.1` | the same for `wlp3s0`, plus `ipv4.gateway 10.0.0.1` |
+  | `set dhcp off on 192.168.20.1` | the interface that has 192.168.20.1 becomes static at that address |
+  | `use dhcp on eno1` | `… ipv4.method auto …` |
+  | `bring eno1 down` / `enable eno1` | `nmcli device disconnect eno1` / `nmcli device connect eno1` |
+  | `turn wifi off` / `airplane mode on` | `nmcli radio wifi off` / `nmcli radio all off && rfkill block bluetooth` |
 - **Git** (inside a repository) — what changed, recent commits, branch,
   switch/create branch, commit with a message, push, pull, undo last commit,
   discard changes, diff of a file, who changed a file, stash, clone, init,

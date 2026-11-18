@@ -755,7 +755,7 @@ free up port 3000	3000 ;; fuser -vk || kill
 what's slowing down my computer	uptime ;; --sort=-%cpu
 my pc is really slow, why	uptime ;; --sort=-%cpu
 restart networking	systemctl restart
-restart my wifi	systemctl restart
+restart my wifi	systemctl restart || nmcli radio wifi || rfkill block wifi
 which users are admins	getent group sudo
 who can use sudo	getent group sudo
 show bob's groups	id -nG bob
