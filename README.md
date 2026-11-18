@@ -57,17 +57,25 @@ became a general fix and a test; `tests/phrases.tsv` and
 
 ## What the rules understand
 
-About 140 kinds of request, without a model:
+About 240 kinds of request, without a model:
 
 - **Files** — list, find (type, name, content, size and size ranges, age,
   owner, empty, hidden, broken links, duplicates, exclusions), file tree,
   details, type, permissions, owner, checksums, show/head/tail/follow/edit,
   copy/move/rename/delete (also "find … and delete/move/copy them"), bulk
   extension renames, trash, symlinks, zip/tar/extract and archive contents,
-  backups, downloads, compare, replace text, count files by extension.
+  backups, downloads, compare, replace text, count files by extension,
+  "everything except X", "all but the newest 3", the Nth newest file, files
+  edited yesterday afternoon, newer than a file, before a year, with spaces
+  in the name, world-writable, unreadable, not mine, not executable, full
+  path, size in bytes, empty a folder but keep it, add a file to a zip,
+  password-protected zips, extract one file, the real trash.
 - **Text** — line N or lines N–M, line numbers, sort, unique lines, remove
   duplicate lines, count matches, reverse, pretty-print JSON, CSV as a
-  table, append or write a line, empty a file, base64, upper/lower case.
+  table, append or write a line, empty a file, base64, upper/lower case,
+  columns and sorting by a column, lines without a word, the most common
+  lines, grep with context, matches per file, delete line N / blank lines /
+  the header, tabs to spaces, JSON keys, CSV to JSON, is this JSON/zip valid.
 - **Dates and numbers** — arithmetic, time in a city, timezone, week number,
   dates N days from now, timestamps, timers, reminders, random numbers,
   dice, coin, passwords, UUIDs.
@@ -75,22 +83,31 @@ About 140 kinds of request, without a model:
   inodes, swap, GPU, USB and PCI devices, hardware, screen resolution,
   processes and what a program uses, ports and freeing one, kernel
   messages, system errors, boot and service logs, services (start, stop,
-  restart, status, running, failed), logins, sudo rights, locale, keyboard,
-  reboot/shutdown/scheduled shutdown, lock screen.
+  restart, status, running, failed, enabled at boot, logs, uptime), logins,
+  failed logins, sudo rights, locale, keyboard, reboot/shutdown now, in N
+  minutes, at a time or tonight, lock screen, why is my computer slow, the
+  process tree, kill by port / all but one / the top CPU process, pause and
+  resume a program, threads and total memory of a program, swap per process,
+  docker space, clean-up and stopping containers.
 - **Packages** — install, remove, search, info, which package owns a file,
   files of a package, recently installed, check for updates, upgrade, clean
-  up old packages.
+  up old packages, install several at once, purge, fix broken packages,
+  upgrade everything except the kernel, which packages take the most space.
 - **Shell** — variables, aliases (saved to `aisharc`), adding to `PATH`,
   what a command does, its manual, repeat every N seconds, time a command,
   run in the background, as root, notify when done, `again`.
 - **Network** — IPs, gateway, routes, DNS servers, MAC addresses, is a host
   up, DNS lookup, is a port open on a host, HTTP headers, weather, Wi-Fi
   networks/name/password, ssh, scp to and from a server, sync folders,
-  firewall.
+  firewall (block or open a port), active connections, devices on my wifi,
+  renew my IP.
 - **Git** (inside a repository) — what changed, recent commits, branch,
   switch/create branch, commit with a message, push, pull, undo last commit,
-  discard changes, diff of a file, who changed a file, stash, clone, init.
-- **Users and desktop** — add a user, add to a group, change password,
+  discard changes, diff of a file, who changed a file, stash, clone, init,
+  show/revert the last commit, undo a pull, squash, blame a line, delete a
+  branch, stop tracking a file, unstage, remove untracked files.
+- **Users and desktop** — add or delete a user, make someone an admin, who
+  has sudo, a user's groups, who can log in, add to a group, change password,
   become root, switch user, open a website or app, web search, screenshot,
   volume.
 
@@ -112,12 +129,12 @@ Wording is normalised before the rules run: politeness ("could you … for
 me, thanks", "I'd like to", "help me", "go ahead and"), synonyms, a verb at
 the end, missing articles and typos of any word aisha knows.
 `tests/test_robustness.py` rewrites every tested request those ways (about
-2,400 variants) and requires at least 97% to still give the right command;
-it is at 98%.
+3,900 variants) and requires at least 97% to still give the right command;
+it is at 97.4%.
 
 "what can you do" inside aisha lists examples. Actions you rule out ("find
 tmp files, don't remove them") are never run. `tests/phrases.tsv` lists the
-380+ requests the test suite checks, including ones the rules must leave to
+820+ requests the test suite checks, including ones the rules must leave to
 the model.
 
 | You type | aisha runs |
@@ -182,11 +199,25 @@ manage remembered phrases, `llm` checks the model, `help` lists examples.
   start in.
 - Actions you rule out ("find tmp files, don't remove them") never run, and
   a "not" the rules can't place sends the request to the model.
+- Power words are never handed to bash: `reboot nginx` restarts the nginx
+  service (systemd's `reboot` would take the word as an argument and restart
+  the computer), `reboot tonight` schedules it, `reboot later` asks when.
+  "yes" and "thanks" get a reply instead of running `yes`.
+- "Everything except X" keeps X; if X isn't there, nothing is deleted. A
+  file name is never written into an archive as text. "To the trash" uses
+  the real trash (`gio trash`).
+- A guess from the "closest things" list that deletes or changes things is
+  never listed first, and a guess never reboots or powers off the computer
+  unless you said so.
 - Extraction never replaces existing files; copies and backups ask before
   overwriting.
 - Names and search terms are always quoted, so text like `$(…)` in a file
   name is never executed.
 - `aisha -n …` and "how do I …" only show the command.
+
+`tests/findings.md` is the ledger of a bug hunt: two agents competed to find
+requests aisha got wrong, a third judged them. All 109 accepted findings are
+fixed and in `tests/phrases.tsv`.
 
 ## Optional language model
 

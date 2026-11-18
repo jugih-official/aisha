@@ -531,3 +531,342 @@ list files chronologically	ls -lhtr
 # -- usb (drive actions are in TestUSB, which fakes the drive)
 list all connected usb	USB drives || lsblk
 what usb drives are connected	lsblk
+# --- from the findings game (tests/findings.md): the phrase each player found, and the judge's paraphrases
+delete everything except report.pdf	! -name report.pdf ;; -mindepth 1 -maxdepth 1
+copy everything except backup.zip to /tmp/x	-not -iname backup.zip ;; /tmp/x
+move the oldest log to archive	head -z -n 1 ;; archive
+zip all the pdfs	zip ;; *.pdf
+biggest folder	du -sh ;; sort -hr
+how many lines does each txt file have	-exec wc -l {} + ;; *.txt
+encode report.pdf in base64	base64 -- report.pdf || base64 report.pdf
+convert logs.txt to lowercase	tr '[:upper:]' '[:lower:]'
+lines in logs.txt that don't contain error	grep -v ;; error ;; logs.txt
+second newest file	sed -n 2p
+files I edited yesterday afternoon	12:00 ;; 18:00
+delete all but the newest 3 files	tail -n +4
+top 10 lines in logs.txt by frequency	uniq -c ;; head -n 10
+empty the log file	: > ;; app.log
+move everything from run1 to here	find run1 -mindepth 1 -maxdepth 1 ;; mv
+what folder am i in	pwd
+list files in run1 and src	run1 src
+list all files but not the hidden ones	! -name '.*'
+find files with spaces in the name	-name '* *'
+find world writable files	-perm -0002
+find files with 777 permissions	-perm 0777
+find files i can't read	! -readable
+find files containing both error and warning	grep -rlIi ;; error ;; warning
+files newer than report.pdf	-newer report.pdf
+show the 3rd column of people.csv	cut -d, -f3
+sort people.csv by the second column	sort -t, -k2,2
+show the keys in data.json	keys()
+convert people.csv to json	csv.DictReader
+compress each file in run1	gzip -k
+replace all occurrences of error with ERROR in every txt file	s/error/ERROR/g ;; *.txt
+make run.sh readable only by me	chmod go-rwx
+remove execute permission from run.sh	chmod -x
+size of report.pdf in bytes	stat -c %s
+files modified before 2024	! -newermt 2024-01-01
+check if data.json is valid json	json.tool
+full path of report.pdf	realpath
+add notes.txt to backup.zip	zip -j backup.zip
+change all tabs to spaces in run.sh	\t ;; run.sh
+create a password protected zip of report.pdf	zip -e
+move all pdfs older than a week to the trash	gio trash || trash-put || Trash ;; -mtime +7
+extract only README.md from data.tar.gz	data.tar.gz README.md
+delete line 3 from logs.txt	sed -i '3d'
+delete the first line of people.csv	sed -i '1d'
+remove blank lines from logs.txt	sed -i '/^[[:space:]]*$/d'
+remove all files in run1 but keep the folder	find run1 -mindepth 1 -delete
+show lines containing error in logs.txt with 2 lines of context	-C 2
+count lines matching error in each file	grep -rcIi
+which file has the most lines	wc -l ;; sort -nr
+how many files of each type in run1	uniq -c ;; run1
+find .sh files that are not executable	! -executable
+test if backup.zip is corrupted	zipfile -t || unzip -t
+extract data.tar.gz and delete it	tar ;; rm
+search for error case sensitive in logs.txt	grep -nF -- error logs.txt
+write hello to logs.txt	> logs.txt
+find files not owned by me	! -user
+kill the app on port 3000	3000 ;; fuser -vk || kill
+why is my computer slow	uptime ;; --sort=-%cpu
+who has sudo	getent group sudo
+what groups is bob in	id -nG bob
+how much space does docker use	docker system df || /var/lib/docker
+how much space is left on /home	df -h -- /home
+update everything except the kernel	apt-mark hold
+install vlc and gimp	install vlc gimp
+block port 22	22
+show the last commit	git show --stat HEAD
+revert the last commit	git revert --no-edit HEAD
+undo my last git pull	git reset --keep ORIG_HEAD
+squash the last 3 commits	git reset --soft HEAD~3
+who wrote line 10 of README.md	git blame -L 10,10
+last 3 commits please	git log --oneline ;; -n 3
+delete the branch feature-x	git branch -d feature-x
+show logs since yesterday 3pm	journalctl --since 'yesterday 15:00'
+failed login attempts	failed|invalid
+show the process tree	--forest || pstree
+kill -9 firefox	pkill -9 -- firefox
+how many threads does firefox have	nlwp
+uptime of nginx	ActiveEnterTimestamp
+make bob an admin	usermod -aG sudo bob
+delete user bob	deluser bob
+which users can log in	nologin
+what's the uuid of my disk	UUID
+where is my home folder	$HOME
+time in tokyo	TZ=Asia/Tokyo
+who is using my wifi	ip neigh
+which packages take the most space	Installed-Size
+fix broken packages	dpkg --configure -a
+how much ram does chrome use in total	rss ;; awk
+what's the date next friday	date -d 'next friday'
+show active connections	state established
+show all variables with proxy	env | grep -i -- proxy
+remove README.md from git	git rm --cached -- README.md
+remove untracked files	git clean -fd
+clean up docker	docker system prune
+stop all docker containers	docker ps -q | xargs -r docker stop
+kill all python processes except 1234	grep -vxF 1234
+kill python but not jupyter	grep -v -- jupyter
+kill the process using the most cpu	--sort=-%cpu ;; kill
+pause firefox	pkill -STOP -- firefox
+renew my ip	nmcli || dhclient
+what's using my swap	VmSwap
+convert 1700000000000 to a date	date -d @1700000000
+purge nginx	apt purge nginx
+remove nginx completely	apt purge nginx
+undo git add	git restore --staged
+reboot nginx	systemctl restart nginx
+reboot tonight	shutdown -r 23:00
+reboot in 5 minutes	shutdown -r +5
+restart the network	systemctl restart
+shut down nginx	systemctl stop nginx
+follow nginx logs	journalctl -u nginx -f
+show sshd logs	journalctl -u ssh
+is ssh enabled at boot	systemctl is-enabled ssh
+list services that start at boot	--state=enabled
+nginx status	systemctl status nginx
+remove everything except report.pdf	! -name report.pdf ;; -mindepth 1 -maxdepth 1
+get rid of everything but report.pdf	! -name report.pdf ;; -mindepth 1 -maxdepth 1
+copy all files but backup.zip to /tmp/x	-not -iname backup.zip ;; /tmp/x
+copy everything apart from backup.zip into /tmp/x	-not -iname backup.zip ;; /tmp/x
+move the oldest .log file into archive	head -z -n 1 ;; archive
+put the oldest log file in the archive folder	head -z -n 1 ;; archive
+make a zip of all the pdf files	zip ;; *.pdf
+put all the pdfs in a zip	zip ;; *.pdf
+which folder is the largest	du -sh ;; sort -hr
+what folder takes the most space	du -sh ;; sort -hr
+line count per txt file	-exec wc -l {} + ;; *.txt
+count the lines in every txt file separately	-exec wc -l {} + ;; *.txt
+base64 encode report.pdf	base64 -- report.pdf || base64 report.pdf
+convert report.pdf to base64	base64 -- report.pdf || base64 report.pdf
+show lines in logs.txt without error	grep -v ;; error ;; logs.txt
+lines of logs.txt not containing error	grep -v ;; error ;; logs.txt
+2nd newest file	sed -n 2p
+second most recently modified file	sed -n 2p
+files modified yesterday afternoon	12:00 ;; 18:00
+what did I change yesterday afternoon	12:00 ;; 18:00
+keep only the 3 newest files	tail -n +4
+delete everything except the 3 most recent files	tail -n +4
+most common lines in logs.txt	uniq -c ;; head -n 10
+which lines repeat most in logs.txt	uniq -c ;; head -n 10
+clear the contents of var/log/app.log	: > ;; app.log
+truncate app.log to zero	: > ;; app.log
+move all files out of run1 into this folder	find run1 -mindepth 1 -maxdepth 1 ;; mv
+move run1's contents up here	find run1 -mindepth 1 -maxdepth 1 ;; mv
+which directory am i in	pwd
+show what's in run1 and src	run1 src
+list run1 and src	run1 src
+list files without the hidden files	! -name '.*'
+show files excluding hidden ones	! -name '.*'
+which files have a space in their name	-name '* *'
+find filenames containing spaces	-name '* *'
+find files anyone can write to	-perm -0002
+files writable by everyone	-perm -0002
+which files am i not allowed to read	! -readable
+find unreadable files	! -readable
+files that contain error and warning	grep -rlIi ;; error ;; warning
+which files mention both error and warning	grep -rlIi ;; error ;; warning
+files modified after report.pdf	-newer report.pdf
+which files changed since report.pdf	-newer report.pdf
+print column 3 of people.csv	cut -d, -f3
+third field of people.csv	cut -d, -f3
+sort people.csv by column 2	sort -t, -k2,2
+order people.csv by the second field	sort -t, -k2,2
+list the top-level keys of data.json	keys()
+what keys does data.json have	keys()
+turn people.csv into json	csv.DictReader
+people.csv as json	csv.DictReader
+gzip every file in run1 separately	gzip -k
+compress the files in run1 one by one	gzip -k
+change error to ERROR in all txt files	s/error/ERROR/g ;; *.txt
+replace error with ERROR in all .txt files	s/error/ERROR/g ;; *.txt
+make run.sh private	chmod go-rwx
+only i should be able to read run.sh	chmod go-rwx
+make run.sh not executable	chmod -x
+take away the execute bit on run.sh	chmod -x
+how many bytes is report.pdf	stat -c %s
+exact size of report.pdf	stat -c %s
+files older than 2024	! -newermt 2024-01-01
+files last changed before january 2024	! -newermt 2024-01-01
+is data.json valid json	json.tool
+validate data.json	json.tool
+absolute path of report.pdf	realpath
+where exactly is report.pdf	realpath
+put notes.txt into backup.zip	zip -j backup.zip
+add run1/notes.txt to the zip backup.zip	zip -j backup.zip
+convert tabs to spaces in run.sh	\t ;; run.sh
+replace tabs with spaces in run.sh	\t ;; run.sh
+zip report.pdf with a password	zip -e
+make an encrypted zip of report.pdf	zip -e
+trash pdfs older than 7 days	gio trash || trash-put || Trash ;; -mtime +7
+get README.md out of data.tar.gz	data.tar.gz README.md
+unpack just README.md from data.tar.gz	data.tar.gz README.md
+remove line 3 of logs.txt	sed -i '3d'
+delete the third line in logs.txt	sed -i '3d'
+remove the header line from people.csv	sed -i '1d'
+drop the first line of people.csv	sed -i '1d'
+delete empty lines in logs.txt	sed -i '/^[[:space:]]*$/d'
+strip blank lines from logs.txt	sed -i '/^[[:space:]]*$/d'
+empty the run1 folder	find run1 -mindepth 1 -delete
+delete everything inside run1	find run1 -mindepth 1 -delete
+grep error in logs.txt with 2 lines before and after	-C 2
+show error lines in logs.txt plus 2 lines around them	-C 2
+how many lines mention error in each file	grep -rcIi
+count error lines per file	grep -rcIi
+longest file by line count	wc -l ;; sort -nr
+which file here has the most lines in it	wc -l ;; sort -nr
+count files by extension in run1	uniq -c ;; run1
+file types in run1 and how many of each	uniq -c ;; run1
+which shell scripts are missing the execute bit	! -executable
+find non-executable .sh files	! -executable
+check backup.zip for errors	zipfile -t || unzip -t
+is backup.zip ok	zipfile -t || unzip -t
+unpack data.tar.gz then remove the archive	tar ;; rm
+extract data.tar.gz and remove it afterwards	tar ;; rm
+case-sensitive search for error in logs.txt	grep -nF -- error logs.txt
+grep error in logs.txt matching case	grep -nF -- error logs.txt
+overwrite logs.txt with hello	> logs.txt
+write the word hello into logs.txt	> logs.txt
+reboot the nginx server	systemctl restart nginx
+bounce nginx	systemctl restart nginx
+kill the thing on port 3000	3000 ;; fuser -vk || kill
+free up port 3000	3000 ;; fuser -vk || kill
+what's slowing down my computer	uptime ;; --sort=-%cpu
+my pc is really slow, why	uptime ;; --sort=-%cpu
+restart networking	systemctl restart
+restart my wifi	systemctl restart
+which users are admins	getent group sudo
+who can use sudo	getent group sudo
+show bob's groups	id -nG bob
+which groups does bob belong to	id -nG bob
+docker disk usage	docker system df || /var/lib/docker
+how big is docker on my disk	docker system df || /var/lib/docker
+free space on /home	df -h -- /home
+how full is /home	df -h -- /home
+upgrade all packages but not the kernel	apt-mark hold
+update the system without the kernel	apt-mark hold
+install both vlc and gimp	install vlc gimp
+close port 22 in the firewall	22
+deny port 22	22
+what changed in the last commit	git show --stat HEAD
+show me the latest commit	git show --stat HEAD
+git revert the last commit	git revert --no-edit HEAD
+make a commit that undoes the last one	git revert --no-edit HEAD
+undo git pull	git reset --keep ORIG_HEAD
+go back to before the last pull	git reset --keep ORIG_HEAD
+squash my last 3 commits into one	git reset --soft HEAD~3
+combine the last three commits	git reset --soft HEAD~3
+who changed line 10 in README.md	git blame -L 10,10
+blame line 10 of README.md	git blame -L 10,10
+last 3 commits	git log --oneline ;; -n 3
+my last three commits	git log --oneline ;; -n 3
+remove branch feature-x	git branch -d feature-x
+delete the local branch feature-x	git branch -d feature-x
+system logs since 3pm yesterday	journalctl --since 'yesterday 15:00'
+show the journal since yesterday 15:00	journalctl --since 'yesterday 15:00'
+ssh logs	journalctl -u ssh
+show logs for sshd	journalctl -u ssh
+show failed ssh logins	failed|invalid
+who tried to log in and failed	failed|invalid
+process tree	--forest || pstree
+show processes as a tree	--forest || pstree
+force kill firefox	pkill -9 -- firefox
+kill firefox with signal 9	pkill -9 -- firefox
+thread count of firefox	nlwp
+how many threads is firefox running	nlwp
+since when is nginx up	ActiveEnterTimestamp
+give bob sudo rights	usermod -aG sudo bob
+add bob to the sudo group	usermod -aG sudo bob
+remove the user bob	deluser bob
+delete bob's account	deluser bob
+list users that can log in	nologin
+which accounts have a login shell	nologin
+show disk uuids	UUID
+uuid of my partitions	UUID
+does ssh start at boot	systemctl is-enabled ssh
+is ssh enabled on startup	systemctl is-enabled ssh
+what is my home directory	$HOME
+path of my home folder	$HOME
+tokyo time	TZ=Asia/Tokyo
+current time in tokyo	TZ=Asia/Tokyo
+who is connected to my network	ip neigh
+what devices are on my network	ip neigh
+biggest installed packages	Installed-Size
+what packages use the most disk space	Installed-Size
+repair broken apt packages	dpkg --configure -a
+apt is broken, fix it	dpkg --configure -a
+total memory used by chrome	rss ;; awk
+how much memory is chrome using altogether	rss ;; awk
+what date is next friday	date -d 'next friday'
+when is next friday	date -d 'next friday'
+list open network connections	state established
+what connections are active	state established
+show proxy environment variables	env | grep -i -- proxy
+which env vars mention proxy	env | grep -i -- proxy
+restart the computer in 5 minutes	shutdown -r +5
+schedule a reboot in 5 minutes	shutdown -r +5
+stop tracking README.md	git rm --cached -- README.md
+untrack README.md in git	git rm --cached -- README.md
+clean the repo	git clean -fd
+delete untracked files in git	git clean -fd
+prune docker	docker system prune
+free up docker space	docker system prune
+stop every running container	docker ps -q | xargs -r docker stop
+docker stop all	docker ps -q | xargs -r docker stop
+kill every python process but 1234	grep -vxF 1234
+stop all python processes except pid 1234	grep -vxF 1234
+kill the top cpu process	--sort=-%cpu ;; kill
+kill whatever is eating my cpu	--sort=-%cpu ;; kill
+freeze firefox	pkill -STOP -- firefox
+pause the firefox process	pkill -STOP -- firefox
+which services are enabled	--state=enabled
+what starts at boot	--state=enabled
+get a new ip address	nmcli || dhclient
+renew my dhcp lease	nmcli || dhclient
+which processes use swap	VmSwap
+swap usage per process	VmSwap
+what date is 1700000000000	date -d @1700000000
+1700000000000 milliseconds to a date	date -d @1700000000
+is nginx ok	systemctl status nginx
+nginx service status	systemctl status nginx
+purge the nginx package	apt purge nginx
+uninstall nginx and delete its config	apt purge nginx
+uninstall nginx completely	apt purge nginx
+get rid of nginx entirely	apt purge nginx
+unstage everything	git restore --staged
+unstage all files	git restore --staged
+make logs.txt lowercase	tr '[:upper:]' '[:lower:]'
+lowercase the contents of logs.txt	tr '[:upper:]' '[:lower:]'
+find files with mode 777	-perm 0777
+which files are chmod 777	-perm 0777
+files owned by someone else	! -user
+which files here aren't mine	! -user
+reboot later tonight	shutdown -r 23:00
+restart the computer tonight	shutdown -r 23:00
+shut down the nginx service	systemctl stop nginx
+stop nginx service	systemctl stop nginx
+tail the nginx logs	journalctl -u nginx -f
+watch nginx logs live	journalctl -u nginx -f
+kill all python processes except jupyter	grep -v -- jupyter
+stop python but keep jupyter running	grep -v -- jupyter

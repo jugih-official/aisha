@@ -1056,6 +1056,78 @@ class TestRuleReview(LabTest):
         self.assertFalse(p and "apt" in p.command)
 
 
+class TestFindingsGame(LabTest):
+    """Safety bugs from the findings game (tests/findings.md); each must stay fixed."""
+
+    def test_power_words_never_reach_bash(self):
+        for line in ["reboot nginx", "reboot tonight", "reboot in 5 minutes", "shutdown the server later",
+                     "yes", "yes please", "kill -9 firefox", "time in tokyo"]:
+            self.assertFalse(aisha.looks_like_shell(line, None, self.lab), line)
+        for line in ["reboot", "shutdown now", "shutdown -r +5", "kill -9 1234", "time ls", "yes | head -n 2"]:
+            self.assertTrue(aisha.looks_like_shell(line, None, self.lab), line)
+
+    def test_reboot_a_service_restarts_it(self):
+        self.assertIn("systemctl restart nginx", self.cmd("reboot nginx"))
+        self.assertIn("shutdown -r +5", self.cmd("reboot in 5 minutes"))
+        p = self.plan("reboot later")
+        self.assertTrue(p.show_only)            # asks when, runs nothing
+
+    def test_delete_everything_except_keeps_it(self):
+        p = self.plan("delete everything except README.md")
+        self.assertTrue(p.destructive)
+        self.assertIsNotNone(p.preview)
+        subprocess.run(["bash", "-c", p.command], cwd=self.lab, check=True)
+        self.assertEqual(sorted(os.listdir(self.lab)), [".git", "README.md"])
+
+    def test_except_a_missing_name_deletes_nothing(self):
+        p = self.plan("delete everything except neewst.txt")
+        self.assertFalse(p and p.confidence >= aisha.DEFAULTS["threshold"] and "rm" in p.command)
+        p = self.plan("get rid of everything but README.md")
+        self.assertNotIn("rm -- README.md", p.command)
+
+    def test_a_file_is_never_written_into_an_archive_as_text(self):
+        with zipfile_lab(self.lab):
+            for line in ["add run1/notes.txt to backup.zip", "put run1/notes.txt into backup.zip"]:
+                cmd = self.cmd(line)
+                self.assertNotIn(">", cmd, line)
+                self.assertIn("zip -j backup.zip", cmd)
+
+    def test_trash_is_the_real_trash(self):
+        for line in ["move README.md to the trash", "trash old.tmp", "trash all .tmp files"]:
+            cmd = self.cmd(line)
+            self.assertRegex(cmd, r"gio trash|trash-put|Trash/files", line)
+            self.assertNotIn("mkdir -p -- trash", cmd)
+
+    def test_oldest_moves_only_one(self):
+        self.assertIn("head -z -n 1", self.cmd("move the oldest txt file to done"))
+
+    def test_kill_except_spares_the_pid(self):
+        self.assertIn("grep -vxF 1234", self.cmd("kill all python processes except 1234"))
+
+    def test_guesses_never_reboot(self):
+        for phrase, plan, _ in aisha.suggest("restart the wlan thing", self.lab):
+            self.assertNotRegex(plan.command, r"\b(?:reboot|poweroff|shutdown)\b", phrase)
+
+    def test_chatter_runs_nothing(self):
+        sh = aisha.Shell(dict(aisha.DEFAULTS, llm="off"))
+        sh.cwd = self.lab
+        for line in ["yes", "yes please", "thanks", "ok"]:
+            self.assertEqual(sh.handle(line), 0, line)
+
+
+class zipfile_lab:
+    def __init__(self, lab):
+        self.lab = lab
+
+    def __enter__(self):
+        import zipfile
+        with zipfile.ZipFile(os.path.join(self.lab, "backup.zip"), "w") as z:
+            z.writestr("a.txt", "a")
+
+    def __exit__(self, *a):
+        return False
+
+
 class TestPlaces(LabTest):
     def test_home_spellings(self):
         for phrase in ["list files in ~home", "list files in home", "list files in $HOME", "list files in my home",

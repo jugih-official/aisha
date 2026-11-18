@@ -49,7 +49,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 # ---- configuration ----------------------------------------------------------
 
@@ -703,7 +703,8 @@ def take_sort_limit(u: Utterance, spec: FindSpec) -> None:
         spec.sort = ("name", False)
     if spec.sort and not spec.limit and re.search(
             r"\b(?:the\s+)?(?:largest|biggest|heaviest|smallest|newest|latest|oldest|most\s+recent)\s+"
-            r"(?:[\w.]+\s+){0,2}?(?:file|folder|directory|one|image|photo|picture|pdf|video|document)\b(?!s)", u.low):
+            r"(?:[\w.]+\s+){0,2}?(?:file|folder|directory|one|image|photo|picture|pdf|video|document|log|script|archive|zip|"
+            r"song|mp3|csv|backup|download|spreadsheet|movie|text\s+file)\b(?!s)(?!\s+(?:files|folders|ones|entries))", u.low):
         spec.limit = 1
     if spec.sort:
         spec.why.append("sorted " + SORT_LABEL[spec.sort])
@@ -853,13 +854,15 @@ def take_exclude(u: Utterance, spec: FindSpec) -> None:
     if u.take(r"\b(?:not\s+empty|non-?empty)\b"):
         spec.not_empty = True
         spec.why.append("not empty")
-    pat = (rf"\b(?:except(?:\s+for)?|excluding|exclude|but\s+not|other\s+than|apart\s+from|besides|not)\s+"
+    pat = (rf"\b(?:except(?:\s+for)?|excluding|exclude|but(?:\s+not)?|other\s+than|apart\s+from|besides|not)\s+"
            rf"(?:the\s+|any\s+|all\s+)?({ITEM}(?:\s*(?:,|and|or|nor)\s*{ITEM})*)(?:\s+(?:files?|ones))?\b")
     for m in re.finditer(pat, u.text):
         items = [i for i in re.split(r"\s*(?:,|\band\b|\bor\b|\bnor\b)\s*", m.group(1)) if i]
         exts, names = [], []
         for item in items:
-            if item.startswith((".", "*.")):
+            if re.fullmatch(r"qlit\d+", item):
+                names.append(u.lit(item))       # a real name: "except backup.zip"
+            elif item.startswith((".", "*.")):
                 exts.append(item.lstrip("*."))
             elif type_word(item):
                 exts += type_word(item)[1]
@@ -1053,6 +1056,8 @@ def take_types(u: Utterance, spec: FindSpec) -> None:
 
 
 def parse_filters(u: Utterance, spec: FindSpec) -> None:
+    # "apart from X" is an exclusion, not a starting folder (same length keeps offsets)
+    u.text = re.sub(r"\bapart\s+from\b", lambda m: "except".ljust(len(m.group(0))), u.text)
     take_size(u, spec)
     take_time(u, spec)
     take_sort_limit(u, spec)
@@ -1883,15 +1888,39 @@ def resolve_dest(u: Utterance, text: str) -> str:
     return path or t
 
 
+def is_trash(dest_text: str, cwd: str) -> bool:
+    """'the trash', 'the recycle bin' (unless a folder of that name is right here)."""
+    word = re.sub(r"^(?:the|my)\s+", "", dest_text.strip().lower())
+    return bool(re.fullmatch(r"trash(?:\s+can)?|recycle\s*bin|bin|wastebasket|rubbish(?:\s+bin)?", word)) and \
+        not os.path.isdir(os.path.join(cwd, word))
+
+
+def trash_tool() -> str:
+    return first_available([("gio", "gio trash --"), ("trash-put", "trash-put --"),
+                            (None, "mv -i -t ~/.local/share/Trash/files --")])
+
+
 def bulk_transfer(u: Utterance, spec: FindSpec, tool: str, dest_text: str, left: Utterance,
                   guessed: int = 0) -> Plan:
     """find the matching files and mv/cp them into a folder, after a preview."""
+    if tool == "mv" and is_trash(dest_text, u.cwd):
+        u.text = " " * len(u.text)
+        spec.ftype = spec.ftype or "f"
+        tool_ = trash_tool()
+        mk = "mkdir -p ~/.local/share/Trash/files && " if tool_.startswith("mv ") else ""
+        plan = Plan(mk + render_find(spec, "exec:" + tool_), "trash", [where_label(spec, True)] + spec.why,
+                    destructive=True, preview=render_find(spec, "list"),
+                    warning="! moves the files listed above to the trash")
+        return finish(left, plan, guessed, spec)
     dest = resolve_dest(u, dest_text)
     u.text = " " * len(u.text)
     spec.ftype = spec.ftype or "f"
     if not dest.startswith(("/", "~")):
         spec.exclude.append(f"./{dest.strip('./')}/*" if spec.root == "." else f"*/{dest.strip('./')}/*")
-    cmd = render_find(spec, f"exec:{tool} -i -t {qpath(dest)} --")
+    if spec.sort and spec.limit:         # "move the oldest log": only that one
+        cmd = render_find(spec, "top0") + f" | xargs -0 -r {tool} -i -t {qpath(dest)} --"
+    else:
+        cmd = render_find(spec, f"exec:{tool} -i -t {qpath(dest)} --")
     if not os.path.isdir(os.path.join(u.cwd, os.path.expanduser(dest))):
         cmd = f"mkdir -p -- {qpath(dest)} && {cmd}"
     plan = Plan(cmd, "move" if tool == "mv" else "copy",
@@ -2021,6 +2050,10 @@ def explicit_targets(u: Utterance) -> list | None:
 
 
 def h_delete(u: Utterance) -> Plan | None:
+    to_trash = bool(u.take(r"\b(?:(?:in|into|to)\s+(?:the\s+)?(?:trash(?:\s+can)?|recycle\s*bin|wastebasket|rubbish\s+bin))\b")
+                    or u.peek(r"^\s*trash\b"))
+    if to_trash:
+        u.take(r"\b(?:put|move|send|throw)\b")
     if not u.take(r"\b(?:delete|remove|rm|erase|trash|get\s+rid\s+of|clean\s+(?:up|out)|wipe|destroy|throw\s+(?:away|out))\b"):
         return None
     # "find X and delete them" / "delete all X you can find"
@@ -2029,6 +2062,9 @@ def h_delete(u: Utterance) -> Plan | None:
     if u.peek(r"\b(?:packages?|programs?|software|kernels?|dependencies)\b"):
         return None
     singular = u.peek(r"\bthe\s+(?:\S+\s+){0,2}?(?:file|folder|directory|dir)\b(?!s)") and not u.peek(r"\b(?:all|every|each)\b")
+    if u.peek(r"\b(?:except(?:\s+for)?|but(?:\s+not)?|other\s+than|apart\s+from|besides|save\s+for|keep(?:ing)?)\s+"
+              r"(?:the\s+)?qlit\d+"):
+        return None                    # "delete everything but report.pdf": report.pdf is the one to keep
     targets = explicit_targets(u)
     if targets is None:
         return None                    # a name that is not there: never guess
@@ -2037,6 +2073,12 @@ def h_delete(u: Utterance) -> Plan | None:
         real = os.path.realpath(os.path.join(u.cwd, os.path.expanduser(t)))
         if real in SENSITIVE_ROOTS or real == home or real == os.path.realpath(u.cwd):
             return None                # never rm a home, system or the current folder from words
+    if targets and to_trash:
+        tool_ = trash_tool()
+        mk = "mkdir -p ~/.local/share/Trash/files && " if tool_.startswith("mv ") else ""
+        plan = finish(u, Plan(f"{mk}{tool_} " + " ".join(qpath(t) for t in targets), "trash", targets))
+        plan.destructive = True
+        return plan
     if targets:
         for _ in range(3):   # words describing what was named, not filters
             u.take(r"\b(?:" + "|".join(sorted(DESCRIPTORS)) + r"|files?|folders?|director(?:y|ies)|dirs?)\b")
@@ -2064,6 +2106,12 @@ def h_delete(u: Utterance) -> Plan | None:
         rm = "rm -r --" if spec.ftype == "d" else "rm --"
         plan = Plan(f"{top} | xargs -0 -r {rm}", "delete", [where_label(spec, True)] + spec.why,
                     preview=f"{top} | tr '\\0' '\\n'")
+    elif to_trash:
+        spec.ftype = spec.ftype or "f"
+        tool_ = trash_tool()
+        mk = "mkdir -p ~/.local/share/Trash/files && " if tool_.startswith("mv ") else ""
+        plan = Plan(mk + render_find(spec, "exec:" + tool_), "trash", [where_label(spec, True)] + spec.why,
+                    preview=render_find(spec, "list"), warning="! moves the files listed above to the trash")
     else:
         plan = Plan(render_find(spec, "delete"), "delete", [where_label(spec, True)] + spec.why,
                     preview=render_find(spec, "list"))
@@ -2554,6 +2602,8 @@ def unit_exists(name: str) -> bool:
 def service_name(word: str) -> str | None:
     """'nginx', 'the network', 'apache' -> the systemd unit, or None if it is not a service."""
     word = word.strip()
+    if word.lower() not in SERVICE_WORDS and re.search(r"\s+(?:server|service|daemon)$", word):
+        word = re.sub(r"\s+(?:server|service|daemon)$", "", word)
     w = SERVICE_WORDS.get(word.lower(), word)
     if w == "network":
         return next((n for n in ("NetworkManager", "networking", "systemd-networkd") if unit_exists(n)),
@@ -2567,21 +2617,23 @@ def service_name(word: str) -> str | None:
 
 def h_service(u: Utterance) -> Plan | None:
     """'reboot nginx', 'restart the network', 'nginx status', 'is ssh enabled at boot'."""
-    m = u.peek(r"^\s*(reboot|restart|start|stop|reload|enable|disable|shut\s*down|turn\s+off|turn\s+on|kill)\s+"
-               r"(?:the\s+)?([\w.@-]+(?:\s+server)?)(?:\s+(?:service|daemon|server|unit))?(?:\s+now)?\s*$")
+    m = u.peek(r"^\s*(reboot|restart|start|stop|reload|enable|disable|shut\s*down|turn\s+off|turn\s+on|kill|bounce|kick)\s+"
+               r"(?:the\s+|my\s+)?([\w.@-]+(?:\s+server)?)(?:\s+(?:service|daemon|server|unit))?(?:\s+now)?\s*$")
     if m:
         verb, word = m.group(1), u.lit(u.o(m, 2))
         if re.fullmatch(COMPUTER_WORDS, word.lower()):
             return None
         unit = service_name(word)
+        unsure = False
         if not unit and verb == "reboot" and not re.fullmatch(r"(?:now|later|tonight|soon|today)", word.lower()):
-            unit = word                  # "reboot X" never means the computer
+            unit, unsure = word, True    # "reboot X" never means the computer
         if not unit or verb == "kill" and not unit_exists(unit):
             return None
-        act = {"reboot": "restart", "shutdown": "stop", "turnoff": "stop", "turnon": "start",
+        act = {"reboot": "restart", "bounce": "restart", "kick": "restart", "shutdown": "stop", "turnoff": "stop", "turnon": "start",
                "kill": "kill"}.get(re.sub(r"\s+", "", verb), verb)
         u.text = " " * len(u.text)
         return Plan(f"{sudo()}systemctl {act} {shlex.quote(unit)}", "service", [f"{act} {unit}"],
+                    confidence=0.65 if unsure else 1.0,
                     destructive=act in ("stop", "restart", "disable", "kill"),
                     warning=f"! {act}s the {unit} service" if act in ("stop", "restart", "disable", "kill") else None,
                     checked=act not in ("stop", "restart", "disable", "kill"))
@@ -2590,7 +2642,7 @@ def h_service(u: Utterance) -> Plan | None:
                r"is\s+(?:the\s+)?([\w.@-]+)(?:\s+service)?\s+(?:active|running|up|ok|working))\s*$")
     if m:
         unit = service_name(u.lit(next(g for g in m.groups() if g)))
-        if unit and (unit_exists(unit) or not m.group(3)):
+        if unit and (unit_exists(unit) or not m.group(3) or re.search(r"\b(?:ok|working)\s*$", u.low)):
             u.text = " " * len(u.text)
             return Plan(f"systemctl status {shlex.quote(unit)} --no-pager", "service", [f"status of {unit}"])
     m = u.peek(r"^\s*(?:is|does)\s+(?:the\s+)?([\w.@-]+)(?:\s+service)?\s+(?:enabled|start(?:s|ed)?)\s+(?:at|on|when)\s+(?:boot|startup|start\s*up)\s*$")
@@ -2600,6 +2652,7 @@ def h_service(u: Utterance) -> Plan | None:
             u.text = " " * len(u.text)
             return Plan(f"systemctl is-enabled {shlex.quote(unit)}", "service", [f"does {unit} start at boot"])
     m = u.peek(r"^\s*(?:(?:show|list|which|what)\s+)?(?:the\s+)?(?:services|programs)\s+(?:that\s+)?(?:start|run|are\s+enabled)\s+(?:at|on)\s+(?:boot|startup)\s*$|"
+               r"^\s*(?:which|what)\s+services\s+are\s+enabled\s*$|^\s*what\s+(?:starts|runs)\s+(?:at|on)\s+(?:boot|startup)\s*$|"
                r"^\s*(?:list\s+|show\s+)?(?:the\s+)?enabled\s+services\s*$")
     if m:
         u.text = " " * len(u.text)
@@ -2619,12 +2672,12 @@ def h_service(u: Utterance) -> Plan | None:
 
 WHEN = (r"(?:\s+(?:in|after)\s+(?P<n>\d+|an?|one)\s*(?P<unit>minutes?|mins?|m|hours?|hrs?|h)\b"
         r"|\s+at\s+(?P<hh>\d{1,2})(?::(?P<mm>\d{2}))?\s*(?P<ampm>[ap]\.?m\.?)?"
-        r"|\s+(?P<word>tonight|at\s+midnight|later|soon|this\s+evening|tomorrow(?:\s+morning)?))")
+        r"|\s+(?:later\s+)?(?P<word>tonight|at\s+midnight|later|soon|this\s+evening|tomorrow(?:\s+morning)?))")
 
 
 def h_power_later(u: Utterance) -> Plan | None:
     """'reboot in 5 minutes', 'shut down at 22:30', 'reboot tonight'."""
-    m = u.peek(r"^\s*(?P<verb>restart|reboot|shut\s*down|power\s*off|turn\s+off|switch\s+off)"
+    m = u.peek(r"^\s*(?:schedule\s+(?:a\s+)?|plan\s+a\s+)?(?P<verb>restart|reboot|shut\s*down|power\s*off|turn\s+off|switch\s+off)"
                rf"(?:\s+(?:the\s+|my\s+|this\s+)?{COMPUTER_WORDS})?{WHEN}\s*$")
     if not m:
         return None
@@ -2894,11 +2947,45 @@ def _path_add(v, u):
     return f"{line} && printf '%s\\n' {shlex.quote(line)} >> {qpath(AISHARC)}"
 
 
+BINARY_EXT = (r"\.(?:zip|tar|t?gz|tgz|bz2|xz|7z|rar|zst|pdf|png|jpe?g|gif|webp|mp[34]|mkv|avi|mov|iso|img|"
+              r"exe|so|o|a|db|sqlite3?|docx?|xlsx?|pptx?|odt|ods|deb|rpm|jar|class|pyc)$")
+
+
+def split_alternatives(p: str) -> list[str]:
+    """Top-level a|b|c of a regex."""
+    parts, depth, cur, esc, in_class = [], 0, "", False, False
+    for c in p:
+        if esc:
+            esc = False
+        elif c == "\\":
+            esc = True
+        elif in_class:
+            in_class = c != "]"
+        elif c == "[":
+            in_class = True
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif c == "|" and depth == 0:
+            parts.append(cur)
+            cur = ""
+            continue
+        cur += c
+    return parts + [cur]
+
+
 class Recipe:
     def __init__(self, label, patterns, cmd, *, slots=None, defaults=None, destructive=False, warning=None,
-                 needs=(), git=False, gui=False, runs_on_question=False):
-        self.label, self.cmd, self.slots = label, cmd, slots or {}
-        self.patterns = [re.compile(p) for p in ([patterns] if isinstance(patterns, str) else patterns)]
+                 needs=(), git=False, gui=False, runs_on_question=False, preview=None, text_into=False):
+        self.label, self.cmd, self.slots, self.preview = label, cmd, slots or {}, preview
+        self.text_into = text_into      # writes {text} into {newfile}: never a file name, never an archive
+        self.patterns = []
+        for p in [patterns] if isinstance(patterns, str) else patterns:
+            try:
+                self.patterns.append(re.compile(p))
+            except re.error:             # a slot named in two alternatives: one pattern each
+                self.patterns += [re.compile(alt) for alt in split_alternatives(p)]
         self.defaults, self.destructive, self.warning = defaults or {}, destructive, warning
         self.needs, self.git, self.gui, self.runs_on_question = needs, git, gui, runs_on_question
 
@@ -2985,8 +3072,15 @@ def _apply_recipe(r: Recipe, u: Utterance) -> Plan | None:
             vals[base] = v
         if not ok:
             continue
+        if r.text_into:
+            text_lit = u.lit(vals.get("_raw_text", "").strip())
+            target = u.lit(vals.get("_raw_newfile", "").strip()).lower()
+            if (os.path.isfile(os.path.join(u.cwd, os.path.expanduser(text_lit))) or find_below(text_lit, u.cwd)
+                    or re.search(BINARY_EXT, target)):
+                continue                 # "put notes.txt into backup.zip" adds a file, it is not text
         for k, d in r.defaults.items():
             vals.setdefault(k, d)
+        vals.setdefault("su", sudo())
         if callable(r.cmd):
             cmd = r.cmd(vals, u)
         else:
@@ -2998,10 +3092,15 @@ def _apply_recipe(r: Recipe, u: Utterance) -> Plan | None:
         if not cmd:
             continue
         u.blank(m.start(), m.end())
-        shown = [f"{k} {u.lit(v) if isinstance(v, str) else v}" for k, v in vals.items()
+        u.take(r"^\s*(?:please\s+)?(?:find|search\s+for|search|locate|look\s+for|hunt\s+for|list|show(?:\s+me)?|"
+               r"get(?:\s+me)?|give\s+me|print|display|view|tell\s+me)\b")
+        u.take(r"\b(?:find|list|show|search)\s*$")
+        shown = [f"{k} {re.sub(r'qlit\d+', lambda q: u.lit(q.group(0)), v) if isinstance(v, str) else v}"
+                 for k, v in vals.items()
                  if not k.startswith("_") and k in m.groupdict() and m.group(k)]
+        preview = r.preview(vals, u) if callable(r.preview) else (r.preview.format(**vals) if r.preview else None)
         return Plan(cmd, r.label, shown, destructive=r.destructive, warning=r.warning,
-                    runs_on_question=r.runs_on_question)
+                    runs_on_question=r.runs_on_question, preview=preview)
     return None
 
 
@@ -3052,9 +3151,9 @@ RECIPES = [
             (None, "python3 -c 'import csv, sys; r = list(csv.reader(open(sys.argv[1]))); w = [max(map(len, c)) for c in zip(*r)]; "
                    "[print(\"  \".join(x.ljust(n) for x, n in zip(row, w))) for row in r]' {file}")]),
     Recipe("append", [r"\b(?:append|add)\s+(?:the\s+(?:line|text)\s+)?(?P<text>qlit\d+)\s+to\s+(?:the\s+end\s+of\s+)?(?P<newfile>\S+)\s*$"],
-           "printf '%s\\n' {text} >> {newfile}", destructive=True, warning="! adds a line to the file"),
+           "printf '%s\\n' {text} >> {newfile}", destructive=True, warning="! adds a line to the file", text_into=True),
     Recipe("write", [r"\b(?:write|put|save)\s+(?:the\s+(?:line|text)\s+)?(?P<text>qlit\d+)\s+(?:to|in|into)\s+(?P<newfile>\S+)\s*$"],
-           "printf '%s\\n' {text} > {newfile}", destructive=True, warning="! replaces the file's contents"),
+           "printf '%s\\n' {text} > {newfile}", destructive=True, warning="! replaces the file's contents", text_into=True),
     Recipe("empty file", [rf"\b(?:empty|truncate|blank|wipe\s+the\s+contents\s+of)\s+(?:the\s+)?(?:file\s+)?{F}\s*$",
                           rf"\bclear\s+(?:the\s+)?(?:contents\s+of\s+(?:the\s+)?)?(?:file\s+)?{F}\s*$"],
            ": > {file}", destructive=True, warning="! empties the file"),
@@ -3355,6 +3454,778 @@ RECIPES = [
 ]
 
 
+# ---- phrases found by the findings game (tests/findings.md) ------------------------
+
+ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7, "eighth": 8,
+            "ninth": 9, "tenth": 10}
+ORD = r"(?:\d+(?:st|nd|rd|th)?|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)"
+NOT_GIT = "-path ./.git -prune -o"
+
+
+def ord_num(w: str) -> int:
+    w = w.lower()
+    return ORDINALS.get(w) or int(re.sub(r"\D", "", w) or 1)
+
+
+def _lit(vals: dict, key: str, u: Utterance) -> str:
+    return u.lit(vals.get("_raw_" + key, "").strip())
+
+
+def _ext_glob(word: str | None) -> str | None:
+    """'txt', 'pdfs', '.sh', 'python' -> the -name test for that type."""
+    if not word:
+        return None
+    w = word.lower().lstrip("*.")
+    w = {"shell": "sh", "bash": "sh"}.get(w, w)
+    t = type_word(w)
+    exts = t[1] if t else ([w.rstrip("s")] if w.endswith("s") and len(w) > 3 else [w])
+    if len(exts) == 1:
+        return f"-iname '*.{exts[0]}'"
+    return "\\( " + " -o ".join(f"-iname '*.{e}'" for e in exts) + " \\)"
+
+
+def _column(vals, u):
+    n = ord_num(_lit(vals, "n", u))
+    f = vals["file"]
+    if _lit(vals, "file", u).lower().endswith(".csv"):
+        return f"cut -d, -f{n} -- {f}"
+    if _lit(vals, "file", u).lower().endswith(".tsv"):
+        return f"cut -f{n} -- {f}"
+    return f"awk '{{print ${n}}}' {f}"
+
+
+def _sort_column(vals, u):
+    n, f, name = ord_num(_lit(vals, "n", u)), vals["file"], _lit(vals, "file", u).lower()
+    rev = "r" if vals.get("_raw_rev") else ""
+    num_ = "n" if re.search(r"\b(?:numeric|numerically|number)\b", u.low) else ""
+    if name.endswith(".csv"):
+        return f"(head -n 1 {f}; tail -n +2 {f} | sort -t, -k{n},{n}{num_}{rev})"
+    return f"sort -k{n},{n}{num_}{rev} -- {f}"
+
+
+def _check_file(vals, u):
+    name, f = _lit(vals, "file", u).lower(), vals["file"]
+    if name.endswith(".json"):
+        return f"python3 -m json.tool {f} > /dev/null && echo 'valid JSON'"
+    if name.endswith(".zip"):
+        return f"python3 -m zipfile -t {f}"
+    if re.search(r"\.(?:tar(?:\.\w+)?|tgz|tbz2|txz)$", name):
+        return f"tar -tf {f} > /dev/null && echo 'archive is OK'"
+    if name.endswith((".gz", ".bz2", ".xz")):
+        return f"{ {'gz': 'gzip', 'bz2': 'bzip2', 'xz': 'xz'}[name.rsplit('.', 1)[1]] } -t {f} && echo 'archive is OK'"
+    if name.endswith((".yaml", ".yml")):
+        return None
+    if name.endswith(".sh"):
+        return f"bash -n {f} && echo 'syntax OK'"
+    if name.endswith(".py"):
+        return f"python3 -m py_compile {f} && echo 'syntax OK'"
+    return None
+
+
+def _case(vals, u):
+    lower = "lower" in vals.get("_raw_case", "").lower()
+    a, b = ("[:upper:]", "[:lower:]") if lower else ("[:lower:]", "[:upper:]")
+    return f"tr '{a}' '{b}' < {vals['file']}"
+
+
+def _tabs(vals, u):
+    n = int(vals.get("n") or 4)
+    if "spaces" in vals.get("_raw_from", "").lower():
+        return f"sed -i 's/ \\{{{n}\\}}/\\t/g' -- {vals['file']}"
+    return f"sed -i 's/\\t/{' ' * n}/g' -- {vals['file']}"
+
+
+def _delete_line(vals, u):
+    which = _lit(vals, "n", u).lower()
+    which = "1" if which in ("header", "heading", "title") else which
+    f = vals["file"]
+    if vals.get("_raw_m"):
+        return f"sed -i '{int(num(which))},{int(num(_lit(vals, 'm', u)))}d' -- {f}"
+    addr = "$" if which == "last" else str(ord_num(which))
+    return f"sed -i '{addr}d' -- {f}"
+
+
+def _lines_each(vals, u):
+    test = _ext_glob(_lit(vals, "type", u))
+    return f"find . {NOT_GIT} -type f {test} -exec wc -l {{}} +" if test else None
+
+
+def _zip_type(vals, u):
+    word = _lit(vals, "type", u).lower()
+    test = _ext_glob(word)
+    t = type_word(word.rstrip("s")) or type_word(word)
+    if not test or not t:
+        return None
+    name = re.sub(r"s$", "", word) + "s.zip"
+    return f"find . {NOT_GIT} -type f {test} -print | zip -@ {name}"
+
+
+def _except_delete(vals, u):
+    if re.match(r"(?:the\s+)?(?:\d+\s+)?(?:newest|latest|oldest|most\s+recent|biggest|largest|smallest)\b", vals["_raw_keep"].strip()):
+        return None
+    keep = [k for k in re.split(r"\s*(?:,|\band\b|\bor\b)\s*", vals["_raw_keep"].strip()) if k]
+    tests = []
+    for k in keep:
+        k = re.sub(r"^(?:the|my)\s+", "", re.sub(r"\s+(?:files?|folders?|ones)$", "", k.strip()))
+        name = u.lit(k)
+        if not name or name in ("the", "file", "files", "folder"):
+            continue
+        if os.path.lexists(os.path.join(u.cwd, name)):
+            tests.append(f"! -name {shlex.quote(os.path.basename(name.rstrip('/')))}")
+        elif _ext_glob(k) and (type_word(k.lower()) or re.fullmatch(r"\*?\.\w+", k)):
+            tests.append("! " + _ext_glob(k).replace("-iname", "-iname", 1))
+        else:
+            return None                  # keep something that is not here? then nothing is safe to delete
+    if not tests:
+        return None
+    files_only = bool(re.search(r"\b(?:all|every)\s+(?:the\s+)?files\b", u.low))
+    tests = " ".join(tests)
+    kind = " -type f" if files_only else ""
+    return f"find . -mindepth 1 -maxdepth 1{kind} ! -name .git {tests} -exec rm -r -- {{}} +"
+
+
+def _except_delete_preview(vals, u):
+    cmd = _except_delete(vals, u)
+    return cmd and cmd.replace(" -exec rm -r -- {} +", " -print")
+
+
+def _nth(vals, u):
+    n = ord_num(_lit(vals, "n", u))
+    which = vals["_raw_which"].lower()
+    which = "newest" if which.startswith("most recent") else which
+    key, order = ("%s", "-nr") if which in ("biggest", "largest") else (
+        ("%s", "-n") if which == "smallest" else ("%T@", "-n" if which == "oldest" else "-nr"))
+    return f"find . {NOT_GIT} -type f -printf '{key}\\t%p\\n' | sort {order} | sed -n {n}p | cut -f2-"
+
+
+PARTS_OF_DAY = {"morning": ("06:00", "12:00"), "afternoon": ("12:00", "18:00"), "evening": ("18:00", "23:59:59"),
+                "night": ("00:00", "06:00"), "lunch": ("11:00", "14:00")}
+
+
+def _part_of_day(vals, u):
+    day = vals["_raw_day"].lower()
+    a, b = PARTS_OF_DAY[vals["_raw_part"].lower()]
+    return (f"d=$(date -d {day} +%F); find . {NOT_GIT} -type f -newermt \"$d {a}\" ! -newermt \"$d {b}\" -print")
+
+
+def _keep_newest(vals, u):
+    n = int(vals["n"])
+    which = vals["_raw_which"].lower()
+    order = "-n" if which == "oldest" else "-nr"
+    return (f"find . -maxdepth 1 -mindepth 1 -type f -printf '%T@\\t%p\\n' | sort {order} | tail -n +{n + 1} | "
+            f"cut -f2- | xargs -r -d '\\n' rm -v --")
+
+
+def _keep_newest_preview(vals, u):
+    return _keep_newest(vals, u).replace(" | xargs -r -d '\\n' rm -v --", "")
+
+
+def one_log_file(cwd: str) -> str | None:
+    hits = []
+    for root, dirs, files in os.walk(cwd):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        hits += [os.path.relpath(os.path.join(root, f), cwd) for f in files if f.endswith(".log")]
+        if len(hits) > 1:
+            return None
+    return hits[0] if hits else None
+
+
+def _empty_file(vals, u):
+    if vals.get("file"):
+        return f": > {vals['file']}"
+    log = one_log_file(u.cwd)
+    return f": > {qpath(log)}" if log else None
+
+
+def _move_contents(vals, u):
+    dest = _lit(vals, "dest", u)
+    dest = "." if dest.lower() in ("here", ".", "this folder", "this directory") else qpath(dest)
+    op = "mv -i" if vals["_raw_op"].lower() == "move" else "cp -ri"
+    mk = "" if dest == "." else f"mkdir -p -- {dest} && "
+    return f"{mk}find {vals['dir']} -mindepth 1 -maxdepth 1 -exec {op} -t {dest} -- {{}} +"
+
+
+def _perm_find(vals, u):
+    act = (vals.get("_raw_act") or "read").lower()
+    flag = {"read": "-readable", "open": "-readable", "write": "-writable", "edit": "-writable",
+            "modify": "-writable", "change": "-writable", "execute": "-executable", "run": "-executable"}[act]
+    return f"find . {NOT_GIT} ! {flag} -print"
+
+
+def _not_exec(vals, u):
+    test = _ext_glob(_lit(vals, "type", u)) if vals.get("_raw_type") else ""
+    if vals.get("_raw_type") and not test:
+        return None
+    return f"find . {NOT_GIT} -type f {test + ' ' if test else ''}! -executable -print"
+
+
+def _year(vals, u):
+    y, rel = int(vals["_raw_year"]), vals["_raw_rel"].lower()
+    rel = {"older": "before", "newer": "after"}.get(rel, rel)
+    if rel == "before":
+        return f"find . {NOT_GIT} -type f ! -newermt {y}-01-01 -print"
+    if rel == "after":
+        return f"find . {NOT_GIT} -type f -newermt {y + 1}-01-01 -print"
+    if rel == "since":
+        return f"find . {NOT_GIT} -type f -newermt {y}-01-01 -print"
+    return f"find . {NOT_GIT} -type f -newermt {y}-01-01 ! -newermt {y + 1}-01-01 -print"
+
+
+def _chmod_perm(vals, u):
+    p = vals["_raw_perm"].lower()
+    bit = {"read": "r", "write": "w", "execute": "x", "executable": "x", "exec": "x", "run": "x"}[p]
+    who = "a" if bit != "x" else ""
+    return f"chmod {who}-{bit} -- {vals['path']}"
+
+
+def _trash(vals, u):
+    t = trash_tool()
+    return (f"mkdir -p ~/.local/share/Trash/files && {t} {vals['path']}" if t.startswith("mv ")
+            else f"{t} {vals['path']}")
+
+
+def _extract_one(vals, u):
+    arc, member = vals["file"], vals["member"]
+    if _lit(vals, "file", u).lower().endswith(".zip"):
+        return f"unzip -n {arc} {member}"
+    return f"tar --keep-old-files -xf {arc} {member}"
+
+
+def _extract_delete(vals, u):
+    arc = vals["file"]
+    if _lit(vals, "file", u).lower().endswith(".zip"):
+        return f"unzip -n {arc} && rm -i -- {arc}"
+    return f"tar --keep-old-files -xf {arc} && rm -i -- {arc}"
+
+
+def _add_to_archive(vals, u):
+    arc, name = vals["arc"], _lit(vals, "arc", u).lower()
+    if name.endswith(".zip"):
+        return f"zip -j {arc} {vals['path']}"
+    if name.endswith(".tar"):
+        return f"tar -rf {arc} {vals['path']}"
+    return None
+
+
+def _replace_in_type(vals, u):
+    test = _ext_glob(_lit(vals, "type", u))
+    if not test:
+        return None
+    a = re.sub(r"([/&\\.*^$\[\]])", r"\\\1", _lit(vals, "a", u))
+    b = re.sub(r"([/&\\])", r"\\\1", _lit(vals, "b", u))
+    return (f"find . {NOT_GIT} -type f {test} -exec grep -qF -- {shlex.quote(_lit(vals, 'a', u))} {{}} \\; "
+            f"-exec sed -i {shlex.quote('s/' + a + '/' + b + '/g')} -- {{}} +")
+
+
+def _proc_names(word: str) -> str:
+    w = word.lower()
+    alias = {"firefox": "firefox,firefox-esr", "chrome": "chrome,chromium", "chromium": "chromium,chrome",
+             "code": "code", "vscode": "code"}.get(w, word)
+    return shlex.quote(alias)
+
+
+def _ram_total(vals, u):
+    return (f"ps -C {_proc_names(_lit(vals, 'word', u))} -o rss= | "
+            "awk '{s+=$1} END {printf \"%.0f MiB\\n\", s/1024}'")
+
+
+def _kill_except(vals, u):
+    name, keep = _lit(vals, "word", u), _lit(vals, "keep", u)
+    if name.lower() in ("all", "everything", "processes", "the"):
+        return None
+    q, k = shlex.quote(name), shlex.quote(keep)
+    if keep.isdigit():
+        return f"pgrep -- {q} | grep -vxF {keep} | xargs -r kill"
+    return f"pgrep -a -- {q} | grep -v -- {k} | cut -d' ' -f1 | xargs -r kill"
+
+
+def _kill_top(vals, u):
+    res = "%mem" if vals["_raw_res"].lower() in ("memory", "ram") else "%cpu"
+    return (f"pid=$(ps -eo pid --sort=-{res} --no-headers | head -n 1 | tr -d ' '); "
+            f"ps -o pid,comm,{res} -p \"$pid\"; kill \"$pid\"")
+
+
+def _pause(vals, u):
+    word = _lit(vals, "word", u)
+    if re.fullmatch(COMPUTER_WORDS + r"|downloads?|music|it|everything", word.lower()):
+        return None
+    sig = "STOP" if vals["_raw_verb"].lower() in ("pause", "freeze") else "CONT"
+    return f"pkill -{sig} -- {shlex.quote(word)}"
+
+
+def _uptime_of(vals, u):
+    word = _lit(vals, "word", u)
+    if re.fullmatch(COMPUTER_WORDS, word.lower()):
+        return None
+    unit = service_name(word)
+    if unit and unit_exists(unit) or unit and not process_running(word):
+        return f"systemctl show {shlex.quote(unit)} -p ActiveEnterTimestamp --value"
+    return f"ps -C {_proc_names(word)} -o pid,etime,cmd"
+
+
+def _threads(vals, u):
+    return f"ps -o pid,nlwp,cmd -C {_proc_names(_lit(vals, 'word', u))}"
+
+
+def _since(vals, u):
+    when = vals["_raw_when"].strip().lower()
+    when = re.sub(r"^the\s+", "", when)
+    m = re.fullmatch(r"(?:the\s+)?(?:last|past)\s+(?:(\d+|an?|one)\s+)?(minute|min|hour|day|week)s?", when) or \
+        re.fullmatch(r"(\d+|an?|one)\s+(minute|min|hour|day|week)s?\s+ago", when)
+    if m:
+        n = 1 if m.group(1) in (None, "a", "an", "one") else int(m.group(1))
+        unit = {"minute": "min", "min": "min", "hour": "h", "day": "d", "week": "w"}[m.group(2)]
+        return f"journalctl --since '-{n}{unit}' --no-pager"
+    if when in ("boot", "last boot", "the last boot", "startup", "reboot", "the reboot"):
+        return "journalctl -b --no-pager"
+
+    def clock(t):
+        mm = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m\.?|(\d{1,2}):(\d{2})", t)
+        if not mm:
+            return None
+        if mm.group(4):
+            return f"{int(mm.group(4)):02d}:{mm.group(5)}"
+        h = int(mm.group(1)) % 12 + (12 if mm.group(3) == "p" else 0)
+        return f"{h:02d}:{mm.group(2) or '00'}"
+    m = re.fullmatch(r"(today|yesterday)(?:\s+(?:at\s+)?(.+))?|(?:at\s+)?(.+?)(?:\s+(today|yesterday))?", when)
+    day = m.group(1) or m.group(4) or "today"
+    t = m.group(2) or m.group(3)
+    if t:
+        c = clock(t)
+        if not c:
+            return None
+        return f"journalctl --since '{day} {c}' --no-pager"
+    return f"journalctl --since {day} --no-pager"
+
+
+def _date_of(vals, u):
+    when = re.sub(r"^in\s+", "", vals["_raw_when"].strip().lower())
+    when = re.sub(r"\bfrom\s+now\b", "", when).strip()
+    return f"date -d {shlex.quote(when)} '+%A %d %B %Y'"
+
+
+def _ms_date(vals, u):
+    ts = int(vals["_raw_ts"])
+    return f"date -d @{ts // 1000}" if ts > 10 ** 11 else f"date -d @{ts}"
+
+
+def _install_many(vals, u):
+    names = [n for n in re.split(r"\s*,\s*|\s+and\s+|\s+", re.sub(r"^both\s+", "", vals["_raw_pkgs"].strip())) if n]
+    if len(names) < 2 or any(n.lower() in FILLER or os.path.exists(os.path.join(u.cwd, n)) for n in names):
+        return None
+    return install_cmd([shlex.quote(n) for n in names])
+
+
+def _purge(vals, u):
+    pm, name = pkg_manager(), _lit(vals, "word", u)
+    if name.lower() in FILLER or os.path.exists(os.path.join(u.cwd, name)):
+        return None
+    q = shlex.quote(name)
+    if pm != "apt":
+        return install_cmd([q], remove=True)
+    return f"{sudo()}apt purge {q} && {sudo()}apt autoremove"
+
+
+GAME_RECIPES = [
+    # -- text
+    Recipe("lines without", [rf"\b(?:show\s+|print\s+|list\s+)?(?:the\s+|all\s+)?(?:lines?|rows?)\s+(?:in|of|from)\s+{F}\s+(?:that\s+)?(?:don'?t|do\s+not|doesn'?t|does\s+not|not|without)\s+(?:contain(?:ing)?\s+|have\s+|having\s+|include\s+|mention\s+|match\s+)?(?P<text>\S+)\s*$",
+                             rf"\b(?:show\s+|print\s+|list\s+)?(?:the\s+|all\s+)?(?:lines?|rows?)\s+(?:that\s+)?(?:don'?t|do\s+not|doesn'?t|does\s+not|not|without)\s+(?:contain(?:ing)?\s+|have\s+|having\s+|include\s+|mention\s+|match\s+)?(?P<text>\S+)\s+(?:in|of|from)\s+{F}\s*$",
+                             rf"\b(?:hide|exclude|filter\s+out|skip)\s+(?:the\s+)?(?:lines?\s+)?(?:with|containing|matching|mentioning)\s+(?P<text>\S+)\s+(?:in|from)\s+{F}\s*$"],
+           "grep -viF -- {text} {file}"),
+    Recipe("most common lines", [rf"\b(?:top|most\s+(?:common|frequent|repeated))\s+(?:(?P<n>\d+)\s+)?(?:lines?|entries|rows)\s+(?:in|of)\s+{F}(?:\s+by\s+(?:frequency|count|occurrences?))?\s*$",
+                                 rf"\b(?:top|most\s+(?:common|frequent|repeated))\s+(?:(?P<n>\d+)\s+)?(?:lines?|entries|rows)\s+(?:by\s+(?:frequency|count)\s+)?(?:in|of)\s+{F}\s*$",
+                                 rf"\b(?:count|how\s+often\s+does\s+each)\s+(?:the\s+)?(?:duplicate|repeated)?\s*lines?\s+(?:in|of)\s+{F}\s+by\s+frequency\b"],
+           "sort -- {file} | uniq -c | sort -rn | head -n {n}", defaults={"n": "10"}),
+    Recipe("column", [rf"\b(?:show|print|get|extract|list|cut)?\s*(?:me\s+)?(?:the\s+)?(?P<n>{ORD})\s+column\s+(?:of|in|from)\s+{F}\s*$",
+                      rf"\bcolumn\s+(?P<n>\d+)\s+(?:of|in|from)\s+{F}\s*$"],
+           _column, slots={"n": "raw"}),
+    Recipe("sort by column", [rf"\bsort\s+{F}\s+by\s+(?:the\s+)?(?P<n>{ORD})\s+(?:column|field)(?P<rev>\s+(?:descending|reversed?|in\s+reverse(?:\s+order)?))?(?:\s+(?:numerically|as\s+numbers))?\s*$",
+                              rf"\bsort\s+{F}\s+by\s+(?:column|field)\s+(?P<n>\d+)(?P<rev>\s+(?:descending|reversed?))?\s*$"],
+           _sort_column, slots={"n": "raw"}),
+    Recipe("json keys", [rf"\b(?:show|list|print|get|what\s+are)\s+(?:me\s+)?(?:the\s+)?(?:top[- ]level\s+)?(?:keys|fields|properties)\s+(?:in|of)\s+{F}\s*$"],
+           "python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); "
+           "print(*(d.keys() if isinstance(d,dict) else range(len(d))), sep=\"\\n\")' {file}"),
+    Recipe("csv to json", [rf"\b(?:convert|turn|change|export)\s+{F}\s+(?:to|into|as)\s+json\s*$"],
+           lambda v, u: ("python3 -c 'import csv,json,sys; print(json.dumps(list(csv.DictReader(open(sys.argv[1]))), "
+                         f"indent=2))' {v['file']}") if _lit(v, "file", u).lower().endswith(".csv") else None),
+    Recipe("check file", [rf"\b(?:check|test|validate|verify)\s+(?:if\s+|whether\s+|that\s+)?{F}(?:\s+is)?(?:\s+(?:valid|correct|well[- ]formed|proper|ok|intact|broken|corrupt(?:ed)?|damaged))?(?:\s+(?:json|zip|archive))?\s*$",
+                          rf"\bis\s+{F}\s+(?:valid|correct|well[- ]formed|ok|intact|broken|corrupt(?:ed)?|damaged)(?:\s+json)?\s*$"],
+           _check_file),
+    Recipe("base64 file", [rf"\b(?:base64[- ]?encode|encode)\s+{F}(?:\s+(?:in|to|as|with|using|into)\s+base64)?\s*$",
+                           rf"\bbase64\s+(?:of\s+)?{F}\s*$"],
+           "base64 -- {file}"),
+    Recipe("base64 decode file", [rf"\b(?:base64[- ]?decode|decode)\s+{F}(?:\s+(?:from|as)\s+base64)?\s*$"],
+           "base64 -d -- {file}"),
+    Recipe("change case", [rf"\b(?:convert|change|make|turn)\s+{F}\s+(?:to|into)\s+(?P<case>lower|upper)\s*-?\s*case\s*$",
+                           rf"\b(?P<case>lower|upper)\s*-?case\s+{F}\s*$"],
+           _case),
+    Recipe("tabs and spaces", [rf"\b(?:change|convert|replace|turn)\s+(?:all\s+)?(?:the\s+)?(?P<from>tabs|spaces)\s+(?:to|into|with)\s+(?:(?P<n>\d+)\s+)?(?:spaces|tabs)\s+in\s+{F}\s*$",
+                               rf"\b(?:change|convert|replace|turn)\s+(?:all\s+)?(?:the\s+)?(?P<from>tabs|spaces)\s+in\s+{F}\s+(?:to|into|with)\s+(?:(?P<n>\d+)\s+)?(?:spaces|tabs)\s*$"],
+           _tabs, destructive=True, warning="! edits the file in place"),
+    Recipe("delete lines", [rf"\b(?:delete|remove|drop|erase|cut)\s+(?:the\s+)?line\s+(?:number\s+)?(?P<n>\d+)\s+(?:from|in|of)\s+{F}\s*$",
+                            rf"\b(?:delete|remove|drop|erase|cut)\s+(?:the\s+)?(?P<n>{ORD}|last)\s+line\s+(?:from|in|of)\s+{F}\s*$",
+                            rf"\b(?:delete|remove|drop|erase)\s+lines\s+(?P<n>\d+)\s+(?:to|through|-)\s+(?P<m>\d+)\s+(?:from|in|of)\s+{F}\s*$"],
+           _delete_line, slots={"n": "raw", "m": "raw"}, destructive=True, warning="! edits the file in place"),
+    Recipe("blank lines", [rf"\b(?:remove|delete|strip|drop|get\s+rid\s+of)\s+(?:all\s+)?(?:the\s+)?(?:blank|empty)\s+lines\s+(?:from|in|of)\s+{F}\s*$"],
+           "sed -i '/^[[:space:]]*$/d' -- {file}", destructive=True, warning="! edits the file in place"),
+    Recipe("grep context", [rf"\b(?:show\s+|find\s+|search\s+|grep\s+)?(?:the\s+)?(?:lines?\s+)?(?:containing|with|matching|for|mentioning)\s+(?P<text>\S+)\s+in\s+{F}\s+with\s+(?P<n>\d+)\s+lines?\s+(?:of\s+)?(?:context|around(?:\s+it)?|before\s+and\s+after)\s*$",
+                            rf"\b(?P<text>\S+)\s+in\s+{F}\s+with\s+(?P<n>\d+)\s+lines?\s+(?:of\s+)?context\s*$"],
+           "grep -niF -C {n} -- {text} {file}"),
+    Recipe("matches per file", [rf"\bcount\s+(?:the\s+)?(?:lines|matches|occurrences)\s+(?:matching|containing|with|of|mentioning)\s+(?P<text>\S+)\s+(?:in|per|for)\s+(?:each|every)\s+file\s*$",
+                                rf"\bhow\s+many\s+(?:times|lines)\s+(?:does\s+)?(?P<text>\S+)\s+(?:appears?|occurs?|shows?\s+up)\s+(?:in|per)\s+(?:each|every)\s+file\s*$"],
+           "grep -rcIi --exclude-dir=.git -- {text} . | grep -v ':0$'"),
+    Recipe("most lines", [r"\b(?:which|what)\s+file\s+has\s+(?:the\s+)?most\s+lines\b|\bfile\s+with\s+the\s+most\s+lines\b|"
+                          r"\blongest\s+file\s+(?:by\s+lines)?\s*$"],
+           "find . -path ./.git -prune -o -type f -exec wc -l {{}} + | grep -v ' total$' | sort -nr | head -n 1"),
+    Recipe("lines per file", [r"\bhow\s+many\s+lines\s+(?:does|do|are\s+in|in)\s+(?:each|every)\s+(?P<type>\.?\w+?)\s+files?(?:\s+have)?\s*$",
+                              r"\bline\s+counts?\s+(?:of|for)\s+(?:each|every|all)\s+(?:the\s+)?(?P<type>\.?\w+?)\s+files\s*$",
+                              r"\bcount\s+(?:the\s+)?lines\s+(?:in|of)\s+(?:each|every)\s+(?P<type>\.?\w+?)\s+file\s*$"],
+           _lines_each),
+    Recipe("case-sensitive search", [rf"\b(?:search|grep|look|find)\s+(?:for\s+)?(?P<text>\S+)\s+(?:case[- ]sensitive(?:ly)?|exactly|matching\s+case|with\s+exact\s+case)\s+in\s+{F}\s*$",
+                                     rf"\b(?:search|grep|look|find)\s+(?:for\s+)?(?P<text>\S+)\s+in\s+{F}\s+(?:case[- ]sensitive(?:ly)?|exactly|matching\s+case)\s*$",
+                                     rf"\bcase[- ]sensitive\s+(?:search|grep)\s+(?:for\s+)?(?P<text>\S+)\s+in\s+{F}\s*$"],
+           "grep -nF -- {text} {file}"),
+    Recipe("write to file", [r"\b(?:write|put|save)\s+(?P<text>.+?)\s+(?:to|in|into)\s+(?:the\s+file\s+)?(?P<newfile>\S+)\s*$"],
+           lambda v, u: None if re.search(r"\b(?:it|this|that|them|output|result|results|list)\b", v["_raw_text"])
+           else f"printf '%s\\n' {v['text']} > {v['newfile']}",
+           destructive=True, warning="! replaces what is in the file", text_into=True),
+    Recipe("replace in type", [r"\breplace\s+(?:all\s+(?:occurrences\s+of\s+)?|every\s+)?(?P<a>\S+)\s+(?:with|by)\s+(?P<b>\S+)\s+in\s+(?:all|every|each)\s+(?:the\s+)?(?P<type>\.?\w+?)\s+files?\s*$"],
+           _replace_in_type, slots={"a": "raw", "b": "raw", "type": "raw"}, destructive=True,
+           warning="! edits the matching files in place"),
+    # -- files and folders
+    Recipe("delete all except", [r"\b(?:delete|remove|erase|rm|trash|get\s+rid\s+of|wipe|clear\s+out)\s+(?:everything|all(?:\s+(?:the\s+)?files)?|every\s+file)\s+(?:here\s+|in\s+this\s+folder\s+)?"
+                                 r"(?:except(?:\s+for)?|but(?:\s+not)?|other\s+than|apart\s+from|besides|save)\s+(?P<keep>.+?)\s*$"],
+           _except_delete, destructive=True, preview=_except_delete_preview,
+           warning="! deletes everything listed above, folders included"),
+    Recipe("biggest folder", [r"^\s*(?:show\s+|find\s+|what(?:'s|\s+is)\s+)?(?:me\s+)?(?:the\s+)?(?:biggest|largest)\s+(?:folder|directory|dir)(?:\s+here)?\s*$|"
+                              r"\bwhich\s+(?:folder|directory)\s+is\s+(?:the\s+)?(?:biggest|largest)\b"],
+           "du -sh -- */ 2>/dev/null | sort -hr | head -n 1"),
+    Recipe("nth file", [rf"\b(?:the\s+)?(?P<n>second|third|fourth|fifth|2nd|3rd|4th|5th)\s+(?P<which>newest|latest|oldest|biggest|largest|smallest)\s+file\s*$"],
+           _nth, slots={"n": "raw"}),
+    Recipe("part of day", [r"\bfiles?\s+(?:that\s+)?(?:i\s+|we\s+)?(?:edited|modified|changed|touched|saved|created|worked\s+on)\s+(?P<day>yesterday|today)\s+(?:in\s+the\s+)?(?P<part>morning|afternoon|evening|night)\s*$",
+                           r"\bfiles?\s+(?:from|of)\s+(?P<day>yesterday|today)\s+(?P<part>morning|afternoon|evening)\s*$"],
+           _part_of_day),
+    Recipe("keep newest", [r"\b(?:delete|remove)\s+(?:all\s+)?(?:the\s+)?(?:files\s+)?(?:but|except(?:\s+for)?)\s+the\s+(?P<which>newest|latest|most\s+recent|oldest)\s+(?P<n>\d+)(?:\s+files)?\s*$",
+                           r"\bkeep\s+only\s+the\s+(?P<which>newest|latest|most\s+recent|oldest)\s+(?P<n>\d+)(?:\s+files)?(?:\s+and\s+delete\s+the\s+rest)?\s*$"],
+           _keep_newest, preview=_keep_newest_preview, destructive=True, warning="! deletes the files listed above"),
+    Recipe("empty file", [rf"\b(?:empty|truncate|clear|wipe|blank)\s+(?:out\s+)?(?:the\s+)?(?:contents\s+of\s+)?{F}(?:\s+file)?\s*$",
+                          r"\b(?:empty|truncate|clear|wipe)\s+(?:out\s+)?the\s+log\s*(?:file)?\s*$"],
+           _empty_file, destructive=True, warning="! empties the file"),
+    Recipe("empty folder", [r"\b(?:remove|delete|clear|erase)\s+(?:all\s+(?:of\s+)?)?(?:the\s+)?(?:files|everything|contents?)\s+(?:in|inside|of|from)\s+(?P<dir>\S+)\s+(?:but|and)\s+keep\s+(?:the\s+)?(?:folder|directory|dir|it)(?:\s+itself)?\s*$",
+                            r"^\s*(?:empty|clear\s+out|clean\s+out)\s+(?:the\s+)?(?:folder\s+|directory\s+)?(?P<dir>\S+)(?:\s+(?:folder|directory))?\s*$"],
+           "find {dir} -mindepth 1 -delete", preview="find {dir} -mindepth 1", destructive=True,
+           warning="! deletes everything listed above; the folder stays"),
+    Recipe("move contents", [r"\b(?P<op>move|copy)\s+(?:everything|all(?:\s+the)?\s+files|all|the\s+contents)\s+(?:from|in|out\s+of|inside)\s+(?P<dir>\S+)\s+(?:to|into|in)\s+(?P<dest>here|this\s+folder|this\s+directory|\S+)\s*$"],
+           _move_contents, slots={"dest": "raw"}),
+    Recipe("where am i", [r"\bwhat\s+(?:folder|directory|dir)\s+(?:am\s+i\s+in|is\s+this|are\s+we\s+in)\b|\bwhich\s+(?:folder|directory|dir)\s+am\s+i\s+in\b|"
+                          r"^\s*(?:show\s+)?(?:the\s+)?current\s+(?:folder|directory|dir)\s*$"], "pwd"),
+    Recipe("list two folders", [r"\b(?:list|show)\s+(?:the\s+)?(?:files\s+)?(?:in|of|inside)\s+(?P<a>\S+)\s+and\s+(?P<b>\S+)\s*$"],
+           "ls -lh -- {a} {b}", slots={"a": "dir", "b": "dir"}),
+    Recipe("not hidden", [r"\b(?:list|show)\s+(?:all\s+)?(?:the\s+)?files\s+(?:but\s+not|except(?:\s+for)?|without|excluding|apart\s+from)\s+(?:the\s+)?hidden(?:\s+ones|\s+files)?\s*$|"
+                          r"\b(?:list|show)\s+(?:all\s+)?(?:the\s+)?(?:non[- ]hidden|visible)\s+files\s*$"],
+           "find . -maxdepth 1 -mindepth 1 -type f ! -name '.*'"),
+    Recipe("spaces in names", [r"\bfiles?\s+with\s+(?:a\s+)?spaces?\s+in\s+(?:the(?:ir)?\s+)?names?\b|\bfiles?\s+(?:whose|with)\s+names?\s+(?:contain|have|has|with)\s+(?:a\s+)?spaces?\b"],
+           f"find . {NOT_GIT} -name '* *' -print"),
+    Recipe("world writable", [r"\b(?:world|everyone|anyone)[- ]?writ(?:e)?able\s+files\b|\bfiles?\s+(?:that\s+are\s+|which\s+are\s+)?(?:world|everyone|anyone)[- ]?writ(?:e)?able\b|"
+                              r"\bfiles?\s+(?:that\s+)?(?:anyone|everyone)\s+can\s+(?:write|edit|change)\b"],
+           f"find . {NOT_GIT} -type f -perm -0002 -print"),
+    Recipe("permission bits", [r"\bfiles?\s+with\s+(?:permissions?\s+)?(?P<mode>[0-7]{3,4})(?:\s+permissions?)?\s*$|\bfiles?\s+(?:that\s+are\s+)?chmod(?:ded)?\s+(?P<mode>[0-7]{3,4})\s*$"],
+           lambda v, u: f"find . {NOT_GIT} -type f -perm {v['_raw_mode'].zfill(4)} -print"),
+    Recipe("files i cannot", [r"\bfiles?\s+(?:that\s+)?(?:i|we)\s+(?:can'?t|cannot|can\s+not|am\s+not\s+allowed\s+to|don'?t\s+have\s+permission\s+to)\s+(?P<act>read|open|write|edit|modify|change|execute|run)\b|"
+                              r"\b(?:un|non[- ]?)(?P<act>read)able\s+files\b"],
+           _perm_find),
+    Recipe("not mine", [r"\bfiles?\s+(?:that\s+are\s+|which\s+are\s+)?not\s+owned\s+by\s+me\b|\bfiles?\s+(?:that\s+)?(?:i|that\s+i)\s+don'?t\s+own\b|"
+                        r"\bfiles?\s+owned\s+by\s+(?:someone|somebody)\s+else\b|\bfiles?\s+owned\s+by\s+(?:other\s+users|others)\b"],
+           f"find . {NOT_GIT} ! -user \"$USER\" -print"),
+    Recipe("not executable", [r"\b(?:find\s+|list\s+|show\s+)?(?:all\s+)?(?:the\s+)?(?:\*?\.?(?P<type>\w+)\s+)?(?:files|scripts)\s+(?:that\s+are\s+|which\s+are\s+|that\s+aren'?t\s+|which\s+aren'?t\s+)?(?:not\s+|non[- ]?)?executable\b",
+                              r"\b(?:non[- ]executable|unexecutable)\s+(?:\*?\.?(?P<type>\w+)\s+)?(?:files|scripts)\b"],
+           lambda v, u: _not_exec(v, u) if re.search(r"\b(?:not|non|aren'?t|un|missing|without|lacking)", u.low) else None,
+           slots={"type": "raw"}),
+    Recipe("both words", [r"\bfiles?\s+(?:that\s+)?(?:contain(?:ing|s)?|mention(?:ing|s)?|with)\s+both\s+(?P<a>\S+)\s+and\s+(?P<b>\S+)\s*$"],
+           "grep -rlIi --exclude-dir=.git -- {a} . | xargs -r -d '\\n' grep -lIi -- {b}", slots={"a": "text", "b": "text"}),
+    Recipe("newer than file", [rf"\bfiles?\s+(?:that\s+are\s+)?(?P<rel>newer|more\s+recent|modified\s+after|changed\s+after|older|modified\s+before)\s+(?:than\s+)?{P}\s*$"],
+           lambda v, u: f"find . {NOT_GIT} -type f {'!' if v['_raw_rel'].lower().startswith(('older', 'modified before')) else ''} -newer {v['path']} -print".replace("f  -newer", "f -newer")),
+    Recipe("size in bytes", [rf"\b(?:size|how\s+big\s+is|how\s+large\s+is)\s+(?:of\s+)?{P}\s+in\s+bytes\b|\bhow\s+many\s+bytes\s+(?:is|in|does)\s+{P}(?:\s+have)?\s*$|\bexact\s+size\s+of\s+{P}\s*$"],
+           "stat -c %s -- {path}"),
+    Recipe("files by year", [r"\bfiles?\s+(?:that\s+were\s+|last\s+)?(?:modified|changed|edited|created|saved|from)?\s*(?P<rel>before|after|since|in|from|during)\s+(?P<year>(?:19|20)\d\d)\s*$"],
+           _year),
+    Recipe("full path", [rf"\b(?:full|absolute|complete|real)\s+path\s+(?:of|to|for)\s+{P}\s*$|\bwhere\s+exactly\s+is\s+{P}\s*$"],
+           "realpath -- {path}"),
+    Recipe("private", [rf"\bmake\s+{P}\s+(?:readable\s+(?:only\s+)?(?:by|for|to)\s+(?:only\s+)?me(?:\s+only)?|private|only\s+(?:readable|accessible)\s+(?:by|to)\s+me)\s*$"],
+           "chmod go-rwx -- {path}"),
+    Recipe("remove permission", [rf"\b(?:remove|take\s+away|drop|revoke|take\s+off)\s+(?:the\s+)?(?P<perm>read|write|execute|executable|exec|run)\s+(?:permissions?|rights?|bit|flag|access)\s+(?:from|on|of|for)\s+{P}\s*$",
+                                 rf"\bmake\s+{P}\s+(?:not|non)[- ]?(?P<perm>executable)\s*$"],
+           _chmod_perm),
+    Recipe("read only", [rf"\bmake\s+{P}\s+read[- ]?only\s*$"], "chmod a-w -- {path}"),
+    Recipe("trash file", [rf"\b(?:move|send|put|throw)\s+{P}\s+(?:to|in|into)\s+(?:the\s+)?(?:trash|recycle\s*bin|bin|wastebasket)\s*$",
+                          rf"^\s*trash\s+{P}\s*$"],
+           _trash),
+    Recipe("files per type", [r"\bhow\s+many\s+files\s+(?:of|for)\s+each\s+(?:type|kind|extension)\s+(?:in|inside)\s+(?P<dir>\S+)\s*$"],
+           "find {dir} -type f -name '*.*' | sed 's/.*\\.//' | sort | uniq -c | sort -rn"),
+    # -- archives
+    Recipe("zip a type", [r"^\s*(?:zip|compress)\s+(?:up\s+)?(?:all\s+)?(?:the\s+|my\s+)?(?P<type>\w+)(?:\s+files)?\s*$"],
+           _zip_type, slots={"type": "raw"}),
+    Recipe("compress each", [r"\b(?:compress|gzip|zip)\s+(?:each|every)\s+file\s+(?:in|inside)\s+(?P<dir>\S+)(?:\s+(?:separately|individually))?\s*$",
+                             r"\b(?:compress|gzip)\s+(?:all\s+)?(?:the\s+)?files\s+(?:in|inside)\s+(?P<dir>\S+)\s+(?:separately|individually|one\s+by\s+one)\s*$"],
+           "gzip -k -- {dir}/*"),
+    Recipe("password zip", [rf"\b(?:create|make)\s+(?:an?\s+)?(?:password[- ]protected|encrypted|secure)\s+zip\s+(?:file\s+|archive\s+)?(?:of|from|with|for)\s+{P}\s*$",
+                            rf"\bzip\s+{P}\s+with\s+(?:a\s+)?password\s*$", rf"\b(?:password[- ]protect|encrypt)\s+{P}\s+(?:as|in|into)\s+(?:a\s+)?zip\s*$"],
+           lambda v, u: f"zip -er {qpath(os.path.splitext(os.path.basename(_lit(v, 'path', u).rstrip('/')))[0] + '.zip')} {v['path']}"),
+    Recipe("extract one file", [r"\b(?:extract|get|pull|take|unpack|restore)\s+(?:only\s+|just\s+)?(?P<member>\S+)\s+(?:out\s+)?(?:of|from)\s+(?P<file>\S+)\s*$"],
+           lambda v, u: _extract_one(v, u) if re.search(r"\.(?:zip|tar(?:\.\w+)?|tgz|tbz2|txz)$", _lit(v, "file", u).lower()) else None,
+           slots={"member": "word"}),
+    Recipe("extract and delete", [rf"\b(?:extract|unpack|unzip|untar)\s+{F}\s+(?:and|then)\s+(?:delete|remove)\s+(?:it|the\s+archive|the\s+zip|the\s+file|\S+)\s*$"],
+           _extract_delete, destructive=True),
+    Recipe("add to archive", [rf"\b(?:add|put|append|insert|include)\s+{P}\s+(?:to|into|in)\s+(?:the\s+)?(?:archive\s+|zip\s+)?(?P<arc>\S+)\s*$"],
+           lambda v, u: _add_to_archive(v, u), slots={"arc": "file"}),
+    # -- git
+    Recipe("last commit", [r"^\s*(?:show|what\s+was|what'?s|view|display)\s+(?:me\s+)?(?:the\s+)?(?:last|latest|most\s+recent|previous)\s+commit\s*$"],
+           "git show --stat HEAD", git=True),
+    Recipe("revert commit", [r"\brevert\s+(?:the\s+)?(?:last|latest|previous|most\s+recent)\s+commit\b"],
+           "git revert --no-edit HEAD", git=True, destructive=True, warning="! adds a commit that undoes the last one"),
+    Recipe("undo pull", [r"\b(?:undo|revert|cancel|roll\s+back)\s+(?:my\s+|the\s+)?(?:last\s+)?(?:git\s+)?(?:pull|merge)\b"],
+           "git reset --keep ORIG_HEAD", git=True, destructive=True, warning="! moves the branch back to before the pull"),
+    Recipe("squash", [r"\bsquash\s+(?:the\s+)?(?:last\s+)?(?P<n>\d+)\s+commits\b"],
+           "git reset --soft HEAD~{n} && git commit", git=True, destructive=True,
+           warning="! rewrites the last commits into one (don't do this to pushed commits)"),
+    Recipe("blame line", [rf"\bwho\s+(?:wrote|changed|last\s+changed|edited|modified|touched)\s+line\s+(?P<n>\d+)\s+(?:of|in)\s+{P}\s*$"],
+           "git blame -L {n},{n} -- {path}", git=True),
+    Recipe("blame file", [rf"\bwho\s+wrote\s+(?:each\s+line\s+of\s+)?{P}\s*$|\bwho\s+(?:wrote|changed|edited)\s+each\s+line\s+of\s+{P}\s*$"], "git blame -- {path}", git=True),
+    Recipe("delete branch", [r"\b(?:delete|remove)\s+(?:the\s+)?(?:git\s+|local\s+)?branch\s+(?:called\s+|named\s+)?(?P<word>\S+)\s*$",
+                             r"\b(?:delete|remove)\s+(?:the\s+)?(?P<word>\S+)\s+branch\s*$"],
+           "git branch -d {word}", git=True, destructive=True),
+    Recipe("untrack", [rf"\b(?:remove|delete|drop|untrack)\s+{P}\s+from\s+(?:git|the\s+repo(?:sitory)?|version\s+control|tracking|the\s+index)\b(?:\s+but\s+keep\s+(?:it|the\s+file))?\s*$",
+                       rf"\bstop\s+tracking\s+{P}\s*$", rf"^\s*untrack\s+{P}\s*$"],
+           "git rm --cached -- {path}", git=True),
+    Recipe("clean untracked", [r"\b(?:remove|delete|clean(?:\s+up)?|get\s+rid\s+of)\s+(?:all\s+)?(?:the\s+)?untracked\s+files\b"],
+           "git clean -fd", preview="git clean -nd", git=True, destructive=True, warning="! deletes the untracked files listed above"),
+    Recipe("unstage", [r"\b(?:undo|revert|cancel)\s+(?:the\s+|my\s+)?(?:last\s+)?git\s+add\b|^\s*unstage\s+(?:everything|all(?:\s+files)?)?\s*$",
+                       rf"^\s*unstage\s+{P}\s*$"],
+           "git restore --staged -- {path}", defaults={"path": "."}, git=True),
+    # -- processes
+    Recipe("kill on port", [r"\b(?:kill|stop|end|terminate)\s+(?:the\s+|whatever(?:'s|\s+is)\s+)?(?:app|process|program|server|thing|service)?\s*(?:that'?s\s+|which\s+is\s+)?(?:running\s+|listening\s+|using\s+)?(?:on\s+)?port\s+(?P<n>\d+)\b",
+                            r"\bfree\s+(?:up\s+)?port\s+(?P<n>\d+)\b"],
+           [("fuser", "fuser -vk {n}/tcp"),
+            (None, "pids=$(ss -ltnpH 'sport = :{n}' | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u); "
+                   "[ -n \"$pids\" ] && kill $pids || echo 'nothing is using port {n}'")], destructive=True),
+    Recipe("why slow", [r"\bwhy\s+is\s+(?:my\s+|the\s+|this\s+)?(?:computer|pc|laptop|machine|system|server|box|everything)\s+(?:so\s+|being\s+)?(?:slow|sluggish|laggy|lagging)\b|"
+                        r"\bwhat'?s\s+slowing\s+(?:down\s+)?(?:my|the)\s+(?:computer|pc|laptop|machine|system)\b|"
+                        r"\b(?:computer|pc|laptop|system|machine)\s+is\s+(?:so\s+|really\s+|very\s+)?(?:slow|sluggish)\b"],
+           "uptime; free -h; ps aux --sort=-%cpu | head -n 6; ps aux --sort=-%mem | head -n 6"),
+    Recipe("process tree", [r"\b(?:show\s+|display\s+)?(?:me\s+)?(?:the\s+|a\s+)?process(?:es)?\s+tree\b|\btree\s+of\s+(?:all\s+)?processes\b"],
+           [("pstree", "pstree -p"), (None, "ps -ef --forest")]),
+    Recipe("kill -9", [r"^\s*kill\s+-(?:9|kill|sigkill)\s+(?P<word>[a-z][\w.-]*)\s*$", r"\bforce[- ]?kill\s+(?:the\s+)?(?P<word>[\w.-]+)\s*$"],
+           "pkill -9 -- {word}", destructive=True),
+    Recipe("threads", [r"\bhow\s+many\s+threads\s+(?:does|is)\s+(?P<word>\S+)\s+(?:have|use|using|running)\b|\bthreads?\s+(?:of|for|in)\s+(?P<word>\S+)\s*$"],
+           _threads),
+    Recipe("ram total", [r"\bhow\s+much\s+(?:ram|memory)\s+(?:does|is)\s+(?P<word>\S+)\s+(?:use|using|take|taking)\s+(?:in\s+)?total\b|"
+                         r"\btotal\s+(?:ram|memory)\s+(?:used\s+)?(?:of|by|for)\s+(?P<word>\S+)\s*$"],
+           _ram_total),
+    Recipe("kill except", [r"\b(?:kill|stop)\s+(?:all\s+)?(?:the\s+)?(?P<word>[\w.-]+?)(?:\s+process(?:es)?)?\s+(?:except|but(?:\s+not)?|other\s+than|apart\s+from|besides)\s+(?:pid\s+|process\s+)?(?P<keep>\S+)\s*$"],
+           _kill_except, destructive=True),
+    Recipe("kill top", [r"\bkill\s+(?:the\s+)?(?:process|program|app)\s+(?:that'?s\s+|which\s+is\s+|that\s+is\s+)?(?:using|eating|hogging|taking)\s+(?:up\s+)?(?:the\s+)?most\s+(?P<res>cpu|memory|ram)\b"],
+           _kill_top, destructive=True),
+    Recipe("pause process", [r"^\s*(?P<verb>pause|freeze|resume|unpause|unfreeze|continue)\s+(?:the\s+)?(?P<word>[\w.-]+)(?:\s+process)?\s*$"],
+           _pause),
+    Recipe("swap users", [r"\b(?:what'?s|what\s+is|which\s+(?:processes|programs?|apps?)\s+(?:is|are))\s+using\s+(?:my\s+|the\s+)?swap\b|\bswap\s+usage\s+(?:by|per)\s+process\b"],
+           "for f in /proc/[0-9]*/status; do awk '/^Name:/{{n=$2}} /^VmSwap:/{{if($2>0) print $2\" kB\", n}}' \"$f\" 2>/dev/null; "
+           "done | sort -nr | head"),
+    # -- services, docker
+    Recipe("service uptime", [r"\b(?:uptime\s+of)\s+(?:the\s+)?(?P<word>[\w.-]+)(?:\s+(?:service|process))?(?:\s+been\s+(?:running|up))?\s*$"],
+           _uptime_of),
+    Recipe("docker space", [r"\bhow\s+much\s+(?:disk\s+)?space\s+(?:does|is)\s+docker\s+(?:use|using|take|taking)\b|\bdocker\s+(?:disk\s+)?(?:usage|space)\b"],
+           [("docker", "docker system df"), (None, "sudo du -sh /var/lib/docker")]),
+    Recipe("docker clean", [r"\b(?:clean\s+up|clean|prune|tidy\s+up)\s+docker\b|\bdocker\s+(?:clean\s*up|prune)\b"],
+           "docker system prune", destructive=True, warning="! removes stopped containers, unused networks and dangling images"),
+    Recipe("docker stop all", [r"\bstop\s+(?:all\s+)?(?:the\s+|running\s+)?(?:docker\s+)?containers\b"],
+           "docker ps -q | xargs -r docker stop", destructive=True),
+    # -- users
+    Recipe("who has sudo", [r"\bwho\s+(?:has|can\s+use|is\s+allowed\s+to\s+use|gets?)\s+(?:sudo|admin|root)(?:\s+rights|\s+access)?\b|"
+                            r"^\s*(?:list|show)\s+(?:the\s+|all\s+)?(?:sudoers|admins|administrators|sudo\s+users)\s*$|\bmembers\s+of\s+(?:the\s+)?sudo(?:\s+group)?\b"],
+           "getent group sudo"),
+    Recipe("user groups", [r"\b(?:what|which)\s+groups\s+(?:is|does)\s+(?P<user>\S+)\s+(?:in|belong\s+to|a\s+member\s+of)\b|\bgroups\s+(?:of|for)\s+(?:the\s+)?(?:user\s+)?(?P<user>\S+)\s*$"],
+           "id -nG {user}"),
+    Recipe("make admin", [r"\b(?:make|give)\s+(?P<user>\S+)\s+(?:an?\s+)?(?:admin(?:istrator)?|sudoer|sudo(?:\s+rights|\s+access)?|root\s+(?:rights|access))\s*$|"
+                          r"\badd\s+(?P<user>\S+)\s+to\s+(?:the\s+)?(?:sudo|sudoers|admin)(?:\s+group)?\s*$"],
+           "{su}usermod -aG sudo {user}", destructive=True, warning="! gives that user full control of this computer"),
+    Recipe("delete user", [r"\b(?:delete|remove)\s+(?:the\s+)?user(?:\s+account)?\s+(?P<user>\S+)\s*$"],
+           [("deluser", "{su}deluser {user}"), (None, "{su}userdel {user}")], destructive=True),
+    Recipe("login users", [r"\b(?:which|what)\s+users\s+can\s+(?:log\s*in|login|sign\s+in)\b|^\s*(?:list|show)?\s*(?:the\s+)?(?:real|human|login|normal)\s+users\s*$|\busers\s+with\s+(?:a\s+)?(?:login\s+)?shell\b"],
+           "getent passwd | awk -F: '$7 !~ /(nologin|false|sync)$/ {{print $1}}'"),
+    Recipe("failed logins", [r"\b(?:failed|unsuccessful|bad|wrong)\s+(?:ssh\s+)?(?:login|log-in|logon|password)s?(?:\s+(?:attempts|tries))?\b|\bwho\s+(?:tried|is\s+trying)\s+to\s+(?:log\s*in|hack|break\s+in)\b"],
+           "journalctl -u ssh -u sshd --no-pager | grep -iE 'failed|invalid' | tail -n 30"),
+    # -- system
+    Recipe("disk uuid", [r"\b(?:what'?s\s+|show\s+)?(?:the\s+)?uuids?\s+(?:of|for)\s+(?:my\s+|the\s+)?(?:disks?|drives?|partitions?)\b|\b(?:disk|partition|drive)\s+uuids?\b"],
+           "lsblk -o NAME,UUID,FSTYPE,MOUNTPOINT"),
+    Recipe("home folder", [r"\bwhere\s+is\s+my\s+home(?:\s+(?:folder|directory|dir))?\s*$|\bwhat\s+is\s+my\s+home\s+(?:folder|directory)\b|\b(?:path\s+(?:of|to)\s+)?my\s+home\s+(?:folder|directory)\s+path\b"],
+           "echo \"$HOME\""),
+    Recipe("wifi users", [r"\bwho(?:'?s|\s+is)\s+(?:using|on|connected\s+to)\s+(?:my\s+)?(?:wifi|wi-fi|network|lan|router)\b|\bdevices\s+(?:on|connected\s+to)\s+(?:my\s+)?(?:wifi|wi-fi|network|lan)\b"],
+           "ip neigh show"),
+    Recipe("package sizes", [r"\b(?:which|what)\s+packages\s+(?:take|use)\s+(?:up\s+)?(?:the\s+)?most\s+(?:disk\s+)?space\b|\b(?:biggest|largest)\s+(?:installed\s+)?packages\b"],
+           "dpkg-query -W -f='${{Installed-Size}}\\t${{Package}}\\n' | sort -nr | head -n 15", needs=("dpkg-query",)),
+    Recipe("fix packages", [r"\b(?:fix|repair)\s+(?:the\s+)?(?:broken|half[- ]installed|interrupted)\s+(?:packages|installs?|installations?|apt|dpkg)\b|\bfix\s+apt\b|\bapt\s+is\s+broken\b"],
+           "{su}dpkg --configure -a && {su}apt --fix-broken install", needs=("dpkg",), destructive=True),
+    Recipe("hold kernel", [r"\b(?:update|upgrade)\s+(?:everything|all|all\s+(?:the\s+)?packages|the\s+system|packages)\s+(?:except|but(?:\s+not)?|without|apart\s+from)\s+(?:the\s+)?kernel\b"],
+           lambda v, u: ("k=$(dpkg-query -W -f='${db:Status-Abbrev} ${Package}\\n' 'linux-image-*' | awk '$1==\"ii\"{print $2}'); "
+                         f"{sudo()}apt-mark hold $k && {sudo()}apt update && {sudo()}apt upgrade; {sudo()}apt-mark unhold $k"),
+           needs=("apt",), destructive=True, warning="! upgrades everything but the kernel"),
+    Recipe("install many", [r"^\s*(?:please\s+)?install\s+(?P<pkgs>[\w.+-]+(?:(?:\s*,\s*|\s+and\s+|\s+)[\w.+-]+)+)\s*$"],
+           _install_many, destructive=True, warning="! changes installed software"),
+    Recipe("purge", [r"^\s*purge\s+(?:the\s+)?(?:package\s+)?(?P<word>[\w.+-]+)\s*$",
+                     r"\b(?:remove|uninstall|delete)\s+(?:the\s+)?(?:package\s+)?(?P<word>[\w.+-]+)\s+(?:completely|entirely|fully|with\s+(?:its\s+)?config(?:uration)?s?)\s*$"],
+           _purge, destructive=True, warning="! removes the package and its settings"),
+    Recipe("space on path", [r"\b(?:how\s+much\s+)?(?:free\s+)?(?:disk\s+)?space\s+(?:is\s+)?(?:left|free|available|remaining)\s+(?:on|in|at)\s+(?P<path>\S+)\s*$|"
+                             r"^\s*(?:how\s+much\s+)?free\s+(?:disk\s+)?space\s+(?:on|in)\s+(?P<path>\S+)\s*$"],
+           "df -h -- {path}"),
+    # -- network
+    Recipe("block port", [r"\b(?P<verb>block|close|deny|firewall)\s+(?:the\s+)?(?:incoming\s+)?(?:traffic\s+(?:on|to)\s+)?port\s+(?P<n>\d+)\b"],
+           [("ufw", "{su}ufw deny {n}/tcp"), ("nft", "{su}nft add rule inet filter input tcp dport {n} drop"),
+            (None, "{su}iptables -A INPUT -p tcp --dport {n} -j DROP")], destructive=True),
+    Recipe("open port", [r"\b(?:open|allow|unblock)\s+(?:the\s+)?(?:incoming\s+)?(?:traffic\s+(?:on|to)\s+)?port\s+(?P<n>\d+)\b(?:\s+in\s+the\s+firewall)?"],
+           [("ufw", "{su}ufw allow {n}/tcp"), ("nft", "{su}nft add rule inet filter input tcp dport {n} accept"),
+            (None, "{su}iptables -A INPUT -p tcp --dport {n} -j ACCEPT")], destructive=True),
+    Recipe("active connections", [r"^\s*(?:show\s+|list\s+)?(?:me\s+)?(?:the\s+|all\s+|my\s+)?(?:active|open|established|current)\s+(?:network\s+|internet\s+)?connections\s*$"],
+           "ss -tunp state established"),
+    Recipe("renew ip", [r"\b(?:renew|refresh|reset|get\s+a\s+new|release)\s+(?:my\s+|the\s+)?(?:ip(?:\s+address)?|dhcp(?:\s+lease)?)\b"],
+           [("nmcli", "dev=$(ip route show default | awk '{{print $5; exit}}'); {su}nmcli device disconnect \"$dev\" && "
+                      "{su}nmcli device connect \"$dev\""),
+            (None, "{su}dhclient -r && {su}dhclient")], destructive=True, warning="! drops the network for a moment"),
+    Recipe("env grep", [r"\b(?:show|list)\s+(?:the\s+|all\s+|my\s+)?(?P<word>(?!all\b|the\b|my\b|environment\b)\w+)\s+(?:environment|env)\s+(?:variables|vars)\s*$",
+                        r"\b(?:show|list|print)\s+(?:all\s+)?(?:the\s+|my\s+)?(?:environment\s+|env\s+)?(?:variables|vars)\s+(?:with|containing|matching|named|about|for|like)\s+(?P<word>\S+)\s*$"],
+           "env | grep -i -- {word}"),
+    # -- dates
+    Recipe("date of", [r"\b(?:what'?s|what\s+is|show|which)?\s*(?:the\s+)?(?:date|day)\s+(?:is\s+(?:it\s+)?)?(?P<when>(?:next|last|this)\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|week|month|year)|tomorrow|yesterday)\s*$",
+                       r"\b(?:what|which)\s+(?:date|day)\s+is\s+(?P<when>(?:next|last|this)\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\s*$"],
+           _date_of),
+    Recipe("ms timestamp", [r"\bconvert\s+(?P<ts>\d{10,13})\s+(?:to|into)\s+(?:a\s+)?(?:date|time|human)\b|\b(?P<ts>\d{13})\s+(?:to|as|in)\s+(?:a\s+)?(?:date|human)\b|\bwhat\s+(?:date|time)\s+is\s+(?P<ts>\d{10,13})\b"],
+           _ms_date),
+    Recipe("journal since", [r"^\s*(?:show\s+|display\s+)?(?:me\s+)?(?:the\s+)?(?:system\s+)?(?:logs?|journal)\s+(?:since|after)\s+(?P<when>.+?)\s*$"],
+           _since),
+]
+RECIPES[:0] = GAME_RECIPES
+
+# More ways to say the same things (paraphrases from the findings game).
+MORE_WAYS = {
+    "zip a type": [r"\b(?:make|create)\s+(?:a\s+)?zip\s+(?:file\s+|archive\s+)?(?:of|with|from)\s+(?:all\s+)?(?:the\s+|my\s+)?(?P<type>\w+)(?:\s+files)?\s*$"],
+    "biggest folder": [r"\b(?:which|what)\s+(?:folder|directory)\s+(?:takes|uses|is\s+using|eats|takes\s+up)\s+(?:up\s+)?(?:the\s+)?most\s+(?:disk\s+)?space\b"],
+    "lines per file": [r"\bline\s+counts?\s+(?:per|for\s+each|of\s+each)\s+(?P<type>\.?\w+?)\s+file\s*$",
+                       r"\bcount\s+(?:the\s+)?lines\s+(?:in|of)\s+(?:each|every)\s+(?P<type>\.?\w+?)\s+file(?:\s+separately)?\s*$"],
+    "base64 file": [rf"\bconvert\s+{F}\s+(?:to|into)\s+base64\s*$"],
+    "nth file": [r"\b(?:the\s+)?(?P<n>second|third|fourth|fifth|2nd|3rd|4th|5th)\s+(?P<which>most\s+recent(?:ly)?)(?:\s+(?:modified|changed|edited))?\s+file\s*$"],
+    "part of day": [r"\bwhat\s+(?:did\s+i|have\s+i)\s+(?:change|edit|modify|touch|work\s+on)d?\s+(?P<day>yesterday|today)\s+(?:in\s+the\s+)?(?P<part>morning|afternoon|evening|night)\s*$"],
+    "keep newest": [r"\bkeep\s+only\s+the\s+(?P<n>\d+)\s+(?P<which>newest|latest|most\s+recent|oldest)(?:\s+files)?\s*$",
+                    r"\b(?:delete|remove|get\s+rid\s+of)\s+(?:everything|all(?:\s+(?:the\s+)?files)?)\s+(?:but|except(?:\s+for)?)\s+the\s+(?P<n>\d+)\s+(?P<which>newest|latest|most\s+recent|oldest)(?:\s+files)?\s*$"],
+    "most common lines": [rf"\b(?:which|what)\s+lines\s+(?:repeat|occur|appear|come\s+up)\s+(?:the\s+)?most\s+(?:often\s+)?in\s+{F}\s*$"],
+    "empty file": [rf"\btruncate\s+{F}\s+to\s+(?:zero|0|nothing|empty)(?:\s+bytes)?\s*$"],
+    "move contents": [r"\b(?P<op>move|copy)\s+(?P<dir>[\w./-]+?)'s\s+(?:contents|files)\s+(?:up\s+)?(?:to\s+|in\s+)?(?P<dest>here|this\s+folder)\s*$"],
+    "list two folders": [r"\b(?:list|show)\s+(?:what\s+is\s+in\s+|the\s+contents\s+of\s+)?(?P<a>\S+)\s+and\s+(?P<b>\S+)\s*$"],
+    "spaces in names": [r"\b(?:file\s*names?|names?)\s+(?:containing|with|that\s+contain|that\s+have)\s+(?:a\s+)?spaces?\b",
+                        r"\bfiles?\s+(?:that\s+)?(?:have|has|contain)\s+(?:a\s+)?spaces?\s+in\s+(?:the(?:ir)?\s+)?names?\b"],
+    "world writable": [r"\bfiles?\s+(?:that\s+are\s+)?writ(?:e)?able\s+by\s+(?:everyone|anyone|all|others|everybody)\b"],
+    "files i cannot": [r"\b(?:which|what)\s+files\s+(?:am\s+i|are\s+we)\s+not\s+allowed\s+to\s+(?P<act>read|open|write|edit|modify|change|execute|run)\b",
+                       r"\b(?:which|what)\s+files\s+(?:can\s+i\s+not|can\s+not\s+i|cannot\s+i)\s+(?P<act>read|open|write|edit|modify|change|execute|run)\b"],
+    "both words": [r"\bfiles?\s+(?:that\s+)?(?:contain(?:ing|s)?|mention(?:ing|s)?)\s+(?P<a>\S+)\s+and\s+(?P<b>\S+)\s*$"],
+    "column": [rf"\b(?:show|print|get|extract|list|cut)?\s*(?:me\s+)?(?:the\s+)?(?P<n>{ORD})\s+field\s+(?:of|in|from)\s+{F}\s*$"],
+    "sort by column": [rf"\b(?:order|arrange)\s+{F}\s+by\s+(?:the\s+)?(?P<n>{ORD})\s+(?:column|field)(?P<rev>\s+(?:descending|reversed?))?\s*$"],
+    "json keys": [rf"\bwhat\s+(?:keys|fields)\s+(?:does|is\s+in)\s+{F}(?:\s+have)?\s*$"],
+    "csv to json": [rf"^\s*{F}\s+(?:as|to|in)\s+json\s*$"],
+    "private": [rf"\bonly\s+(?:i|me)\s+(?:should\s+)?(?:be\s+able\s+to|can|may)\s+(?:read|open|see|access)\s+{P}\s*$"],
+    "delete lines": [rf"\b(?:delete|remove|drop|strip)\s+(?:the\s+)?(?P<n>header|heading|title)\s+(?:line|row)\s+(?:from|in|of)\s+{F}\s*$"],
+    "empty folder": [r"^\s*(?:delete|remove|erase)\s+everything\s+(?:inside|in)\s+(?P<dir>\S+)\s*$"],
+    "grep context": [rf"\b(?P<text>\S+)\s+in\s+{F}\s+with\s+(?P<n>\d+)\s+lines?\s+(?:of\s+context|around(?:\s+(?:it|them))?|before\s+and\s+after)\s*$",
+                     rf"\b(?:show\s+)?(?P<text>\S+)\s+lines\s+in\s+{F}\s+(?:plus|with|and)\s+(?P<n>\d+)\s+lines?\s+(?:around|of\s+context|before\s+and\s+after)(?:\s+(?:them|it|each))?\s*$"],
+    "matches per file": [r"\bhow\s+many\s+lines\s+(?:mention|contain|have|match)\s+(?P<text>\S+)\s+in\s+(?:each|every)\s+file\s*$",
+                         r"\bcount\s+(?P<text>\S+)\s+lines\s+(?:per|in\s+each|for\s+each)\s+file\s*$"],
+    "most lines": [r"\blongest\s+file\s+by\s+(?:lines?|line\s+count|number\s+of\s+lines)\s*$",
+                   r"\b(?:which|what)\s+file\s+(?:here\s+)?has\s+(?:the\s+)?most\s+lines(?:\s+in\s+it)?\s*$"],
+    "files per type": [r"\bcount\s+(?:the\s+)?files\s+(?:by|per)\s+(?:extension|type|kind)\s+in\s+(?P<dir>\S+)\s*$",
+                       r"\bfile\s+types\s+in\s+(?P<dir>\S+)\s+and\s+how\s+many\s+(?:of\s+each|there\s+are)\s*$"],
+    "not executable": [r"\b(?:which\s+|what\s+)?(?:(?P<type>\w+)\s+)?(?:files|scripts)\s+(?:are\s+)?(?:missing|without|lacking|do\s+not\s+have)\s+(?:the\s+)?(?:execute|exec|executable|x)\s+(?:bit|permission|flag)\b"],
+    "check file": [rf"\bcheck\s+{F}\s+for\s+(?:errors|corruption|damage|problems)\s*$"],
+    "extract and delete": [rf"\b(?:extract|unpack|unzip|untar)\s+{F}\s+(?:and|then)\s+(?:delete|remove)\s+it\s+(?:afterwards|after(?:\s+that)?|when\s+done)\s*$"],
+    "write to file": [r"\boverwrite\s+(?P<newfile>\S+)\s+with\s+(?P<text>.+?)\s*$",
+                      r"\breplace\s+the\s+contents\s+of\s+(?P<newfile>\S+)\s+with\s+(?P<text>.+?)\s*$"],
+    "why slow": [r"\bwhat\s+is\s+slowing\s+(?:down\s+)?(?:my|the)\s+(?:computer|pc|laptop|machine|system)(?:\s+down)?\b"],
+    "who has sudo": [r"\b(?:which|what)\s+users\s+(?:are|have)\s+(?:admins?|administrators|sudo(?:ers)?|root)\b"],
+    "user groups": [r"\b(?:show\s+|list\s+)?(?P<user>[a-z_][\w-]*)'s\s+groups\b"],
+    "docker space": [r"\bhow\s+(?:big|large)\s+is\s+docker\b"],
+    "space on path": [r"\bhow\s+full\s+is\s+(?P<path>\S+)\s*$"],
+    "last commit": [r"\bwhat\s+changed\s+in\s+(?:the\s+)?(?:last|latest|previous|most\s+recent)\s+commit\b"],
+    "revert commit": [r"\bmake\s+a\s+commit\s+that\s+(?:undoes|reverts)\s+(?:the\s+)?(?:last|previous)\s+(?:one|commit)\b"],
+    "undo pull": [r"\bgo\s+back\s+to\s+(?:before|how\s+it\s+was\s+before)\s+(?:the|my)\s+(?:last\s+)?(?:git\s+)?pull\b"],
+    "squash": [r"\b(?:squash|combine|merge)\s+(?:the\s+|my\s+)?(?:last\s+)?(?P<n>\d+|two|three|four|five|six|seven|eight|nine|ten)\s+commits(?:\s+into\s+one)?\b"],
+    "blame line": [rf"\bblame\s+line\s+(?P<n>\d+)\s+(?:of|in)\s+{P}\s*$"],
+    "process tree": [r"\bprocesses\s+(?:as\s+a|in\s+a)\s+tree\b"],
+    "kill -9": [r"\bkill\s+(?P<word>[a-z][\w.-]*)\s+with\s+(?:signal\s+)?(?:9|kill|sigkill)\s*$"],
+    "threads": [r"\bthread\s+count\s+(?:of|for)\s+(?P<word>\S+)\s*$"],
+    "service uptime": [r"\bsince\s+when\s+(?:is|has)\s+(?P<word>[\w.-]+)\s+(?:been\s+)?(?:up|running)\s*$"],
+    "delete user": [r"\b(?:delete|remove)\s+(?P<user>[a-z_][\w-]*)'s\s+(?:user\s+)?account\s*$"],
+    "login users": [r"\b(?:list|show)\s+(?:the\s+)?users\s+(?:that|who)\s+can\s+(?:log\s*in|login)\b",
+                    r"\b(?:which|what)\s+accounts\s+(?:have\s+(?:a\s+)?login\s+shell|can\s+log\s*in)\b"],
+    "home folder": [r"\bpath\s+(?:of|to)\s+my\s+home(?:\s+(?:folder|directory|dir))?\s*$"],
+    "wifi users": [r"\b(?:what|which)\s+devices\s+are\s+(?:on|connected\s+to)\s+(?:my\s+)?(?:wifi|wi-fi|network|lan)\b"],
+    "ram total": [r"\bhow\s+much\s+(?:ram|memory)\s+(?:does|is)\s+(?P<word>\S+)\s+(?:use|using|take|taking)\s+(?:altogether|combined|overall|all\s+together)\b"],
+    "date of": [r"\bwhen\s+is\s+(?P<when>(?:next|this)\s+(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday))\s*$"],
+    "active connections": [r"\b(?:what|which)\s+(?:network\s+)?connections\s+are\s+(?:active|open|established)\b"],
+    "env grep": [r"\b(?:which|what)\s+(?:env(?:ironment)?\s+)?(?:variables|vars)\s+(?:mention|contain|have|include)\s+(?P<word>\S+)\s*$"],
+    "untrack": [rf"^\s*untrack\s+{P}\s+in\s+git\s*$"],
+    "clean untracked": [r"\bclean\s+(?:up\s+)?the\s+(?:repo|repository|working\s+tree)\b"],
+    "docker clean": [r"\bfree\s+up\s+(?:disk\s+)?(?:space\s+(?:used\s+by|from|in)\s+)?docker(?:\s+space)?\b"],
+    "docker stop all": [r"\bstop\s+(?:all|every)\s+(?:the\s+)?(?:running\s+)?(?:docker\s+)?containers?\b", r"^\s*docker\s+stop\s+all\s*$"],
+    "kill except": [r"\b(?:kill|stop)\s+(?:all\s+|every\s+)(?:the\s+)?(?P<word>[\w.-]+?)(?:\s+process(?:es)?)?\s+(?:except|but(?:\s+not)?|other\s+than)\s+(?:pid\s+|process\s+)?(?P<keep>\S+)\s*$",
+                    r"\b(?:kill|stop)\s+(?:all\s+)?(?P<word>[\w.-]+?)\s+but\s+keep\s+(?P<keep>\S+)(?:\s+(?:running|alive))?\s*$"],
+    "kill top": [r"\bkill\s+the\s+top\s+(?P<res>cpu|memory|ram)\s+(?:process|hog|program)\b",
+                 r"\bkill\s+(?:whatever|what)\s+is\s+(?:eating|hogging|using)\s+(?:up\s+)?(?:all\s+)?(?:my\s+|the\s+)?(?P<res>cpu|memory|ram)\b"],
+    "swap users": [r"\b(?:which|what)\s+(?:processes|programs?|apps?)\s+(?:use|are\s+using)\s+(?:the\s+)?swap\b"],
+    "ms timestamp": [r"\b(?P<ts>\d{10,13})\s+(?:milliseconds|millis|ms|seconds|secs)?\s*(?:to|as|in|into)\s+(?:a\s+)?(?:date|human)\b"],
+    "purge": [r"^\s*purge\s+(?:the\s+)?(?P<word>[\w.+-]+)\s+package\s*$",
+              r"\b(?:uninstall|remove)\s+(?P<word>[\w.+-]+)\s+and\s+(?:delete|remove)\s+(?:its|the)\s+(?:config(?:uration)?s?|settings|config\s+files)\s*$",
+              r"\bget\s+rid\s+of\s+(?P<word>[\w.+-]+)\s+(?:entirely|completely)\s*$"],
+    "change case": [rf"\bmake\s+{F}\s+(?P<case>lower|upper)\s*-?case\s*$",
+                    rf"\b(?P<case>lower|upper)\s*-?case\s+(?:the\s+)?(?:contents\s+of\s+|text\s+in\s+)?{F}\s*$"],
+    "permission bits": [r"\bfiles?\s+with\s+(?:mode|permissions?)\s+(?P<mode>[0-7]{3,4})\s*$",
+                        r"\b(?:which|what)\s+files\s+(?:are|have)\s+(?:chmod(?:ded)?\s+|mode\s+|permissions?\s+)?(?P<mode>[0-7]{3,4})\s*$"],
+    "not mine": [r"\b(?:which|what)\s+files\s+(?:here\s+)?are\s+not\s+mine\b", r"\bfiles?\s+(?:that\s+)?(?:are\s+not|aren't)\s+mine\b"],
+    "files by year": [r"\bfiles?\s+(?P<rel>older|newer)\s+than\s+(?P<year>(?:19|20)\d\d)\s*$",
+                      r"\bfiles?\s+(?:last\s+)?(?:changed|modified|edited)\s+(?P<rel>before|after)\s+(?:january\s+)?(?P<year>(?:19|20)\d\d)\s*$"],
+    "newer than file": [rf"\b(?:which\s+)?files?\s+(?:that\s+)?(?:have\s+)?(?P<rel>changed|been\s+modified|were\s+modified|modified)\s+since\s+{P}\s*$"],
+    "git log": [r"\b(?:my\s+|the\s+)?(?:recent|last|latest)\s+(?P<n>two|three|four|five|six|seven|eight|nine|ten)\s+commits\b"],
+    "time in city": [r"^\s*(?P<city>[a-z][a-z_]+(?:\s+[a-z]+)?)\s+time(?:\s+now)?\s*$"],
+}
+MORE_WAYS2 = {
+    "keep newest": [r"\b(?:delete|remove|get\s+rid\s+of)\s+(?:all\s+|everything\s+)?(?:the\s+)?(?:files\s+)?(?:but|except(?:\s+for)?)\s+(?:the\s+)?(?P<which>newest|latest|most\s+recent|oldest)\s+(?P<n>\d+)(?:\s+files)?\s*$",
+                    r"\b(?:delete|remove|get\s+rid\s+of)\s+(?:everything|all(?:\s+(?:the\s+)?files)?)\s+(?:but|except(?:\s+for)?)\s+(?:the\s+)?(?P<n>\d+)\s+(?P<which>newest|latest|most\s+recent|oldest)(?:\s+files)?\s*$",
+                    r"\bkeep\s+only\s+(?:the\s+)?(?P<n>\d+)\s+(?P<which>newest|latest|most\s+recent|oldest)(?:\s+files)?\s*$"],
+    "empty file": [r"\b(?:empty|truncate|clear|wipe)\s+(?:out\s+)?(?:the\s+)?log\s*file\s*$"],
+    "remove permission": [rf"\b(?:erase|strip|get\s+rid\s+of)\s+(?:the\s+)?(?P<perm>read|write|execute|executable|exec|run)\s+(?:permissions?|rights?|bit|flag|access)\s+(?:from|on|of|for)\s+{P}\s*$"],
+    "delete lines": [rf"\bget\s+rid\s+of\s+(?:the\s+)?line\s+(?:number\s+)?(?P<n>\d+)\s+(?:from|in|of)\s+{F}\s*$",
+                     rf"\bget\s+rid\s+of\s+(?:the\s+)?(?P<n>{ORD}|last|header|heading|title)\s+(?:line|row)\s+(?:from|in|of)\s+{F}\s*$"],
+    "extract and delete": [rf"\b(?:extract|unpack|unzip|untar|decompress)\s+{F}\s+(?:and|then)\s+(?:delete|remove|erase|get\s+rid\s+of)\s+(?:it|the\s+archive|the\s+zip|the\s+file)(?:\s+(?:afterwards|after(?:\s+that)?|when\s+done))?\s*$"],
+    "hold kernel": [r"\b(?:update|upgrade)\s+(?:the\s+)?(?:system|everything|all)\s+(?:except|without|but(?:\s+not)?)\s+(?:the\s+)?kernel\b"],
+    "last commit": [r"^\s*(?:show|view|display|print|give\s+me|get)\s+(?:me\s+)?(?:the\s+)?(?:last|latest|most\s+recent|previous)\s+commit\s*$"],
+    "revert commit": [r"\bmake\s+(?:a\s+)?commit\s+that\s+(?:undoes|reverts)\s+(?:the\s+)?(?:last|previous)\s+(?:one|commit)\b"],
+    "undo pull": [r"\bgo\s+back\s+to\s+before\s+(?:the\s+|my\s+)?(?:last\s+)?(?:git\s+)?pull\b"],
+    "delete branch": [r"\bget\s+rid\s+of\s+(?:the\s+)?(?:git\s+)?branch\s+(?P<word>\S+)\s*$"],
+    "journal since": [r"^\s*(?:print|view|list)\s+(?:the\s+)?(?:system\s+)?(?:logs?|journal)\s+(?:since|after)\s+(?P<when>.+?)\s*$"],
+    "process tree": [r"\bprocesses\s+as\s+(?:a\s+)?tree\b"],
+    "kill -9": [r"\bforce\s+(?:terminate|stop|end)\s+(?:the\s+)?(?P<word>[\w.-]+)\s*$",
+                r"\b(?:stop|end|terminate)\s+(?P<word>[a-z][\w.-]*)\s+with\s+(?:signal\s+)?(?:9|kill|sigkill)\s*$"],
+    "env grep": [r"\bprint\s+(?:the\s+|all\s+|my\s+)?(?P<word>(?!all\b|the\b|my\b|environment\b)\w+)\s+(?:environment|env)\s+(?:variables|vars)\s*$"],
+    "clean untracked": [r"^\s*clean\s+(?:up\s+)?(?:the\s+)?(?:repo|repository)\s*$"],
+    "kill top": [r"\b(?:kill|stop|end)\s+(?:the\s+)?top\s+(?P<res>cpu|memory|ram)\s+(?:process|hog|program)\b"],
+    "renew ip": [r"\bget\s+(?:a\s+)?new\s+ip(?:\s+address)?\b"],
+}
+for _r in RECIPES:
+    for _p in MORE_WAYS2.get(_r.label, []):
+        _r.patterns.append(re.compile(_p))
+for _r in RECIPES:
+    for _p in MORE_WAYS.get(_r.label, []):
+        try:
+            _r.patterns.append(re.compile(_p))
+        except re.error:
+            _r.patterns += [re.compile(a) for a in split_alternatives(_p)]
+
+
 def h_recipe(u: Utterance) -> Plan | None:
     best = None
     text = Utterance(u.raw, u.cwd).text
@@ -3539,7 +4410,10 @@ def harvest_vocab() -> set:
     texts = [INTENT_BANK, " ".join(TYPE_WORDS), " ".join(SYNONYMS), " ".join(SYNONYMS.values())]
     texts += [pat for pat, *_ in SYSTEM]
     texts += [p.pattern for r in RECIPES for p in r.patterns]
-    texts += [pat for pat, *_ in LS_KEYS] + [SUNIT, TUNIT, " ".join(FILLER), "megabytes gigabytes kilobytes username mount unmount umount eject format usb stick flash drive ntfs fat32 exfat"]
+    texts += [pat for pat, *_ in LS_KEYS] + [SUNIT, TUNIT, " ".join(FILLER), "megabytes gigabytes kilobytes username mount unmount umount eject format usb stick flash drive ntfs fat32 exfat",
+              "tonight midnight later minutes hours reboot restart shutdown schedule status enabled starts kernel package "
+              "docker spaces newest recent permissions writable afterwards before after remove corrupted encrypted column "
+              "containing threads failed undoes"]
     words = set()
     for t in texts:
         words.update(re.findall(r"[a-z]{4,}", re.sub(r"\\[a-zA-Z]", " ", t)))
@@ -4214,6 +5088,9 @@ def fill_template(template: str, vals: list[tuple[str, str]]) -> tuple[str, int]
 SUGGEST_MIN = 0.3
 
 
+POWER_RE = re.compile(r"\b(?:reboot|poweroff|shutdown|halt|suspend|hibernate)\b")
+
+
 def suggest(text: str, cwd: str, threshold: float = DEFAULTS["threshold"], limit: int = 3) -> list[tuple[str, Plan, float]]:
     """Closest requests aisha knows, filled with this request's values, that the rules are sure of."""
     masked, vals = request_values(text, cwd)
@@ -4228,11 +5105,15 @@ def suggest(text: str, cwd: str, threshold: float = DEFAULTS["threshold"], limit
         plan = _interpret_fixing(phrase, cwd)
         if not plan or plan.confidence < threshold or plan.command in seen:
             continue
+        if POWER_RE.search(plan.command) and not re.search(
+                r"\b(?:computer|pc|laptop|machine|system|reboot|shut\s*down|power|suspend|sleep|hibernate)\b", text, re.I):
+            continue                     # never guess "restart the computer" for "restart the wlan thing"
         seen.add(plan.command)
         out.append((phrase, plan, score * (0.8 ** unused)))
         if len(out) >= limit:
             break
-    return sorted(out, key=lambda x: -x[2])
+    # a guess that deletes, reboots or rewrites never comes first
+    return sorted(out, key=lambda x: (x[1].destructive or needs_care(x[1].command), -x[2]))
 
 
 def apply_synonyms(text: str) -> tuple[str, list[str]]:
@@ -4335,7 +5216,7 @@ SHUTDOWN_TIME = re.compile(r"now|\+?\d+|\d{1,2}:\d{2}|-[a-zA-Z-]+.*")
 AMBIGUOUS_FIRST = {"go", "kill", "find", "open", "make", "which", "who", "file", "install", "compare",
                    "base64", "convert", "set", "sync", "ssh", "clone", "add", "pull", "push", "display", "shift",
                    "du", "df", "free", "locate", "look", "see", "show", "cd", "zip", "unzip", "head",
-                   "tail", "touch", "less"}
+                   "tail", "touch", "less", "truncate", "last"}
 
 
 # On Debian `edit` is run-mailcap and `open` is openvt: nobody typing
@@ -4357,6 +5238,21 @@ def looks_like_shell(line: str, path_env: str | None = None, cwd: str | None = N
     if (toks[0] in POWER_CMDS and rest and not re.search(r"[|&;<>`$]", line)
             and not all(SHUTDOWN_TIME.fullmatch(t) for t in rest)):
         return False
+    if (toks[0] in ("kill", "pkill") and rest and all(t.startswith("-") or not re.fullmatch(r"[%+-]?\d+|%\S*", t)
+                                                       for t in rest)
+            and any(re.fullmatch(r"[a-z][\w.-]*", t) for t in rest) and toks[0] == "kill"
+            and not re.search(r"[|&;<>`$]", line)):
+        return False                     # "kill -9 firefox": kill takes numbers, the rules take names
+    if (toks[0] == "git" and cwd and len(rest) >= 2 and not any(t.startswith("-") for t in rest)
+            and set(w.lower() for w in rest[1:]) & {"the", "my", "last", "all", "every", "latest", "previous"}
+            and not re.search(r"[|&;<>`$]", line)):
+        plan = interpret(line, cwd)      # "git revert the last commit"
+        if plan and plan.confidence >= threshold:
+            return False
+    if toks[0] in ("sort", "cut", "order") and re.search(r"\bby\s+(?:the\s+)?(?:\w+\s+)?(?:column|field)\b", line):
+        return False                     # "sort people.csv by column 2"
+    if toks[0] == "watch" and re.search(r"\blogs?\b", line) and not any(t.startswith("-") for t in rest):
+        return False                     # "watch nginx logs live"
     if toks[0] == "yes" and not re.search(r"[|&;<>`$]", line):
         return False                     # "yes please": nobody wants y printed forever
     if (cwd and toks[0] in PREFER_RULES and rest and not any(t.startswith("-") for t in rest)
@@ -4408,7 +5304,7 @@ def _looks_like_shell(line: str, path_env: str | None = None, known: set = froze
     first = toks[0]
     if first.startswith(("./", "/", "~/", "../")):
         return True
-    if first == "time" and len(toks) > 1 and toks[1].lower() in ("how", "it", "the"):
+    if first == "time" and len(toks) > 1 and toks[1].lower() in ("how", "it", "the", "in", "at", "now", "zone"):
         return False                     # "time how long make takes"
     if first in known or first in SHELL_KEYWORDS:
         return True
