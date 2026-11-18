@@ -262,8 +262,14 @@ On Debian and Ubuntu, `install.sh` builds the Debian package
 (`packaging/debian/build-deb.sh` → `dist/aisha_<version>_all.deb`) and
 installs it with apt: `/usr/bin/aisha`, `man aisha`, registered as a login
 shell. Elsewhere, or with `./install.sh --local`, it puts aisha in
-`/usr/local` without a package. It asks nothing but your sudo password.
-Needs Python 3.9+ (Debian 11 or newer).
+`/usr/local` without a package. Needs Python 3.9+ (Debian 11 or newer).
+
+The first time, it asks whether new terminal windows should open aisha
+(GNOME Terminal, which Ubuntu and Linux Mint use too, Konsole and Xfce
+Terminal). Logins, ssh and scripts keep bash either way. Change it later with
+`packaging/terminal-default.sh set`, `unset` or `status`; `./install.sh
+--no-ask` skips the question. To use aisha everywhere, including ssh, make
+it your login shell: `chsh -s /usr/bin/aisha` (back: `chsh -s /bin/bash`).
 
 To update, run `./update.sh` in this folder: it pulls the latest version and
 reinstalls aisha the way you installed it (package or `/usr/local`).

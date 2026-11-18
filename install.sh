@@ -2,6 +2,8 @@
 # install.sh — install (or update) aisha. Asks nothing but your sudo password.
 #   On Debian/Ubuntu: builds the Debian package and installs it with apt.
 #   Elsewhere, or with --local: puts aisha in /usr/local without a package.
+#   The first time, it asks whether new terminal windows should open aisha (--no-ask skips it;
+#   packaging/terminal-default.sh set|unset changes it later).
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,13 +17,17 @@ yellow() { printf '\033[1;33m%s\033[0m\n' "$*"; }
 die()    { red "error: $*"; exit 1; }
 
 MODE=auto
-case "${1:-}" in
-    -h|--help) sed -n '2,4p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    ""|aisha|--aisha) ;;
-    --local|--force) MODE=local ;;
-    --deb) MODE=deb ;;
-    *) die "unknown option: $1 (try --help)" ;;
-esac
+ASK_TERMINAL=1
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help) sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        aisha|--aisha) ;;
+        --local|--force) MODE=local ;;
+        --deb) MODE=deb ;;
+        --no-ask) ASK_TERMINAL=0 ;;
+        *) die "unknown option: $arg (try --help)" ;;
+    esac
+done
 if [ "$MODE" = auto ]; then
     if command -v apt >/dev/null 2>&1 && command -v dpkg-deb >/dev/null 2>&1; then MODE=deb; else MODE=local; fi
 fi
@@ -62,3 +68,8 @@ else
 fi
 
 green "aisha $VERSION is installed. Start it with: aisha"
+
+# Offer once to open aisha in new terminal windows (never asked again; never as root).
+if [ "$ASK_TERMINAL" -eq 1 ] && [ "$(id -u)" -ne 0 ] && [ -t 0 ]; then
+    "$SRC_DIR/packaging/terminal-default.sh" ask || true
+fi

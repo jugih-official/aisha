@@ -38,6 +38,10 @@ ask() {  # ask "question" -> 0 on yes
 }
 
 echo "Uninstalling aisha."
+# terminal windows that open aisha go back to your login shell
+if [ "$(id -u)" -ne 0 ] && [ -x "$(dirname "$0")/packaging/terminal-default.sh" ]; then
+    "$(dirname "$0")/packaging/terminal-default.sh" unset || true
+fi
 remove_path "$AISHA_BIN_TARGET" sudo
 remove_path "$AISHA_LIB_DIR" sudo
 if dpkg -S /usr/bin/aisha >/dev/null 2>&1; then
