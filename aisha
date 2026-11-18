@@ -49,7 +49,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.7.2"
+VERSION = "0.7.3"
 
 # ---- configuration ----------------------------------------------------------
 
@@ -5086,6 +5086,7 @@ def fill_template(template: str, vals: list[tuple[str, str]]) -> tuple[str, int]
 
 
 SUGGEST_MIN = 0.3
+STRONG_SUGGESTION = 0.6   # below this, a set-up language model is asked before the list is shown
 
 
 POWER_RE = re.compile(r"\b(?:reboot|poweroff|shutdown|halt|suspend|hibernate)\b")
@@ -5205,6 +5206,12 @@ newest oldest recent empty hidden old big
 # Replies to nobody: "yes" is also a program that prints y forever.
 CHATTER = re.compile(r"(?:yes|yeah|yep|yup|no|nope|nah|ok|okay|k|sure|fine|cool|great|nice|thanks|thank\s+you|thx|ty)"
                      r"(?:[\s,]+(?:please|thanks|thank\s+you|sir|mate|man|then))*")
+# "hello", "hi aisha, how are you?": a shell has nothing to run for these.
+GREETING = re.compile(
+    r"(?:(?:hi|hello|hey|hiya|howdy|yo|greetings|good\s+(?:morning|afternoon|evening|day))(?:\s+(?:there|aisha|you))?"
+    r"(?:[\s,!.]+(?:how\s+are\s+you(?:\s+doing)?(?:\s+today)?|how\s+is\s+it\s+going|what\s+is\s+up|what's\s+up|sup))?"
+    r"|how\s+are\s+you(?:\s+doing)?(?:\s+today)?|how\s+is\s+it\s+going|what\s+is\s+up|what's\s+up"
+    r"|who\s+are\s+you|what\s+are\s+you)[\s?!.]*")
 
 # Power commands with words after them never go to bash: systemd's reboot takes
 # "reboot nginx" as a reboot argument and restarts the computer at once.
@@ -5970,6 +5977,13 @@ class Shell:
             say(dim("you're welcome" if low.startswith("thank") else
                     "nothing is waiting for an answer: say what to do, or 'help'"))
             return 0
+        if GREETING.fullmatch(low):
+            if re.match(r"(?:who|what)\s+are\s+you", low):
+                say("I'm aisha, a shell you can talk to: type bash as usual, or say what you want done.")
+            else:
+                say(("Hi! " if not low.startswith("how") else "") + "All good here, ready when you are.")
+            say(dim("  try: show the biggest files here · what's using my memory · find pdfs older than a month · help"))
+            return 0
         if low in ("again", "repeat", "repeat that", "do it again", "do that again", "run it again",
                    "run that again", "same again", "once more") or line == "!!":
             if not self.last_line:
@@ -6093,8 +6107,12 @@ class Shell:
         if partial and partial.command not in [p.command for _, p in choices] and partial.confidence >= 0.4:
             partial.source = "guess"
             choices.append(("(best guess) " + partial.rationale(), partial))
-        if not choices and self.llm.enabled and not self.dry_run:
-            return self.via_llm(line, partial)
+        best = max((s for _, _, s in options), default=0.0)
+        if self.llm.enabled and not self.dry_run and (not choices or best < STRONG_SUGGESTION):
+            # nothing close: the language model goes first; the list only if it can't help
+            rc = self.via_llm(line, partial, fall_back=not choices)
+            if rc is not None:
+                return rc
         if choices:
             say(yellow("Not sure — closest things I know:"))
             for i, (phrase, plan) in enumerate(choices, 1):
@@ -6131,7 +6149,8 @@ class Shell:
         pattern, template = self.memory.learn(phrase, command)
         say(dim(f"learned: “{pattern}” → {template}"))
 
-    def via_llm(self, line: str, partial: Plan | None) -> int:
+    def via_llm(self, line: str, partial: Plan | None, fall_back: bool = True) -> int | None:
+        """Ask the language model. With fall_back=False, None if it could not help."""
         if not self.llm.enabled:
             say(red("the LLM is turned off (AISHA_LLM=off)"))
             return 1
@@ -6146,6 +6165,8 @@ class Shell:
             cmd = self.llm.command_for(line, self.cwd, hints)
         except LLMError as e:
             say(red(f"LLM: {e}"))
+            if not fall_back:
+                return None
             if partial:
                 say(yellow("falling back to the rules' best guess:"))
                 partial.source = "guess"
@@ -6154,6 +6175,8 @@ class Shell:
                 dim(" Rephrase it, type the bash command, or paste it to the aisha project so it can be added."))
             return 1
         if not cmd:
+            if not fall_back:
+                return None
             say(yellow("that does not look like something a shell command can do."))
             return 1
         plan = Plan(cmd, "llm", [f"{self.cfg['llm_model']}, {time.time() - t0:.1f}s"], source="llm",

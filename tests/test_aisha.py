@@ -425,6 +425,33 @@ class TestShellSession(LabTest):
         self.assertTrue(os.path.exists(os.path.join(self.lab, "from-llm.txt")))
         self.assertEqual(len(_MockLLM.seen), 2)
 
+    def test_greetings_get_a_reply_not_a_command(self):
+        _MockLLM.seen.clear()
+        for line in ["hello, how are you", "hi", "hey aisha", "how are you?", "good morning", "who are you"]:
+            self.assertEqual(self.sh.handle(line), 0, line)
+        self.assertEqual(_MockLLM.seen, [])        # no model, no menu, nothing run
+
+    def test_model_goes_first_when_suggestions_are_weak(self):
+        _MockLLM.seen.clear()
+        _MockLLM.replies = ["touch from-model.txt"]
+        self.answers = [""]                        # accept the model's command
+        self.sh.handle("conjure up a file named from-model in this folder")
+        self.assertEqual(len(_MockLLM.seen), 1)
+        self.assertTrue(os.path.exists(os.path.join(self.lab, "from-model.txt")))
+
+    def test_list_still_shown_when_the_model_cannot_help(self):
+        _MockLLM.seen.clear()
+        _MockLLM.replies = ["NONE", "NONE"]
+        shown = []
+        orig = aisha.say
+        aisha.say = lambda *a, **k: shown.append(" ".join(map(str, a)))
+        try:
+            self.sh.handle("how big is this folder thing really")
+        finally:
+            aisha.say = orig
+        if any("closest things" in s for s in shown):      # weak suggestions came after the model
+            self.assertGreaterEqual(len(_MockLLM.seen), 1)
+
     def test_llm_declined_is_not_remembered(self):
         _MockLLM.replies = ["touch nope.txt"]
         self.answers = ["n"]
