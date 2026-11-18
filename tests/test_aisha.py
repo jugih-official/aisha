@@ -1241,6 +1241,26 @@ class TestNetwork(LabTest):
             self.assertFalse(p and p.intent in ("network", "radio"), line)
 
 
+class TestTypos(LabTest):
+    def test_glued_and_swapped_command_words(self):
+        if not shutil.which("git"):
+            self.skipTest("git not installed")
+        for typed, meant in [("gitpull", "git pull"), ("gitstatus", "git status"), ("gti pull", "git pull"),
+                             ("gitpush origin main", "git push origin main")]:
+            p = self.plan(typed)
+            self.assertEqual(p.command, meant, typed)
+            self.assertEqual(p.source, "guess")             # asks [Y/n] before running
+        for word in ["gitfoo", "github", "gitk"]:
+            p = self.plan(word)
+            self.assertFalse(p and p.intent == "did you mean", word)
+
+    def test_lone_y_and_n_run_nothing(self):
+        sh = aisha.Shell(dict(aisha.DEFAULTS, llm="off"))
+        sh.cwd = self.lab
+        for line in ["y", "n", "Y"]:
+            self.assertEqual(sh.handle(line), 0, line)
+
+
 class zipfile_lab:
     def __init__(self, lab):
         self.lab = lab

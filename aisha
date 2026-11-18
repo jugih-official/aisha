@@ -49,7 +49,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.9.1"
+VERSION = "0.9.2"
 NAME = "ai$ha"             # the shell's name as shown: ai shell hybrid alpha. The command stays `aisha`
 TAGLINE = "ai shell hybrid alpha"   # ($ in a command name would be read as a variable by every shell)
 
@@ -165,18 +165,28 @@ def say(s: str = "") -> None:
     print(s, file=sys.stderr, flush=True)
 
 
+def _drop_typeahead(fd: int) -> None:
+    try:
+        import termios
+        termios.tcflush(fd, termios.TCIFLUSH)
+    except (ImportError, OSError, ValueError):
+        pass
+
+
 def ask(prompt: str) -> str | None:
     """Read one answer, from the terminal even when stdin is a pipe.
 
     None means nobody can answer (no terminal at all): callers treat it as no.
     """
     if sys.stdin.isatty():
+        _drop_typeahead(sys.stdin.fileno())   # what was typed while aisha worked is not the answer
         try:
             return input(prompt)
         except EOFError:
             return None
     try:
         with open("/dev/tty") as tty:
+            _drop_typeahead(tty.fileno())
             sys.stderr.write(prompt)
             sys.stderr.flush()
             return tty.readline().strip()
@@ -4872,7 +4882,45 @@ def h_usb(u: Utterance) -> Plan | None:
     return require(plan, [(mkfs.split()[0], pkg)])
 
 
-HANDLERS = [h_usb, h_power_later, h_net, h_service, h_recipe, h_system, h_power, h_version, h_installed, h_port, h_pkg_search, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
+
+GLUE_SUBS = {
+    "git": "pull push status log diff add commit checkout switch branch merge rebase fetch clone stash init show reset "
+           "restore tag remote blame cherry-pick revert grep mv rm bisect describe",
+    "apt": "update upgrade install remove purge search show list autoremove full-upgrade",
+    "systemctl": "status start stop restart reload enable disable list-units daemon-reload is-active is-enabled",
+    "docker": "ps images run exec logs pull push build stop start rm rmi compose",
+    "npm": "install run test start ci update", "pip": "install uninstall list show freeze", "pip3": "install uninstall list show freeze",
+}
+
+
+def unglue(line: str) -> str | None:
+    """'gitpull' -> 'git pull', 'gti status' -> 'git status', 'sudoapt update' -> 'sudo apt update'."""
+    toks = line.split()
+    if not toks or shutil.which(toks[0]) or toks[0] in SHELL_BUILTINS or not re.fullmatch(r"[a-z][a-z0-9-]*", toks[0]):
+        return None
+    w, rest = toks[0], toks[1:]
+    for cmd, subs in GLUE_SUBS.items():
+        if not shutil.which(cmd):
+            continue
+        subs = subs.split()
+        if w.startswith(cmd) and w[len(cmd):] in subs:                       # gitpull
+            return " ".join([cmd, w[len(cmd):]] + rest)
+        if rest and one_edit_apart(w, cmd) and rest[0] in subs:              # gti pull
+            return " ".join([cmd] + rest)
+    if w.startswith("sudo") and len(w) > 5 and shutil.which("sudo") and shutil.which(w[4:]):   # sudoapt update
+        return " ".join(["sudo", w[4:]] + rest)
+    return None
+
+
+def h_unglue(u: Utterance) -> Plan | None:
+    fixed = unglue(u.raw.strip())
+    if not fixed:
+        return None
+    u.text = " " * len(u.text)
+    return Plan(fixed, "did you mean", [f"read '{u.raw.strip()}' as '{fixed}'"], confidence=0.95, source="guess")
+
+
+HANDLERS = [h_unglue, h_usb, h_power_later, h_net, h_service, h_recipe, h_system, h_power, h_version, h_installed, h_port, h_pkg_search, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
             h_find_then, h_reext, h_download, h_compare, h_replace, h_calc, h_copy_move, h_delete, h_read, h_grep, h_count, h_size, h_find, h_list]
 
 
@@ -5688,7 +5736,7 @@ newest oldest recent empty hidden old big
 
 
 # Replies to nobody: "yes" is also a program that prints y forever.
-CHATTER = re.compile(r"(?:yes|yeah|yep|yup|no|nope|nah|ok|okay|k|sure|fine|cool|great|nice|thanks|thank\s+you|thx|ty)"
+CHATTER = re.compile(r"(?:y|n|yes|yeah|yep|yup|no|nope|nah|ok|okay|k|sure|fine|cool|great|nice|thanks|thank\s+you|thx|ty)"
                      r"(?:[\s,]+(?:please|thanks|thank\s+you|sir|mate|man|then))*")
 # "hello", "hi aisha, how are you?": a shell has nothing to run for these.
 GREETING = re.compile(
@@ -6768,7 +6816,8 @@ class Shell:
                 ans = ask("run? [Y/n] ")
                 ok = ans is not None and ans.strip().lower() in ("", "y", "yes")
             if not ok:
-                say(dim("skipped"))
+                other = ans and ans.strip().lower() not in ("n", "no", "")
+                say(dim("skipped" + (f" ('{ans.strip()}' is not y or n)" if other else "")))
                 return 1
         rc = self.run(plan.command)
         if plan.source == "llm" and phrase and rc == 0:
