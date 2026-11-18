@@ -266,7 +266,7 @@ installs it with apt: `/usr/bin/aisha`, `man aisha`, registered as a login
 shell. Elsewhere, or with `./install.sh --local`, it puts aisha in
 `/usr/local` without a package. Needs Python 3.9+ (Debian 11 or newer).
 
-It asks two things:
+It asks two things, each only while it is not done yet (otherwise it says how it stands):
 
 - **Install the language model?** Asked whenever no model is set up: a
   small local model (Qwen2.5-Coder 0.5B run by llamafile, about 550 MB) for
@@ -274,7 +274,7 @@ It asks two things:
   one is set up, the installer just says so. `./install.sh --with-llm`
   installs it without asking (`--with-llm 1.5b` or `3b` for a bigger model),
   `--no-llm` skips the question, and `aisha --setup` adds it any time later.
-  `./update.sh` only reports it, it doesn't ask.
+  `./update.sh` only reports both, it doesn't ask.
 - **Open aisha in new terminal windows?** GNOME Terminal (Ubuntu, Linux
   Mint Cinnamon) and Konsole get it in their profile. Xfce Terminal (Linux
   Mint Xfce, Xubuntu) and any other terminal app get four lines in

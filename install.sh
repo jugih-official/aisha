@@ -3,8 +3,8 @@
 #   On Debian/Ubuntu: builds the Debian package and installs it with apt.
 #   Elsewhere, or with --local: puts aisha in /usr/local without a package.
 #   It asks whether to install the optional local language model while none is set up
-#   (--with-llm [0.5b|1.5b|3b] installs it without asking, --no-llm skips the question), and once
-#   whether new terminal windows should open aisha. --no-ask skips both questions.
+#   (--with-llm [0.5b|1.5b|3b] installs it without asking, --no-llm skips the question), and whether
+#   new terminal windows should open aisha while they don't. --no-ask skips both questions.
 #   Later: aisha --setup, packaging/terminal-default.sh set|unset.
 set -euo pipefail
 
@@ -113,7 +113,12 @@ else
     echo "Language model: not installed (optional). Add it with: aisha --setup   (or ./install.sh --with-llm)"
 fi
 
-# Offer once to open aisha in new terminal windows (never asked again; never as root).
-if [ "$ASK_TERMINAL" -eq 1 ] && [ "$(id -u)" -ne 0 ] && [ -t 0 ]; then
+# New terminal windows: asked while they don't open aisha yet (not on ./update.sh, not as root).
+echo
+if [ "$(id -u)" -eq 0 ]; then
+    echo "Terminal: run ./install.sh as yourself (not with sudo) to open aisha in new terminal windows"
+elif [ "$ASK_TERMINAL" -eq 1 ] && [ -t 0 ] && [ -z "${AISHA_UPDATING:-}" ]; then
     "$SRC_DIR/packaging/terminal-default.sh" ask || true
+else
+    "$SRC_DIR/packaging/terminal-default.sh" report || true
 fi

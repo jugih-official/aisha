@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # terminal-default.sh — make aisha the shell new terminal windows open (or undo that).
-#   packaging/terminal-default.sh ask     ask once (install.sh runs this; silent if already set or declined)
+#   packaging/terminal-default.sh ask     ask, if new windows don't open aisha yet (install.sh runs this)
+#   packaging/terminal-default.sh report  one line: do new windows open aisha (./update.sh shows this)
 #   packaging/terminal-default.sh set     set it now, no question
 #   packaging/terminal-default.sh unset   back to your normal shell
 #   packaging/terminal-default.sh status  what each terminal app opens
@@ -10,7 +11,7 @@ set -uo pipefail
 
 ACTION="${1:-status}"
 CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
-ASKED="$CFG_DIR/aisha/.terminal-default-asked"
+ASKED="$CFG_DIR/aisha/.terminal-default-asked"   # left by older versions, which asked only once
 AISHA="$(command -v aisha || true)"
 KONSOLE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/konsole"
 
@@ -132,22 +133,30 @@ case "$ACTION" in
         for a in "${APPS[@]}"; do
             if "${a}_is_set"; then echo "$(label "$a"): opens aisha"; else echo "$(label "$a"): opens your login shell"; fi
         done ;;
-    set|ask)
+    set|ask|report)
         [ -n "$AISHA" ] || { yellow "aisha is not installed yet"; exit 1; }
         if [ ${#APPS[@]} -eq 0 ]; then
-            [ "$ACTION" = set ] && manual
+            if [ "$ACTION" = report ]; then echo "Terminal: no graphical session here; to open aisha in your terminal app, see: packaging/terminal-default.sh set"
+            else manual; fi
             exit 0
         fi
         todo=()
         for a in "${APPS[@]}"; do "${a}_is_set" || todo+=("$a"); done
-        [ ${#todo[@]} -eq 0 ] && { [ "$ACTION" = set ] && green "new terminal windows already open aisha"; exit 0; }
+        if [ ${#todo[@]} -eq 0 ]; then
+            green "Terminal: new windows open aisha. (Back to bash: packaging/terminal-default.sh unset)"
+            exit 0
+        fi
+        names="$(for a in "${todo[@]}"; do label "$a"; done | paste -sd, - | sed 's/,/, /g')"
+        if [ "$ACTION" = report ] || { [ "$ACTION" = ask ] && [ ! -t 0 ]; }; then
+            echo "Terminal: new windows ($names) open bash. To open aisha there: packaging/terminal-default.sh set"
+            exit 0
+        fi
         if [ "$ACTION" = ask ]; then
-            [ -t 0 ] && [ ! -e "$ASKED" ] || exit 0            # only once, and only when someone is there to answer
-            names="$(for a in "${todo[@]}"; do label "$a"; done | paste -sd, - | sed 's/,/, /g')"
-            echo
-            read -r -p "Open aisha in new terminal windows ($names)? Logins and scripts keep bash. [y/N] " yn
-            mkdir -p "$(dirname "$ASKED")" && : > "$ASKED"
-            case "${yn,,}" in y|yes) ;; *) dim "  kept your terminal as it is (later: packaging/terminal-default.sh set)"; exit 0 ;; esac
+            read -r -p "Open aisha in new terminal windows ($names)? Logins, ssh and scripts keep bash. [y/N] " yn
+            case "${yn,,}" in
+                y|yes) ;;
+                *) dim "  kept your terminal as it is (later: packaging/terminal-default.sh set)"; exit 0 ;;
+            esac
         fi
         for a in "${todo[@]}"; do
             if "${a}_set"; then green "  $(label "$a"): new windows open aisha"; else yellow "  $(label "$a"): could not change it"; fi
@@ -160,6 +169,7 @@ case "$ACTION" in
         for a in "${APPS[@]}"; do
             if "${a}_is_set"; then "${a}_unset" && green "  $(label "$a"): back to your login shell"; fi
         done
-        rm -f "$ASKED" ;;
+        rm -f "$ASKED"
+        green "new terminal windows open your login shell again" ;;
     *) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
