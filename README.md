@@ -491,7 +491,7 @@ Settings live in `~/.config/ai-bash/aisha/config.json` or the environment:
 | `llm_server` / `llm_model_file` | `AISHA_LLM_SERVER` / `AISHA_LLM_MODEL_FILE` | set by `--setup` |
 | `threshold` | `AISHA_THRESHOLD` | `0.7` (rules below this are "unsure") |
 | `confirm` | `AISHA_CONFIRM` | `llm` (`always`, or `destructive` only) |
-| `prompt_git` | `AISHA_PROMPT_GIT` | `true` (`false` hides `git:branch` in the prompt) |
+| `prompt_git` | `AISHA_PROMPT_GIT` | `false` (`true` shows `git:branch` in the prompt) |
 | `banner` | `AISHA_BANNER` | `true` (`false` hides the greeting) |
 
 ### Install

@@ -1353,8 +1353,8 @@ class TestPrompt(LabTest):
             f.write("ref: refs/heads/aisha\n")
         sh = aisha.Shell(dict(aisha.DEFAULTS, llm="off"))
         sh.cwd = self.lab
+        self.assertNotIn("git:", sh.prompt())            # hidden by default
+        self.assertEqual(sh.prompt().count("aisha"), 1)
+        sh.cfg["prompt_git"] = True
         self.assertIn(" git:aisha ", sh.prompt())
         self.assertTrue(sh.prompt().startswith("aisha "))
-        sh.cfg["prompt_git"] = False
-        self.assertNotIn("git:", sh.prompt())
-        self.assertEqual(sh.prompt().count("aisha"), 1)
