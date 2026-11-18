@@ -2,9 +2,10 @@
 # install.sh — install (or update) ai$ha, the ai shell hybrid alpha (command: aisha).
 #   On Debian/Ubuntu: builds the Debian package and installs it with apt.
 #   Elsewhere, or with --local: puts aisha in /usr/local without a package.
-#   The first time, it asks two things: add the optional local language model (--with-llm [0.5b|1.5b|3b]
-#   installs it without asking, --no-llm skips it), and open aisha in new terminal windows.
-#   --no-ask skips both questions. Later: aisha --setup, packaging/terminal-default.sh set|unset.
+#   It asks whether to install the optional local language model while none is set up
+#   (--with-llm [0.5b|1.5b|3b] installs it without asking, --no-llm skips the question), and once
+#   whether new terminal windows should open aisha. --no-ask skips both questions.
+#   Later: aisha --setup, packaging/terminal-default.sh set|unset.
 set -euo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,7 +27,7 @@ for arg in "$@"; do
         --with-llm) LLM=yes ;;
         0.5b|1.5b|3b) LLM=yes; LLM_SIZE="$arg" ;;
         --no-llm) LLM=no ;;
-        -h|--help) sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         aisha|--aisha) ;;
         --local|--force) MODE=local ;;
         --deb) MODE=deb ;;
@@ -75,9 +76,9 @@ fi
 
 green 'ai$ha (ai shell hybrid alpha) '"$VERSION"' is installed. Start it with: aisha'
 
-# The optional local language model: asked once, never as root (it belongs to your user).
+# The optional local language model. It belongs to your user, so never as root.
 CFG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/aisha"
-llm_ready() {   # already set up: a model server and model file aisha can start, or another server
+llm_ready() {   # prints the model's name and succeeds when one is set up
     python3 - "$CFG_HOME/config.json" <<'PY' 2>/dev/null
 import json, os, sys
 try:
@@ -85,25 +86,31 @@ try:
 except (OSError, ValueError):
     sys.exit(1)
 files = c.get("llm_server") and c.get("llm_model_file")
-sys.exit(0 if (files and os.path.isfile(c["llm_server"]) and os.path.isfile(c["llm_model_file"]))
-         or (c.get("llm_url") and not files) else 1)
+ok = (files and os.path.isfile(c["llm_server"]) and os.path.isfile(c["llm_model_file"])) or \
+     (c.get("llm_url") and not files and c.get("llm") != "off")
+print(c.get("llm_model") or "a language model")
+sys.exit(0 if ok else 1)
 PY
 }
 AISHA_CMD="$(command -v aisha || echo "python3 $SRC_AISHA")"
-if [ "$(id -u)" -ne 0 ] && [ "$LLM" != no ] && ! llm_ready; then
-    if [ "$LLM" = ask ] && [ -t 0 ] && [ ! -e "$CFG_HOME/.llm-asked" ]; then
-        echo
-        echo 'ai$ha works without a language model: its rules and built-in model handle most requests.'
-        echo "A small local model (Qwen2.5-Coder 0.5B, run by llamafile; about 550 MB to download, no cloud, no API key)"
-        echo "answers the rest. It starts only when needed."
-        read -r -p "Add the local language model now? [y/N] " yn
-        mkdir -p "$CFG_HOME" && : > "$CFG_HOME/.llm-asked"
-        case "${yn,,}" in y|yes) LLM=yes ;; *) echo "  skipped (later: aisha --setup)" ;; esac
-    fi
-    if [ "$LLM" = yes ]; then
-        echo
-        $AISHA_CMD --setup "$LLM_SIZE" --yes || yellow "the language model was not set up; try again with: aisha --setup"
-    fi
+echo
+if [ "$(id -u)" -eq 0 ]; then
+    echo "Language model: run ./install.sh as yourself (not with sudo) to add it, or later: aisha --setup"
+elif [ "$LLM" = yes ]; then
+    $AISHA_CMD --setup "$LLM_SIZE" --yes || yellow "the language model was not set up; try again with: aisha --setup"
+elif model="$(llm_ready)"; then
+    green "Language model: $model is set up. (A bigger one: ./install.sh --with-llm 1.5b, or aisha --setup 1.5b)"
+elif [ "$LLM" = ask ] && [ -t 0 ] && [ -z "${AISHA_UPDATING:-}" ]; then
+    echo 'Language model (optional): ai$ha works without one; its rules and built-in model handle most requests.'
+    echo "A small local model answers the rest: Qwen2.5-Coder 0.5B run by llamafile, about 550 MB to download,"
+    echo "no cloud and no API key. It starts only when a request needs it."
+    read -r -p "Install the language model now? [y/N] " yn
+    case "${yn,,}" in
+        y|yes) echo; $AISHA_CMD --setup "$LLM_SIZE" --yes || yellow "the language model was not set up; try again with: aisha --setup" ;;
+        *) echo "  not installed. Add it any time with: aisha --setup   (or ./install.sh --with-llm)" ;;
+    esac
+else
+    echo "Language model: not installed (optional). Add it with: aisha --setup   (or ./install.sh --with-llm)"
 fi
 
 # Offer once to open aisha in new terminal windows (never asked again; never as root).

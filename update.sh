@@ -53,9 +53,9 @@ if [ -z "$mode" ]; then
     fi
 fi
 case "$mode" in
-    deb)        ./install.sh --deb ;;
-    local)      ./install.sh --local ;;
-    auto|aisha) ./install.sh ;;
+    deb)        AISHA_UPDATING=1 ./install.sh --deb ;;
+    local)      AISHA_UPDATING=1 ./install.sh --local ;;
+    auto|aisha) AISHA_UPDATING=1 ./install.sh ;;
     *) red "unknown mode: $mode (use deb or local)"; exit 2 ;;
 esac
 if [ -e /usr/local/bin/ai ] || [ -e /usr/local/bin/ai-code ]; then
