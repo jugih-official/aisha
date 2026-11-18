@@ -49,7 +49,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.5.3"
+VERSION = "0.6.0"
 
 # ---- configuration ----------------------------------------------------------
 
@@ -426,7 +426,7 @@ CONTRACTIONS = [
 # "changed": "not modified in 30 days" is an age filter.)
 NEGATION = re.compile(
     r"\b(?:do\s+not|dont|never|without|not|no\s+need\s+to)\s+(?:\w+\s+){0,2}?"
-    r"(delet\w*|remov\w*|eras\w*|mov(?:e|es|ing)\b|renam\w*|kill\w*|overwrit\w*|trash\w*|wip(?:e|ing))"
+    r"(delet\w*|remov\w*|eras\w*|mov(?:e|es|ing)\b|renam\w*|kill\w*|overwrit\w*|trash\w*|wip(?:e|ing)|get(?:ting)?\s+rid\s+of)"
     r"(?:\s+(?:them|it|anything|any\s+(?:of\s+)?(?:them|files?)|the\s+files|those|these))?\b")
 
 
@@ -617,9 +617,9 @@ def take_time(u: Utterance, spec: FindSpec) -> None:
         (rf"\b(?:no|not)\s+(?:more|older)\s+{THAN}\s+{NUM}\s*{TUNIT}(?:\s+(?:old|ago))?\b", "-"),
         (rf"\b(?:no|not)\s+(?:newer|less|younger)\s+{THAN}\s+{NUM}\s*{TUNIT}(?:\s+(?:old|ago))?\b", "+"),
         (rf"\b{MOD}(?:(?:in|within|during|over|from)\s+)?(?:the\s+)?(?:last|past|previous)\s+(?:{NUM}\s*)?{TUNIT}\b", "-"),
-        (rf"\b{MOD}(?:newer\s+{THAN}|less\s+{THAN}|under|within)\s+{NUM}\s*{TUNIT}(?:\s+(?:old|ago))?\b", "-"),
+        (rf"\b{MOD}(?:newer\s+{THAN}|less\s+{THAN}|under|within)\s+(?:{NUM}\s*)?{TUNIT}(?:\s+(?:old|ago))?\b", "-"),
         (rf"\b(?:not|never|have\s+not\s+been|has\s+not\s+been)\s+(?:been\s+)?(?:modified|changed|touched|used|accessed|opened|edited)\s+(?:in|for|during|since)\s+(?:the\s+)?(?:last|past)?\s*(?:{NUM}\s*)?{TUNIT}\b", "+"),
-        (rf"\b{MOD}(?:older\s+{THAN}|more\s+{THAN}|over|at\s+least)\s+{NUM}\s*{TUNIT}(?:\s+(?:old|ago))?\b", "+"),
+        (rf"\b{MOD}(?:older\s+{THAN}|more\s+{THAN}|over|at\s+least)\s+(?:{NUM}\s*)?{TUNIT}(?:\s+(?:old|ago))?\b", "+"),
         (rf"\b{NUM}\s*{TUNIT}\s+old\b", "+"),
     ]
     for pat, sign in rules:
@@ -645,7 +645,7 @@ def take_time(u: Utterance, spec: FindSpec) -> None:
 SORT_WORD = {
     "largest": ("size", True), "biggest": ("size", True), "heaviest": ("size", True),
     "huge": ("size", True), "big": ("size", True), "large": ("size", True),
-    "smallest": ("size", False), "tiniest": ("size", False), "tiny": ("size", False), "small": ("size", False),
+    "hugest": ("size", True), "smallest": ("size", False), "tiniest": ("size", False), "tiny": ("size", False), "small": ("size", False),
     "newest": ("time", True), "latest": ("time", True), "recent": ("time", True),
     "oldest": ("time", False),
 }
@@ -797,6 +797,8 @@ NOT_PLACES = {"them", "it", "its", "their", "there", "total", "order", "detail",
 
 
 def looks_like_place(tok: str, low: str) -> bool:
+    if os.path.isfile(tok):
+        return False
     if re.search(r"[/~$]", tok) or low.startswith("qlit"):
         return True
     return bool(re.fullmatch(r"[\w.-]+", low)) and not (
@@ -1299,54 +1301,190 @@ def h_find(u: Utterance) -> Plan | None:
     return finish(u, plan, guessed, spec)
 
 
-LIST_V = (r"\b(?:list|ls|show(?:\s+me)?|display|view|see|sort|what\s+do\s+(?:i|we)\s+have|"
-          r"what\s+(?:is|are)(?=\s+(?:in|inside|here|there)\b)|contents?\s+of)\b")
+LIST_V = (r"\b(?:list|ls|show(?:\s+me)?|display|view|see|sort|order|arrange|organi[sz]e|rank|enumerate|print|"
+          r"tell\s+me(?:\s+about)?|give\s+me|get\s+me\s+a\s+list\s+of|"
+          r"what\s+do\s+(?:i|we)\s+have|what\s+(?:is|are)(?=\s+(?:in|inside|here|there)\b)|contents?\s+of)\b")
+
+# ls sort keys: wording -> (key, short flags, extra long option)
+LS_KEYS = [
+    (r"creat(?:ion|ed)(?:\s+(?:time|date))?|birth(?:\s*(?:time|date))?|when\s+(?:they\s+were\s+)?created", "birth", "t", "--time=birth"),
+    (r"access(?:ed)?(?:\s+(?:time|date))?|last\s+(?:accessed|opened|used|read)|atime|when\s+(?:they\s+were\s+)?(?:last\s+)?(?:opened|used|accessed)", "atime", "tu", ""),
+    (r"ctime|status\s+change(?:\s+time)?|inode\s+change(?:\s+time)?", "ctime", "tc", ""),
+    (r"(?:last\s+)?modif(?:ied|ication)(?:\s+(?:time|date))?|mtime|(?:change|edit|update)[ds]?\s+(?:time|date)|time(?:stamps?)?|dates?|"
+     r"age|recency|when\s+(?:they\s+were\s+)?(?:last\s+)?(?:modified|changed|edited|updated|saved)", "time", "t", ""),
+    (r"sizes?|bytes|how\s+big(?:\s+they\s+are)?|weight", "size", "S", ""),
+    (r"(?:file\s*)?extensions?|ext|suffix(?:es)?|(?:file\s*)?types?|kind|format", "ext", "X", ""),
+    (r"versions?(?:\s+numbers?)?|natural(?:\s+order)?|numbers?\s+in\s+(?:the\s+)?names?", "version", "v", ""),
+    (r"(?:file\s*)?names?|filenames?|alphabet|letters?|titles?", "name", "", ""),
+    (r"directory\s+order|disk\s+order|no\s+(?:particular\s+)?order|unsorted|as\s+they\s+are", "none", "U", ""),
+]
+LS_DEFAULT_DESC = {"time": True, "size": True, "birth": True, "atime": True, "ctime": True}   # ls's own default
+
+
+def take_ls_options(u: Utterance) -> dict:
+    """Listing parameters in any wording: sort key and direction, format, what to include."""
+    o = {"key": None, "rev": None, "fmt": None, "all": False, "only": None, "dirs_first": False,
+         "classify": False, "full_time": False, "bytes": False, "block": None, "why": []}
+    if u.take(r"\b(?:folders|directories|dirs|subfolders)\s+(?:first|on\s+top|at\s+the\s+top|before\s+files)\b|"
+              r"\bgroup(?:ed)?\s+(?:the\s+)?(?:folders|directories|dirs)(?:\s+(?:first|together))?\b"):
+        o["dirs_first"] = True
+        o["why"].append("folders first")
+    if u.take(r"\b(?:including|incl|with|plus|and|also|show(?:ing)?|even|together\s+with)\s+(?:the\s+)?(?:hidden|dot)(?:\s*(?:ones|files|items|folders|stuff))?\b|"
+              r"\b(?:hidden|dot\s*files)\s+(?:ones\s+)?(?:too|as\s+well|included)\b"):
+        o["all"] = True
+    if u.take(r"\b(?:only|just)\s+(?:the\s+)?files\b|\bfiles\s+only\b|\b(?:no|without(?:\s+the)?|exclud(?:e|ing))\s+(?:folders|directories|dirs)\b"):
+        o["only"] = "files"
+        o["why"].append("files only")
+    elif u.take(r"\b(?:only|just)\s+(?:the\s+)?(?:folders|directories|dirs|subfolders|subdirectories)\b|"
+                r"\b(?:folders|directories|dirs)\s+only\b|\bno\s+files\b"):
+        o["only"] = "dirs"
+        o["why"].append("folders only")
+    # format
+    if u.take(r"\bone\s+(?:file\s+|item\s+|entry\s+|name\s+)?(?:per|a|each)\s+line\b|\beach\s+on\s+(?:its\s+own|a\s+separate|a\s+new)\s+line\b|"
+              r"\bin\s+a\s+(?:single\s+)?column\b|\bvertically\b|\bline\s+by\s+line\b"):
+        o["fmt"] = "one"
+    elif u.take(r"\b(?:just|only)\s+(?:the\s+)?(?:file\s*)?names\b|\b(?:file\s*)?names\s+only\b|\bnothing\s+but\s+(?:the\s+)?names\b"):
+        o["fmt"] = "one"
+        o["why"].append("names only")
+    elif u.take(r"\bwithout\s+(?:any\s+)?(?:the\s+)?details\b|\bno\s+details\b|\bshort\s+(?:format|list(?:ing)?|form|view)\b|\bbrief(?:ly)?\b|"
+                r"\bsimple\s+(?:list|view)\b|\bplain(?:ly)?\b|\bcompact(?:ly)?\b"):
+        o["fmt"] = "short"
+    elif u.take(r"\bin\s+columns\b|\bas\s+(?:a\s+)?grid\b|\bacross\b"):
+        o["fmt"] = "columns"
+    elif u.take(r"\bcomma[- ]separated\b|\bseparated\s+by\s+commas\b|\bwith\s+commas\b"):
+        o["fmt"] = "commas"
+    u.take(r"\bwith\s+(?:all\s+)?(?:the\s+|their\s+)?(?:details|sizes?|dates?|times?|permissions|owners?|info|information)\b|"
+           r"\bin\s+(?:long|detailed|full)\s+(?:format|form|view|listing)\b|\blong\s+(?:format|listing|form|view)\b|\bdetailed(?:ly)?\b|\bin\s+detail\b|"
+           r"\bhuman[- ]readable(?:\s+sizes?)?\b|\breadable\s+sizes?\b")
+    if u.take(r"\b(?:full|exact|precise|complete|iso)\s+(?:time(?:stamps?)?|dates?)\b|\bwith\s+seconds\b"):
+        o["full_time"] = True
+        o["why"].append("full timestamps")
+    m = u.take(r"\b(?:sizes?\s+)?in\s+(kb|kilobytes?|mb|megabytes?|gb|gigabytes?)\b")
+    if m:
+        o["block"] = m.group(1)[0].upper()
+        o["why"].append(f"sizes in {o['block']}")
+    elif u.take(r"\b(?:sizes?\s+)?(?:in|as)\s+bytes\b|\bexact\s+sizes?\b|\braw\s+sizes?\b|\bnot\s+human[- ]readable\b"):
+        o["bytes"] = True
+        o["why"].append("sizes in bytes")
+    if u.take(r"\b(?:with\s+)?(?:file\s*)?type\s+(?:indicators|markers|symbols)\b|\bclassif(?:y|ied)\b|\bmark\s+(?:the\s+)?(?:folders|directories|types)\b"):
+        o["classify"] = True
+        o["why"].append("type markers")
+    # direction words that also name a key
+    m = u.take(r"\b(newest|latest|most\s+recent|recent|biggest|largest|oldest|smallest|least\s+recent|tiniest)\s+"
+               r"(first|last|on\s+top|at\s+the\s+(?:top|bottom)|at\s+the\s+end)\b")
+    if m:
+        word, where = m.group(1), m.group(2)
+        o["key"] = o["key"] or ("size" if word in ("biggest", "largest", "smallest", "tiniest") else "time")
+        big_first = word in ("newest", "latest", "most recent", "recent", "biggest", "largest")
+        first = where in ("first", "on top", "at the top")
+        o["rev"] = not (big_first == first)
+    if u.take(r"\bz\s*(?:to|-|→)\s*a\b|\breverse\s+alphabetical(?:ly)?\b|\balphabetical(?:ly)?\s+(?:in\s+)?reverse\b"):
+        o["key"], o["rev"] = "name", True
+    elif u.take(r"\ba\s*(?:to|-|→)\s*z\b|\balphabetical(?:ly)?\b|\bby\s+abc\b"):
+        o["key"] = o["key"] or "name"
+    if u.take(r"\bchronological(?:ly)?(?:\s+order)?\b|\bin\s+(?:the\s+)?order\s+(?:they\s+were\s+)?(?:made|created|modified)\b"):
+        o["key"], o["rev"] = o["key"] or "time", True
+    # "sorted by X", "by X", "ordered by X"
+    keys = "|".join(f"(?P<k{i}>{pat})" for i, (pat, *_r) in enumerate(LS_KEYS))
+    m = u.take(r"\b(?:sort(?:ed)?|order(?:ed)?|arrang(?:e|ed)|organi[sz]ed?|rank(?:ed)?|group(?:ed)?)?\s*(?:them\s+|it\s+)?"
+               rf"(?:by|on|according\s+to)\s+(?:their\s+|the\s+|its\s+)?(?:{keys})\b")
+    if m:
+        i = next(int(k[1:]) for k, v in m.groupdict().items() if v)
+        o["key"] = LS_KEYS[i][1]
+    elif u.take(r"\b(?:sort(?:ed)?|order(?:ed)?)\s+(?:them\s+)?(?:alphabetically|by\s+name)?\b"):
+        o["key"] = o["key"] or "name"
+    m = u.take(r"\b(?:in\s+)?(?:revers(?:e|ed)|backwards?|inverted?|upside\s+down)(?:\s+order)?\b|\b(ascending|descending)(?:\s+order)?\b|"
+               r"\b(asc|desc)\b")
+    if m:
+        word = (m.group(1) or m.group(2) or "").lower()
+        if word:
+            desc = word.startswith("desc")
+            o["rev"] = desc != LS_DEFAULT_DESC.get(o["key"] or "name", False)
+        else:
+            o["rev"] = not o["rev"] if o["rev"] is not None else True
+    return o
 
 
 def h_list(u: Utterance) -> Plan | None:
     if not u.take(LIST_V):
         return None
-    u.take(r"\bwith\s+(?:their\s+|the\s+|all\s+)?(?:sizes?|details|dates?|permissions|owners?|info)\b")
-    with_hidden = bool(u.take(r"\b(?:including|incl|with|plus|and|also)\s+(?:the\s+)?hidden(?:\s+(?:ones|files|items|folders))?\b"))
+    opts = take_ls_options(u)
     spec = FindSpec()
     parse_filters(u, spec)
-    u.take(r"\b(?:contents?|everything|entries)\b")
+    u.take(r"\b(?:contents?|everything|entries|stuff|things|items)\b")
     path, _ = first_target(u)
     if path:
         if not os.path.isdir(os.path.join(u.cwd, os.path.expanduser(path))):
             return None  # an existing file: that's a read, not a list
         spec.root = path
     guessed = absorb_keywords(u, spec, "name")
-    show_all = with_hidden or bool(re.search(r"\ball\b", u.low))
+    show_all = opts["all"] or bool(re.search(r"\ball\b", u.low))
+    if spec.ftype == "d" and not opts["only"]:
+        opts["only"] = "dirs"
+    key, rev = opts["key"], opts["rev"]
+    if key is None and spec.sort:                      # "5 biggest", "newest", "sorted by size"
+        key, desc = spec.sort
+        if rev is None:
+            rev = desc != LS_DEFAULT_DESC.get(key, False)
+    if key in ("size", "time", "name") and opts["rev"] is not None:
+        spec.sort = (key, not opts["rev"]) if key in ("size", "time") else (key, opts["rev"])
+    elif key in ("size", "time", "name"):
+        spec.sort = spec.sort or (key, LS_DEFAULT_DESC.get(key, False))
     rich = (spec.size or spec.time or spec.content or spec.names or spec.hidden
             or spec.empty or spec.executable or spec.rec or len(spec.exts) > 1
             or spec.not_exts or spec.not_names or spec.not_empty or spec.owner or spec.broken
-            or (spec.ftype == "f" and spec.limit))
+            or (opts["only"] == "files" and spec.limit) or (spec.ftype == "f" and spec.limit))
+    why = [where_label(spec, False)] + spec.why + opts["why"] + (["including hidden"] if show_all else [])
     if rich:
+        if opts["only"] == "files":
+            spec.ftype = "f"
         cmd = render_find(spec, default_rec=False)
-        plan = Plan(cmd, "list", [where_label(spec, False)] + spec.why)
-        return finish(u, plan, guessed, spec)
-    flags = "-lh" + ("A" if show_all else "")
-    if spec.sort:
-        key, desc = spec.sort
-        flags += {"size": "S", "time": "t", "name": ""}[key]
-        if (key != "name" and not desc) or (key == "name" and desc):
-            flags += "r"
+        return finish(u, Plan(cmd, "list", why), guessed, spec)
+    # build the ls flags
+    long_fmt = opts["fmt"] is None or opts["full_time"]
+    short = ("l" if long_fmt else "") + ("h" if long_fmt and not opts["bytes"] and not opts["block"] else "")
+    short += "A" if show_all else ""
+    extra = []
+    if key:
+        k = next(x for x in LS_KEYS if x[1] == key)
+        short += k[2]
+        if k[3]:
+            extra.append(k[3])
+        if key != "name" or rev:
+            why.append(f"sorted by {key}" + (", reversed" if rev else ""))
+    elif rev:
+        why.append("reversed")
+    short += "r" if rev else ""
+    short += {"one": "1", "columns": "C", "commas": "m"}.get(opts["fmt"], "")
+    short += "F" if opts["classify"] else ""
+    if opts["dirs_first"]:
+        extra.append("--group-directories-first")
+    if opts["full_time"]:
+        extra.append("--full-time")
+    if opts["block"]:
+        extra.append(f"--block-size={opts['block']}")
     root = "" if spec.root == "." else spec.root.rstrip("/") + "/"
-    if spec.ftype == "d":
-        target, has_total = qpath(root) + "*/" if root else "*/", False
-        flags += "d"
-    elif spec.exts:
-        target, has_total = (qpath(root) if root else "") + f"*.{spec.exts[0]}", False
+    has_total = long_fmt
+    if opts["only"] == "files":
+        hide = [] if show_all else ["-not", "-name", "'.*'"]
+        flags = " ".join(x for x in ["-" + short if short else "", *extra] if x)
+        cmd = " ".join(["find", qpath(spec.root), "-maxdepth", "1", "-mindepth", "1", "-type", "f", *hide,
+                        "-exec", "ls", flags + (" " if flags else "") + "--", "{}", "+"])
+        cmd = re.sub(r"\s+", " ", cmd)
+        has_total = False
     else:
-        target, has_total = (qpath(spec.root) if root else ""), True
-    cmd = " ".join(p for p in ("ls", flags, "--" if target else "", target) if p)
+        if opts["only"] == "dirs":
+            target, has_total = (qpath(root) if root else "") + "*/", False
+            short += "d"
+        elif spec.exts:
+            target, has_total = (qpath(root) if root else "") + f"*.{spec.exts[0]}", False
+        else:
+            target = qpath(spec.root) if root else ""
+        flags = " ".join(x for x in ["-" + short if short else "", *extra] if x)
+        cmd = " ".join(x for x in ("ls", flags, "--" if target else "", target) if x)
     if spec.limit:
-        n = spec.limit
-        cmd += f" | head -n {n + 1 if has_total else n}"
-    plan = Plan(cmd, "list", [where_label(spec, False)] + spec.why
-                + (["including hidden"] if show_all else []))
-    return finish(u, plan, guessed, spec)
+        cmd += f" | head -n {spec.limit + 1 if has_total else spec.limit}"
+    return finish(u, Plan(cmd, "list", why), guessed, spec)
 
 
 def h_grep(u: Utterance) -> Plan | None:
@@ -1356,7 +1494,7 @@ def h_grep(u: Utterance) -> Plan | None:
     if m and not re.match(r"(?:files?|folders?)\b", m.group(2)):
         target, term = u.o(m, 1), u.o(m, 2)
     if not term:
-        m = u.peek(r"\b(?:find|search(?:\s+for)?|look\s+for|grep(?:\s+for)?|show(?:\s+me)?|"
+        m = u.peek(r"\b(?:find|search(?:\s+for)?|look\s+for|locate|grep(?:\s+for)?|show(?:\s+me)?|"
                    r"where\s+(?:is|are|do\s+i\s+use|did\s+i\s+use))\s+(?:the\s+(?:word|text|string)\s+)?"
                    r"(\S+)\s+(?:in|inside|within|across|throughout)\s+(.+)$")
         if m:
@@ -1438,7 +1576,7 @@ def h_count(u: Utterance) -> Plan | None:
 
 def h_size(u: Utterance) -> Plan | None:
     # "what's eating my disk", "biggest folders"
-    hog = u.take(r"\b(?:taking|takes|take|using|uses|eating|eats|hogging|hogs|consuming|consumes|filling|occupies|occupying)\s+(?:up\s+)?(?:the\s+most\s+|all\s+(?:the\s+|my\s+)?|so\s+much\s+|my\s+|the\s+)?"
+    hog = u.take(r"\b(?:taking|takes|take|using|uses|eating|eats|hogging|hogs|consuming|consumes|filling|occupies|occupying)\s+(?:up\s+)?(?:(?:the\s+)?most\s+|all\s+(?:the\s+|my\s+)?|so\s+much\s+|my\s+|the\s+)?"
                  r"(?:disk\s+)?(?:space|room|storage|disk)\b")
     big_dirs = u.take(r"\b(?:largest|biggest|heaviest)\s+(?:sub-?)?(?:folders|directories|dirs)\b")
     if hog or big_dirs:
@@ -1563,7 +1701,7 @@ def default_editor() -> tuple[str, str]:
 
 
 def h_read(u: Utterance) -> Plan | None:
-    m = u.take(r"\b(?:show|print|display|cat|read|view|open|output|dump|see|look\s+at|check|edit|modify|"
+    m = u.take(r"\b(?:show|print|display|cat|read|view|open|launch|output|dump|see|look\s+at|check|edit|modify|"
                r"head|tail|follow|watch|what\s+is\s+in|contents?\s+of)\b")
     verb = m.group(0) if m else ""
     if not m and not u.peek(r"\b(?:first|top|last|bottom)\s+(?:\S+\s+)?lines?\b|\b(?:beginning|start|end)\s+of\b"):
@@ -1872,9 +2010,9 @@ def h_delete(u: Utterance) -> Plan | None:
     if not u.take(r"\b(?:delete|remove|rm|erase|trash|get\s+rid\s+of|clean\s+(?:up|out)|wipe|destroy|throw\s+(?:away|out))\b"):
         return None
     # "find X and delete them" / "delete all X you can find"
-    u.take(r"\b(?:find|search\s+for|look\s+for|locate|list|show(?:\s+me)?|get)\b")
+    u.take(r"\b(?:find|search\s+for|look\s+for|locate|track\s+down|hunt\s+for|list|show(?:\s+me)?|get)\b")
     u.take(r"\b(?:and|then)\s+(?:also\s+)?(?=\s*$)|\b(?:them|those|these|all\s+of\s+them|the\s+results?)\b")
-    if u.peek(r"\b(?:package|program|software)\b"):
+    if u.peek(r"\b(?:packages?|programs?|software|kernels?|dependencies)\b"):
         return None
     singular = u.peek(r"\bthe\s+(?:\S+\s+){0,2}?(?:file|folder|directory|dir)\b(?!s)") and not u.peek(r"\b(?:all|every|each)\b")
     targets = explicit_targets(u)
@@ -2023,7 +2161,9 @@ def h_archive(u: Utterance) -> Plan | None:
         if not src:
             return None
         u.text = " " * len(u.text)
-        use_zip = m.group(1).startswith("zip") or (m.group(3) or "").endswith(".zip")
+        dest_given = (m.group(3) or "").lower()
+        use_zip = (m.group(1).startswith("zip") and not re.search(r"\.(?:tar|tgz|gz|xz|bz2)", dest_given)) \
+            or dest_given.endswith(".zip")
         zipper = "zip -r" if shutil.which("zip") else "python3 -m zipfile -c"
         if src in (".", "./"):
             base = os.path.basename(u.cwd.rstrip("/")) or "archive"
@@ -2184,11 +2324,11 @@ SYSTEM = [  # (pattern, command or alternatives, label)
     (r"\b(?:all\s+|the\s+|list\s+of\s+)?(?:user\s+accounts|users)\b(?!\s+(?:logged|online))", "cut -d: -f1 /etc/passwd",
      "user accounts"),
     (r"\b(?:my\s+)?(?:crontab|cron\s+jobs|scheduled\s+(?:jobs|tasks))\b", "crontab -l", "your cron jobs"),
-    (r"\bwhat\s+day\s+is\s+(?:it|today)\b|\bday\s+(?:is\s+it\s+)?today\b|\bwhich\s+day\b|\b(?:the\s+)?(?:date|time)(?:\s+is\s+it)?\b|\btoday's\s+date\b", "date", "date and time"),
+    (r"\bwhat\s+day\s+is\s+(?:it|today)\b|\bday\s+(?:is\s+it\s+)?today\b|\bwhich\s+day\b|(?<!by )(?<!by the )(?<!sorted )\b(?:the\s+)?(?:date|time)(?:\s+is\s+it)?\b(?!\s*(?:order|stamp))|\btoday's\s+date\b", "date", "date and time"),
     (r"\bcalendar\b", [("cal", "cal"), (None, "python3 -m calendar $(date '+%Y %-m')")], "calendar"),
     (r"\bhost\s*name\b|\b(?:computer|machine|pc)\s+name\b|\bwhat\s+is\s+(?:this|the|my)\s+(?:computer|machine|pc|system)\s+called\b",
      "hostname", "hostname"),
-    (r"\b(?:usb\s+)?(?:drives|disks|partitions|block\s+devices|usb\s+sticks?)\b|\bmounted\s+(?:drives|disks|file\s*systems)\b|\bwhat\s+is\s+mounted\b",
+    (r"\b(?:drives|disks|partitions|block\s+devices)\b|\bmounted\s+(?:drives|disks|file\s*systems)\b|\bwhat\s+is\s+mounted\b",
      "lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT", "drives and partitions"),
     (r"\$?path\s+(?:variable|entries|dirs|directories)\b|\bwhat\s+is\s+in\s+(?:my\s+)?\$?path\b|\bmy\s+\$?path\b",
      "echo \"$PATH\" | tr ':' '\\n'", "PATH entries"),
@@ -2248,10 +2388,29 @@ def require(plan: Plan, reqs: list) -> Plan:
         plan.command = f"{inst} && {plan.command}"
         plan.why.append(f"{names} is not installed — installs {' '.join(pkgs)} first")
         plan.destructive = True
-        plan.warning = f"! installs {' '.join(pkgs)} (needs your password)"
+        note = f"! installs {' '.join(pkgs)} first (needs your password)"
+        plan.warning = f"{plan.warning}\n{note}" if plan.warning else note
     else:
         plan.why.append(f"{names} is not installed")
     return plan
+
+
+def process_running(name: str) -> bool:
+    """Is there a process with this command name (from /proc, no tools needed)?"""
+    name = name.lower()
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return False
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                comm = f.read().strip().lower()
+        except OSError:
+            continue
+        if comm == name or comm.startswith(name) and len(name) >= 4:
+            return True
+    return False
 
 
 def h_process(u: Utterance) -> Plan | None:
@@ -2268,6 +2427,10 @@ def h_process(u: Utterance) -> Plan | None:
         su = "" if act == "status" else sudo()
         return Plan(f"{su}systemctl {act} {shlex.quote(name)}", "service", [f"{act} {name}"],
                     destructive=act != "status")
+    m2 = u.peek(r"^\s*(?:stop|end|close|quit|exit|shut\s+down)\s+(?:the\s+)?([\w.-]+)\s*$")
+    if m2 and process_running(m2.group(1)):
+        u.text = " " * len(u.text)
+        return Plan(f"pkill -- {shlex.quote(m2.group(1))}", "stop process", [m2.group(1)], destructive=True)
     m = u.peek(r"\b(?:kill|stop|terminate|end|close|quit|force\s+quit)\s+(?:the\s+|all\s+(?:the\s+)?)?"
                r"(?:process(?:es)?\s+|programs?\s+)?(?:(?:named|called)\s+)?(\S+)(?:\s+(?:process(?:es)?|programs?))?$")
     if m and u.peek(r"\b(?:kill|process(?:es)?|terminate|force\s+quit)\b"):
@@ -2836,8 +2999,6 @@ RECIPES = [
     Recipe("gpu", [r"\b(?:gpu|graphics\s+card|video\s+card|graphics\s+chip)\b"],
            [("nvidia-smi", "nvidia-smi"), ("lspci", "lspci | grep -iE 'vga|3d|display'"),
             (None, "grep -h DRIVER /sys/class/drm/card*/device/uevent")]),
-    Recipe("usb devices", [r"\busb\s+devices\b|\bwhat\s+is\s+(?:plugged|connected)\s+(?:in|to\s+usb)\b|\bconnected\s+usb\b"],
-           [("lsusb", "lsusb"), (None, "cat /sys/bus/usb/devices/*/product 2>/dev/null")]),
     Recipe("pci devices", [r"\bpci\s+devices\b"], [("lspci", "lspci"), (None, "ls /sys/bus/pci/devices")]),
     Recipe("hardware", [r"\bhardware(?:\s+(?:info|information|details|summary|specs))?\b|\b(?:my\s+)?(?:computer|system|pc|machine)\s+specs\b"],
            [("inxi", "inxi -Fxz"),
@@ -2876,7 +3037,7 @@ RECIPES = [
     Recipe("check updates", [r"\b(?:check\s+for|any|available|pending|list)\s+(?:system\s+)?updates\b|\bwhat\s+(?:can|needs\s+to)\s+be\s+(?:updated|upgraded)\b|"
                              r"\bupgradable\b|\bis\s+(?:my\s+system|everything)\s+up\s+to\s+date\b"],
            "apt list --upgradable 2>/dev/null", needs=("apt",)),
-    Recipe("clean packages", [r"\b(?:clean\s+up|clean|remove)\s+(?:the\s+)?(?:old|unused|unneeded|leftover)\s+(?:packages|kernels|dependencies)\b|\bautoremove\b|"
+    Recipe("clean packages", [r"\b(?:clean\s+up|clean|remove|delete|get\s+rid\s+of|purge)\s+(?:the\s+|all\s+(?:the\s+)?)?(?:old|unused|unneeded|leftover|obsolete)\s+(?:packages|kernels|dependencies)\b|\bautoremove\b|"
                               r"\bclean\s+(?:up\s+)?(?:the\s+)?(?:apt|package)\s+cache\b"],
            "sudo apt autoremove && sudo apt clean", needs=("apt",), destructive=True,
            warning="! removes packages nothing needs any more"),
@@ -3077,7 +3238,151 @@ def h_recipe(u: Utterance) -> Plan | None:
     return best
 
 
-HANDLERS = [h_recipe, h_system, h_power, h_version, h_installed, h_port, h_pkg_search, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
+# ---- USB drives --------------------------------------------------------------------
+# aisha looks at the drives itself (lsblk) so commands name the real device.
+# Only drives whose transport is USB are touched, never the disk you boot from.
+
+def usb_drives() -> list[dict]:
+    """[{dev, size, model, label, parts: [{dev, fstype, label, mount, size}]}] for USB disks."""
+    try:
+        r = subprocess.run(["lsblk", "-J", "-o", "NAME,PATH,SIZE,TRAN,TYPE,MOUNTPOINT,FSTYPE,LABEL,MODEL"],
+                           capture_output=True, text=True, timeout=10)
+        data = json.loads(r.stdout or "{}")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+    out = []
+    for d in data.get("blockdevices", []):
+        if d.get("type") != "disk" or (d.get("tran") or "").lower() != "usb":
+            continue
+        parts = [{"dev": c.get("path") or "/dev/" + c["name"], "fstype": c.get("fstype") or "",
+                  "label": c.get("label") or "", "mount": c.get("mountpoint") or "", "size": c.get("size") or ""}
+                 for c in d.get("children") or [] if c.get("type") == "part"]
+        if any(p["mount"] in ("/", "/boot", "/boot/efi", "/usr", "/home") for p in parts) or \
+                d.get("mountpoint") in ("/", "/boot", "/usr", "/home"):
+            continue                     # the system lives here: never offer it
+        out.append({"dev": d.get("path") or "/dev/" + d["name"], "size": d.get("size") or "",
+                    "model": (d.get("model") or "USB drive").strip(), "label": d.get("label") or "",
+                    "parts": parts, "mount": d.get("mountpoint") or "", "fstype": d.get("fstype") or ""})
+    return out
+
+
+USB_LIST = ("lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT,MODEL $(lsblk -dno PATH,TRAN | awk '$2==\"usb\"{print $1}') "
+            "2>/dev/null | grep . || echo 'no USB drives connected'")
+USB_WORD = (r"(?:usb|thumb\s*drive|flash\s*drive|pen\s*drive|memory\s+stick|usb\s+(?:stick|drive|disk|key)|"
+            r"external\s+(?:drive|disk)|stick)")
+FS_TYPES = {  # wording -> (mkfs command, Debian package, label option)
+    "ntfs": ("mkfs.ntfs -f", "ntfs-3g", "-L"), "fat32": ("mkfs.vfat -F 32", "dosfstools", "-n"),
+    "vfat": ("mkfs.vfat -F 32", "dosfstools", "-n"), "fat": ("mkfs.vfat -F 32", "dosfstools", "-n"),
+    "exfat": ("mkfs.exfat", "exfatprogs", "-n"), "ext4": ("mkfs.ext4 -F", "e2fsprogs", "-L"),
+    "linux": ("mkfs.ext4 -F", "e2fsprogs", "-L"), "windows": ("mkfs.ntfs -f", "ntfs-3g", "-L"),
+}
+
+
+def pick_usb(u: Utterance, drives: list[dict]) -> tuple[dict | None, str]:
+    """The drive the user means: named by device or label, or the only one."""
+    for d in drives:
+        names = {os.path.basename(d["dev"]).lower(), d["dev"].lower(), d["label"].lower()}
+        names |= {os.path.basename(p["dev"]).lower() for p in d["parts"]}
+        names |= {p["label"].lower() for p in d["parts"] if p["label"]}
+        names.discard("")
+        for low, orig, _ in u.remaining():
+            if u.lit(orig).lower() in names:
+                return d, ""
+    if len(drives) == 1:
+        return drives[0], ""
+    if not drives:
+        return None, "no USB drive is connected"
+    return None, "several USB drives: say which (" + ", ".join(
+        f"{os.path.basename(d['dev'])} {d['model']} {d['size']}" for d in drives) + ")"
+
+
+def h_usb(u: Utterance) -> Plan | None:
+    if not shutil.which("lsblk"):
+        return None
+    if not u.peek(rf"\b{USB_WORD}s?\b"):
+        # "eject KINGSTON", "format sdb1 to ntfs": a USB drive named by label or device
+        if not u.peek(r"\b(?:eject|unmount|umount|unmoun|dismount|mount|format|reformat|safely\s+remove)\b"):
+            return None
+        drives = usb_drives()
+        if not drives or pick_usb(u, drives)[0] is None or (len(drives) == 1 and not any(
+                u.lit(o).lower() in ({os.path.basename(drives[0]["dev"]), drives[0]["label"].lower()}
+                                     | {os.path.basename(x["dev"]) for x in drives[0]["parts"]}
+                                     | {x["label"].lower() for x in drives[0]["parts"]}) for _, o, _ in u.remaining())):
+            return None
+    text = u.text
+    action = None
+    if re.search(r"\b(?:format|reformat|initiali[sz]e|wipe|erase)\b", text):
+        action = "format"
+    elif re.search(r"\b(?:eject|safely\s+remove|remove\s+safely|unplug|power\s+off|disconnect)\b", text):
+        action = "eject"
+    elif re.search(r"\b(?:unmount|umount|unmoun|dismount)\b", text):
+        action = "unmount"
+    elif re.search(r"\bmount\b", text):
+        action = "mount"
+    elif re.search(r"\b(?:free|space|left|full|usage|capacity|room)\b", text):
+        action = "space"
+    elif re.search(r"\b(?:list|show|connected|plugged|attached|which|what|all|any|detect|see|devices?|drives?|sticks?|info)\b", text):
+        action = "list"
+    if not action:
+        return None
+    if action == "list":
+        u.text = " " * len(u.text)
+        cmd = USB_LIST + "; echo; " + first_available([("lsusb", "lsusb"),
+                                                       (None, "cat /sys/bus/usb/devices/*/product 2>/dev/null")])
+        return Plan(cmd, "usb", ["USB drives, then all USB devices"])
+    drives = usb_drives()
+    d, problem = pick_usb(u, drives)
+    u.text = " " * len(u.text)
+    if not d:
+        return Plan(USB_LIST, "usb", [problem])
+    name = f"{os.path.basename(d['dev'])} ({d['model']}, {d['size']})"
+    parts = d["parts"] or [{"dev": d["dev"], "fstype": d["fstype"], "label": d["label"], "mount": d["mount"],
+                            "size": d["size"]}]
+    mounted = [p for p in parts if p["mount"]]
+    udisks = shutil.which("udisksctl")
+    show = f"lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT {d['dev']}"
+    if action == "space":
+        if not mounted:
+            return Plan(show, "usb", [name, "not mounted: say 'mount the usb' first"])
+        return Plan("df -h " + " ".join(shlex.quote(p["mount"]) for p in mounted), "usb", [f"free space on {name}"])
+    if action == "mount":
+        todo = [p for p in parts if not p["mount"] and p["fstype"]]
+        if not todo:
+            return Plan(show, "usb", [name, "already mounted"])
+        cmd = " && ".join((f"udisksctl mount -b {p['dev']}" if udisks else
+                           f"sudo mkdir -p /media/$USER/{os.path.basename(p['dev'])} && "
+                           f"sudo mount {p['dev']} /media/$USER/{os.path.basename(p['dev'])}") for p in todo)
+        return Plan(cmd, "usb", [f"mount {name}"])
+    unmount = [(f"udisksctl unmount -b {p['dev']}" if udisks else f"sudo umount {p['dev']}") for p in mounted]
+    if action == "unmount":
+        if not unmount:
+            return Plan(show, "usb", [name, "nothing is mounted"])
+        return Plan(" && ".join(unmount), "usb", [f"unmount {name}"])
+    if action == "eject":
+        power = f"udisksctl power-off -b {d['dev']}" if udisks else f"echo 'you can unplug {name} now'"
+        return Plan(" && ".join(unmount + ["sync", power]), "usb", [f"unmount and power off {name}"],
+                    destructive=True, warning=f"! ejects {name}; close files on it first")
+    fs = next(((w, spec) for w, spec in FS_TYPES.items() if re.search(rf"\b{w}\b", u.low)), None)
+    if not fs:
+        return Plan(show, "usb", [name, "format to what? say ntfs, fat32, exfat or ext4"], confidence=0.9)
+    word, (mkfs, pkg, label_opt) = fs
+    if len(parts) != 1:
+        return Plan(show, "usb", [name, f"has {len(parts)} partitions; aisha only formats a drive with one"],
+                    confidence=0.9)
+    target = parts[0]["dev"]
+    label = ""
+    lab = re.search(r"\b(?:called|named|label(?:led)?|with\s+(?:the\s+)?(?:name|label))\s+(\S+)", u.low)
+    if lab:
+        raw = u.lit(u.orig[lab.start(1):lab.end(1)])
+        label = f" {label_opt} {shlex.quote(raw[:11] if 'vfat' in mkfs else raw[:32])}"
+    steps = [(f"udisksctl unmount -b {p['dev']}" if udisks else f"sudo umount {p['dev']}") for p in mounted]
+    steps.append(f"sudo {mkfs}{label} {target}")
+    plan = Plan(" && ".join(steps), "format usb", [f"{target} on {name}", f"as {word.upper()}"], destructive=True,
+                warning=f"! ERASES EVERYTHING on {target} ({d['model']}, {d['size']}) and makes it {word.upper()}")
+    return require(plan, [(mkfs.split()[0], pkg)])
+
+
+HANDLERS = [h_usb, h_recipe, h_system, h_power, h_version, h_installed, h_port, h_pkg_search, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
             h_find_then, h_reext, h_download, h_compare, h_replace, h_calc, h_copy_move, h_delete, h_read, h_grep, h_count, h_size, h_find, h_list]
 
 
@@ -3092,6 +3397,18 @@ hidden largest biggest smallest newest oldest recent sorted size count lines mem
 space processes running install uninstall update upgrade executable everything inside
 with using than from into this that here
 """.split()) | set(TYPE_WORDS) | {w + "s" for w in TYPE_WORDS} | set(EDITORS)
+
+
+def harvest_vocab() -> set:
+    """Every word the rules, recipes and the built-in model use: typos of these get fixed."""
+    texts = [INTENT_BANK, " ".join(TYPE_WORDS), " ".join(SYNONYMS), " ".join(SYNONYMS.values())]
+    texts += [pat for pat, *_ in SYSTEM]
+    texts += [p.pattern for r in RECIPES for p in r.patterns]
+    texts += [pat for pat, *_ in LS_KEYS] + [SUNIT, TUNIT, " ".join(FILLER), "megabytes gigabytes kilobytes username mount unmount umount eject format usb stick flash drive ntfs fat32 exfat"]
+    words = set()
+    for t in texts:
+        words.update(re.findall(r"[a-z]{4,}", re.sub(r"\\[a-zA-Z]", " ", t)))
+    return words
 
 
 def one_edit_apart(a: str, b: str) -> bool:
@@ -3117,35 +3434,65 @@ show shoe slow snow know flow glow grow fine find kind mind bind wind
 """.split()) - VOCAB
 
 
+_FULL_VOCAB: set | None = None
+
+
 def fix_typos(text: str) -> tuple[str, list[str]]:
-    """Replace whole plain words (never file names or quotes) one typo off VOCAB."""
+    """Replace whole plain words (never file names or quotes) one typo off a known word."""
+    global _FULL_VOCAB
+    if _FULL_VOCAB is None:
+        _FULL_VOCAB = (VOCAB | harvest_vocab()) - COMMON
+    vocab = _FULL_VOCAB
     fixes, out, quoted = [], [], False
     for tok in text.split(" "):
-        if tok.count('"') % 2 or tok.count("'") % 2:
-            quoted = not quoted
+        opens = tok[:1] in ("'", '"')
+        closes = len(tok) > 1 and tok[-1:] in ("'", '"')
+        if opens and not closes:
+            quoted = True
         w = tok.lower()
-        if (not quoted and len(w) >= 4 and w.isalpha() and w not in VOCAB and w not in FILLER
+        if (not quoted and not opens and len(w) >= 4 and w.isalpha() and w not in vocab and w not in FILLER
                 and w not in TIMEISH and w not in GENERIC and w not in COMMON):
-            cands = sorted(v for v in VOCAB if one_edit_apart(w, v))
+            cands = sorted(v for v in vocab if one_edit_apart(w, v))
             if any(w.startswith(c) for c in cands):   # "deleted", "removed": real words
                 cands = []
             if len(cands) == 1:
                 fixes.append(f"{w}→{cands[0]}")
                 tok = cands[0]
+        if quoted and closes and not opens:
+            quoted = False
+        elif opens and closes:
+            pass
         out.append(tok)
     return " ".join(out), fixes
+
+
+# Words around a request that carry no meaning: "could you ... for me, thanks".
+POLITE_HEAD = re.compile(
+    r"^\s*(?:(?:hey|hi|hello|ok|okay|so|um+|uh+|well|yo|right|alright|now)\b[,!.:]*\s+|"
+    r"(?:please|pls|plz|kindly|just|quickly)\s+|(?:can|could|would|will)\s+you\s+(?:please\s+|kindly\s+)?|"
+    r"(?:i(?:\s+want|\s+wanna|\s+need|\s+would\s+like|'d\s+like|\s+d\s+like|\s+am\s+trying|'m\s+trying|\s+have)\s+to\s+|i\s+wanna\s+)|"
+    r"help\s+me\s+(?:to\s+)?|go\s+ahead\s+and\s+|let'?s\s+|try\s+(?:to|and)\s+|be\s+so\s+kind\s+and\s+)+", re.I)
+POLITE_TAIL = re.compile(
+    r"(?:(?<!from)(?<!until)(?<!till)[\s,]+(?:please|pls|plz|thanks|thank\s+you|thx|ty|for\s+me|now|asap|quickly|right\s+now|if\s+you\s+can|"
+    r"if\s+possible|kindly)\b)+[\s!.?]*$", re.I)
+
+
+def strip_politeness(text: str) -> str:
+    out = POLITE_TAIL.sub("", POLITE_HEAD.sub("", text)).strip()
+    return out if out else text.strip()
 
 
 # "how do I ...": show the command, don't run it.
 QUESTION_RE = re.compile(
     r"^\s*(?:(?:hey|hi|hello|ok|okay|so|um|well|please|quick\s+question)[,!.:]*\s+)*"
     r"(?:(?:how|what)\s+(?:do|can|would|should)\s+(?:i|you|one|we)\s+(?:use\s+to\s+)?|how\s+to\s+|"
-    r"what(?:'s|\s+is)\s+the\s+(?:bash\s+|shell\s+|linux\s+)?command\s+(?:to|for)\s+|"
+    r"what(?:'s|\s+is)\s+(?:the\s+)?(?:bash\s+|shell\s+|linux\s+)?command\s+(?:to|for)\s+|"
     r"which\s+command\s+(?:do\s+i\s+use\s+to\s+|to\s+use\s+to\s+|)?)", re.I)
 
 
 def interpret(text: str, cwd: str) -> Plan | None:
     """Best deterministic plan for a sentence. "how do I ..." plans are only shown."""
+    text = strip_politeness(text)
     q = QUESTION_RE.match(text)
     if q and text[q.end():].strip():
         plan = _interpret_fixing(text[q.end():].rstrip(" ?"), cwd)
@@ -3165,7 +3512,7 @@ def _interpret_fixing(text: str, cwd: str) -> Plan | None:
     if best is not None and best.confidence >= 0.999:
         return best
     m = re.match(r"^(.+?)\s+(create|make|delete|remove|erase|show|open|edit|find|list|copy|move|rename|extract|"
-                 r"compress|zip|count|search)(?:\s+(?:it|them|please|pls|now))*\s*[?!.]?$", text, re.I)
+                 r"compress|zip|unzip|unpack|count|search|kill|stop|display|print|sort)(?:\s+(?:it|them|please|pls|now))*\s*[?!.]?$", text, re.I)
     if m and not re.match(r"^\s*(?:create|make|delete|remove|show|open|edit|find|list|copy|move|rename|how|what|which)\b",
                           text, re.I):
         again = _interpret(f"{m.group(2)} {m.group(1)}", cwd)
@@ -3185,6 +3532,8 @@ def _interpret_fixing(text: str, cwd: str) -> Plan | None:
         text = syn
     fixed, fixes = fix_typos(text)
     if fixes:
+        fixed, more = apply_synonyms(fixed)
+        fixes += more
         again = _interpret(fixed, cwd)
         targets = {f.split("→")[1] for f in fixes}
         used_as_keyword = any(stem(t) in again.keywords or t in again.keywords for t in targets) if again else True
@@ -3590,7 +3939,7 @@ SYNONYMS = {
     "huge": "big", "giant": "big", "bulky": "big", "heavy": "big", "massive": "big", "enormous": "big",
     "ancient": "old", "stale": "old", "outdated": "old", "aged": "old", "tally": "count", "execute": "run",
     "launch": "run", "terminate": "kill", "decompress": "extract", "unpack": "extract", "untar": "extract",
-    "retrieve": "download", "directory": "folder", "directories": "folders", "dir": "folder", "dirs": "folders",
+    "retrieve": "download", "enumerate": "list", "hugest": "biggest", "directory": "folder", "directories": "folders", "dir": "folder", "dirs": "folders",
 }
 # Folded together only when comparing with the bank (too loose for the rules).
 MODEL_SYNONYMS = dict(SYNONYMS, make="create", new="create", touch="create", remove="delete", rm="delete",
@@ -3840,7 +4189,7 @@ newest oldest recent empty hidden old big
 # Real commands that are also everyday English verbs ("go up", "kill firefox",
 # "find big files"). For these, a confident rules parse wins over bash.
 AMBIGUOUS_FIRST = {"go", "kill", "find", "open", "make", "which", "who", "file", "install", "compare",
-                   "base64", "convert", "set", "sync", "ssh", "clone", "add", "pull", "push", "display",
+                   "base64", "convert", "set", "sync", "ssh", "clone", "add", "pull", "push", "display", "shift",
                    "du", "df", "free", "locate", "look", "see", "show", "cd", "zip", "unzip", "head",
                    "tail", "touch", "less"}
 
@@ -3869,7 +4218,8 @@ def looks_like_shell(line: str, path_env: str | None = None, cwd: str | None = N
     # words, not numbers, %jobs or paths that exist here ("kill 1234" and "kill %1" stay bash)
     plain = [t for t in rest if not re.fullmatch(r"[%+-]?\d+|%\S*", t)
              and not os.path.exists(os.path.join(cwd or ".", os.path.expanduser(t)))]
-    english = len(rest) > 1 and rest[0].lower() in ("a", "an", "the", "my", "me", "all", "every", "some", "how")
+    english = len(rest) > 1 and rest[0].lower() in ("a", "an", "the", "my", "me", "all", "every", "some", "how", "alias",
+                                                    "folder", "file", "directory", "new", "copy", "backup", "link")
     if (cwd and toks[0] in AMBIGUOUS_FIRST and plain
             and (english or not any(t.startswith("-") for t in rest))
             and not re.search(r"[|&;<>`$]", line)
@@ -4593,6 +4943,9 @@ class Shell:
         if line.startswith("?"):
             self.rc = self.via_llm(line[1:].strip(), interpret(line[1:].strip(), self.cwd))
             return self.rc
+        polite = strip_politeness(line)
+        if polite != line and (POLITE_HEAD.match(line) or not looks_like_shell(line, self.env.get("PATH"))):
+            line = polite                      # "go ahead and show README.md" -> "show README.md"
         if self.memory.match(line):           # what you taught wins over guessing (! still forces bash)
             return self.natural(line)
         if looks_like_shell(line, self.env.get("PATH"), self.cwd, self.cfg["threshold"], self.names):

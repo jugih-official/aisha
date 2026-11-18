@@ -1093,7 +1093,7 @@ class TestRecipesNeedingTools(LabTest):
         self.assertEqual(self.cmd("connect to 10.0.0.5 on port 2222"), "ssh -p 2222 10.0.0.5")
         self.assertEqual(self.cmd("copy README.md to jukka@server.example.com:/tmp"),
                          "scp -r -- README.md jukka@server.example.com:/tmp")
-        self.assertEqual(self.cmd("list usb devices"), "lsusb")
+        self.assertIn("lsusb", self.cmd("list usb devices"))
         self.assertEqual(self.cmd("show wifi networks"), "nmcli dev wifi list")
 
 
@@ -1358,3 +1358,97 @@ class TestPrompt(LabTest):
         sh.cfg["prompt_git"] = True
         self.assertIn(" git:aisha ", sh.prompt())
         self.assertTrue(sh.prompt().startswith("aisha "))
+
+
+class TestListOptions(LabTest):
+    def test_parameters(self):
+        cases = {
+            "list all the files on this folder by time": "ls -lhAt",
+            "list all the files on this folder by file name": "ls -lhA",
+            "list files by size smallest first": "ls -lhSr",
+            "list files sorted by date oldest first": "ls -lhtr",
+            "list files newest last": "ls -lhtr",
+            "list files by extension": "ls -lhX",
+            "list files by version": "ls -lhv",
+            "list files by access time": "ls -lhtu",
+            "list files by creation date": "ls -lht --time=birth",
+            "list files z to a": "ls -lhr",
+            "list files in reverse order": "ls -lhr",
+            "list one file per line": "ls -1",
+            "list file names only": "ls -1",
+            "list files without details": "ls",
+            "list files in columns": "ls -C",
+            "list files comma separated": "ls -m",
+            "list directories first": "ls -lh --group-directories-first",
+            "list files with full timestamps": "ls -lh --full-time",
+            "list files with sizes in kb": "ls -l --block-size=K",
+            "list files with type markers": "ls -lhF",
+            "order the files by size": "ls -lhS",
+            "list everything by date and show hidden": "ls -lhAt",
+            "list only files by size": "find . -maxdepth 1 -mindepth 1 -type f -not -name '.*' -exec ls -lhS -- {} +",
+        }
+        for phrase, cmd in cases.items():
+            self.assertEqual(self.cmd(phrase), cmd, phrase)
+
+
+ORIG_USB_DRIVES = aisha.usb_drives
+
+
+class TestUSB(LabTest):
+    ONE = [{"dev": "/dev/sdb", "size": "28.9G", "model": "SanDisk Cruzer", "label": "", "mount": "", "fstype": "",
+            "parts": [{"dev": "/dev/sdb1", "fstype": "vfat", "label": "KINGSTON", "mount": "/media/me/KINGSTON",
+                       "size": "28.9G"}]}]
+
+    def setUp(self):
+        super().setUp()
+        orig_which, orig_drives = aisha.shutil.which, aisha.usb_drives
+        aisha.shutil.which = lambda c, *x, **k: f"/usr/bin/{c}" if c in ("lsblk", "udisksctl", "lsusb", "mkfs.vfat", "mkfs.ext4") \
+            else orig_which(c, *x, **k)
+        aisha.usb_drives = lambda: self.ONE
+        self.addCleanup(setattr, aisha.shutil, "which", orig_which)
+        self.addCleanup(setattr, aisha, "usb_drives", orig_drives)
+
+    def test_only_usb_disks_are_offered(self):
+        fake = {"blockdevices": [
+            {"name": "nvme0n1", "path": "/dev/nvme0n1", "type": "disk", "tran": "nvme", "size": "1T", "model": "Samsung",
+             "children": [{"name": "nvme0n1p2", "path": "/dev/nvme0n1p2", "type": "part", "mountpoint": "/"}]},
+            {"name": "sdc", "path": "/dev/sdc", "type": "disk", "tran": "usb", "size": "500G", "model": "Boot USB",
+             "children": [{"name": "sdc1", "path": "/dev/sdc1", "type": "part", "mountpoint": "/"}]},
+            {"name": "sdb", "path": "/dev/sdb", "type": "disk", "tran": "usb", "size": "28.9G", "model": "SanDisk",
+             "children": [{"name": "sdb1", "path": "/dev/sdb1", "type": "part", "fstype": "vfat", "mountpoint": None}]}]}
+
+        class R:
+            stdout = json.dumps(fake)
+        orig = aisha.subprocess.run
+        aisha.subprocess.run = lambda *a, **k: R()
+        try:
+            got = ORIG_USB_DRIVES()
+        finally:
+            aisha.subprocess.run = orig
+        self.assertEqual([d["dev"] for d in got], ["/dev/sdb"])
+
+    def test_actions(self):
+        c = self.cmd
+        self.assertIn("lsusb", c("list all connected usb"))
+        self.assertEqual(c("show free on usb"), "df -h /media/me/KINGSTON")
+        self.assertEqual(c("unmount usb"), "udisksctl unmount -b /dev/sdb1")
+        self.assertEqual(c("unmoun usb"), "udisksctl unmount -b /dev/sdb1")
+        self.assertEqual(c("eject usb"), "udisksctl unmount -b /dev/sdb1 && sync && udisksctl power-off -b /dev/sdb")
+        self.assertEqual(c("eject KINGSTON"), c("safely remove the usb drive"))
+        p = self.plan("format usb to fat32 called BACKUP")
+        self.assertEqual(p.command, "udisksctl unmount -b /dev/sdb1 && sudo mkfs.vfat -F 32 -n BACKUP /dev/sdb1")
+        self.assertTrue(p.destructive)
+        self.assertIn("ERASES EVERYTHING on /dev/sdb1", p.warning)
+        p = self.plan("format usb to ntfs")
+        self.assertIn("mkfs.ntfs", p.command)
+        self.assertIn("ERASES EVERYTHING", p.warning)        # kept even when a tool is installed first
+        self.assertIn("install", p.warning)
+        self.assertNotIn("mkfs", self.plan("format the usb stick").command)   # no filesystem named: ask
+
+    def test_two_drives_need_a_name(self):
+        two = self.ONE + [{"dev": "/dev/sdc", "size": "64G", "model": "Kingston", "label": "", "mount": "", "fstype": "",
+                           "parts": [{"dev": "/dev/sdc1", "fstype": "exfat", "label": "PHOTOS", "mount": "", "size": "64G"}]}]
+        aisha.usb_drives = lambda: two
+        self.assertNotIn("mkfs", self.plan("format usb to ext4").command)
+        self.assertIn("several USB drives", self.plan("format usb to ext4").rationale())
+        self.assertEqual(self.cmd("format PHOTOS to ext4"), "sudo mkfs.ext4 -F /dev/sdc1")

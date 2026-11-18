@@ -513,3 +513,21 @@ back up README.md	cp -ai -- README.md README.md.bak
 lines with error in app.log	grep ;; error ;; app.log
 find hello in README.md	grep ;; hello ;; README.md
 count the words in README.md	wc -w
+
+# -- listing parameters
+list all the files on this folder by time	ls -lhAt
+list all the files on this folder by file name	ls -lhA
+list files by size smallest first	ls -lhSr
+list files newest last	ls -lhtr
+list files by extension	ls -lhX
+list files z to a	ls -lhr
+list one file per line	ls -1
+list files without details	ls
+list directories first	--group-directories-first
+order the files by size	ls -lhS
+list everything by date and show hidden	ls -lhAt
+list files chronologically	ls -lhtr
+
+# -- usb (drive actions are in TestUSB, which fakes the drive)
+list all connected usb	USB drives || lsblk
+what usb drives are connected	lsblk

@@ -385,6 +385,27 @@ About 140 kinds of request, without a model:
   become root, switch user, open a website or app, web search, screenshot,
   volume.
 
+- **Listing parameters**, in any combination and wording — sort by name,
+  time, size, extension, version, access, change or creation time, or
+  unsorted; reversed / oldest first / newest last / a–z / z–a / ascending /
+  descending; long, names only, one per line, columns, comma-separated, full
+  timestamps, bytes or KB; hidden included or only, files only, folders only,
+  folders first, type markers. "list all the files in this folder by time,
+  oldest first, including hidden" → `ls -lhAtr`.
+- **USB drives** — list connected drives and devices, free space, mount,
+  unmount, eject (power off), format to NTFS / FAT32 / exFAT / ext4 with a
+  label. aisha reads the drives itself, names the real device in the
+  command, only ever touches drives on USB (never the system disk), asks for
+  the drive when several are plugged in, and shows "ERASES EVERYTHING on
+  /dev/sdb1 (SanDisk, 28.9G)" before formatting.
+
+Wording is normalised before the rules run: politeness ("could you … for
+me, thanks", "I'd like to", "help me", "go ahead and"), synonyms, a verb at
+the end, missing articles and typos of any word aisha knows.
+`tests/test_robustness.py` rewrites every tested request those ways (about
+2,400 variants) and requires at least 97% to still give the right command;
+it is at 98%.
+
 "what can you do" inside aisha lists examples. Actions you rule out ("find
 tmp files, don't remove them") are never run. `tests/phrases.tsv` lists the
 380+ requests the test suite checks, including ones the rules must leave to
