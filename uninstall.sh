@@ -9,6 +9,7 @@ CODE_BIN_TARGET=/usr/local/bin/ai-code
 AISHA_BIN_TARGET=/usr/local/bin/aisha
 AISHA_LIB_DIR=/usr/local/lib/aisha
 AISHA_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/aisha"
+AISHA_CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/aisha"
 BROWSER_PREFIX=/opt/ai-bash
 CFG_DIR_USER="$HOME/.config/ai-bash"
 CFG_DIR_SYS=/etc/ai-bash
@@ -63,6 +64,17 @@ if [ -e "$AISHA_DATA_DIR" ]; then
     read -r -p "Delete them? [y/N] " yn
     case "${yn,,}" in
         y|yes) remove_path "$AISHA_DATA_DIR" user ;;
+        *)     dim "  kept them." ;;
+    esac
+fi
+
+# aisha's settings, learned phrases and history.
+if [ -e "$AISHA_CFG_DIR" ]; then
+    echo
+    yellow "aisha's settings, learned phrases and history are in $AISHA_CFG_DIR."
+    read -r -p "Delete them? [y/N] " yn
+    case "${yn,,}" in
+        y|yes) remove_path "$AISHA_CFG_DIR" user ;;
         *)     dim "  kept them." ;;
     esac
 fi

@@ -142,13 +142,13 @@ downloads → `urllib`, `free`/`uptime`/`ss`/`ip`/`cal` → `/proc` or
 
 - `cd`, variables (plain and exported, arrays too), `umask`, `shopt`
   options, aliases and functions persist between lines;
-  `~/.bash_aliases` and `~/.config/ai-bash/aisha/aisharc` are loaded at
+  `~/.bash_aliases` and `~/.config/aisha/aisharc` are loaded at
   start. (Traps and `set -o` options do not carry over.)
 - Job control: Ctrl-Z, `jobs`, `fg`, `bg`, `cmd &`, `kill %N`.
 - Closing the terminal or `kill`ing aisha passes the signal on to the
   running command, hangs up jobs, stops the model and saves history.
 - Tab completes commands and paths; history is kept in
-  `~/.config/ai-bash/aisha/history`.
+  `~/.config/aisha/history`.
 - `aisha -c '…'`, `aisha script.sh` and scripts on stdin run in plain bash,
   so aisha is safe as a login shell (`chsh -s /usr/bin/aisha` after
   installing the Debian package, which registers it in `/etc/shells`).
@@ -211,7 +211,7 @@ needed and stops it when aisha exits. When the rules and the built-in model are 
 is offered as one more option (`?` at the prompt); its commands are always
 shown and confirmed.
 
-Settings live in `~/.config/ai-bash/aisha/config.json` or the environment:
+Settings live in `~/.config/aisha/config.json` or the environment:
 
 | Setting | Env var | Default |
 |---|---|---|

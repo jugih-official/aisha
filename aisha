@@ -53,7 +53,21 @@ VERSION = "0.6.0"
 
 # ---- configuration ----------------------------------------------------------
 
-CFG_DIR = os.path.expanduser(os.environ.get("AISHA_HOME", "~/.config/ai-bash/aisha"))
+def _config_dir() -> str:
+    """~/.config/aisha; settings from before the rename (~/.config/ai-bash/aisha) move there once."""
+    if os.environ.get("AISHA_HOME"):
+        return os.path.expanduser(os.environ["AISHA_HOME"])
+    base = os.path.expanduser(os.environ.get("XDG_CONFIG_HOME") or "~/.config")
+    new, old = os.path.join(base, "aisha"), os.path.join(base, "ai-bash", "aisha")
+    if os.path.isdir(old) and not os.path.exists(new):
+        try:
+            os.rename(old, new)
+        except OSError:
+            return old
+    return new
+
+
+CFG_DIR = _config_dir()
 CFG_FILE = os.path.join(CFG_DIR, "config.json")
 LEARNED_FILE = os.path.join(CFG_DIR, "learned.json")
 HISTORY_FILE = os.path.join(CFG_DIR, "history")
@@ -2518,6 +2532,127 @@ def h_reext(u: Utterance) -> Plan | None:
                 warning=f"! renames the .{old} files listed above")
 
 
+UNIT_DIRS = ("/etc/systemd/system", "/run/systemd/system", "/lib/systemd/system", "/usr/lib/systemd/system")
+KNOWN_SERVICES = set("""nginx apache2 ssh sshd docker containerd mariadb mysql postgresql redis-server cups bluetooth
+NetworkManager networking ufw cron postfix exim4 smbd nmbd avahi-daemon gdm3 lightdm sddm php-fpm
+memcached mongod elasticsearch jenkins grafana-server prometheus haproxy squid bind9 named
+dnsmasq libvirtd nfs-server rsyslog systemd-resolved systemd-timesyncd tor transmission-daemon""".split())
+SERVICE_WORDS = {  # everyday names for services
+    "network": "network", "networking": "network", "internet": "network", "wifi": "network", "wi-fi": "network",
+    "apache": "apache2", "sshd": "ssh", "openssh": "ssh", "printer": "cups", "printing": "cups",
+    "firewall": "ufw", "dns": "systemd-resolved", "postgres": "postgresql", "redis": "redis-server",
+    "samba": "smbd", "mysql": "mysql", "web server": "nginx" if any(
+        os.path.exists(f"{d}/nginx.service") for d in UNIT_DIRS) else "apache2",
+}
+COMPUTER_WORDS = r"(?:computer|machine|system|pc|laptop|server|box|it)"
+
+
+def unit_exists(name: str) -> bool:
+    return any(os.path.exists(f"{d}/{name}.service") for d in UNIT_DIRS)
+
+
+def service_name(word: str) -> str | None:
+    """'nginx', 'the network', 'apache' -> the systemd unit, or None if it is not a service."""
+    word = word.strip()
+    w = SERVICE_WORDS.get(word.lower(), word)
+    if w == "network":
+        return next((n for n in ("NetworkManager", "networking", "systemd-networkd") if unit_exists(n)),
+                    "NetworkManager" if shutil.which("nmcli") else "networking")
+    if w == "ssh" and not unit_exists("ssh") and unit_exists("sshd"):
+        return "sshd"
+    if unit_exists(w) or w in KNOWN_SERVICES or w.removesuffix(".service") in KNOWN_SERVICES:
+        return w.removesuffix(".service")
+    return None
+
+
+def h_service(u: Utterance) -> Plan | None:
+    """'reboot nginx', 'restart the network', 'nginx status', 'is ssh enabled at boot'."""
+    m = u.peek(r"^\s*(reboot|restart|start|stop|reload|enable|disable|shut\s*down|turn\s+off|turn\s+on|kill)\s+"
+               r"(?:the\s+)?([\w.@-]+(?:\s+server)?)(?:\s+(?:service|daemon|server|unit))?(?:\s+now)?\s*$")
+    if m:
+        verb, word = m.group(1), u.lit(u.o(m, 2))
+        if re.fullmatch(COMPUTER_WORDS, word.lower()):
+            return None
+        unit = service_name(word)
+        if not unit and verb == "reboot" and not re.fullmatch(r"(?:now|later|tonight|soon|today)", word.lower()):
+            unit = word                  # "reboot X" never means the computer
+        if not unit or verb == "kill" and not unit_exists(unit):
+            return None
+        act = {"reboot": "restart", "shutdown": "stop", "turnoff": "stop", "turnon": "start",
+               "kill": "kill"}.get(re.sub(r"\s+", "", verb), verb)
+        u.text = " " * len(u.text)
+        return Plan(f"{sudo()}systemctl {act} {shlex.quote(unit)}", "service", [f"{act} {unit}"],
+                    destructive=act in ("stop", "restart", "disable", "kill"),
+                    warning=f"! {act}s the {unit} service" if act in ("stop", "restart", "disable", "kill") else None,
+                    checked=act not in ("stop", "restart", "disable", "kill"))
+    m = u.peek(r"^\s*(?:(?:show\s+|check\s+)?(?:the\s+)?([\w.@-]+)\s+(?:service\s+)?status|"
+               r"(?:what\s+is\s+the\s+|show\s+(?:me\s+)?(?:the\s+)?)?status\s+of\s+(?:the\s+)?([\w.@-]+)(?:\s+service)?|"
+               r"is\s+(?:the\s+)?([\w.@-]+)(?:\s+service)?\s+(?:active|running|up|ok|working))\s*$")
+    if m:
+        unit = service_name(u.lit(next(g for g in m.groups() if g)))
+        if unit and (unit_exists(unit) or not m.group(3)):
+            u.text = " " * len(u.text)
+            return Plan(f"systemctl status {shlex.quote(unit)} --no-pager", "service", [f"status of {unit}"])
+    m = u.peek(r"^\s*(?:is|does)\s+(?:the\s+)?([\w.@-]+)(?:\s+service)?\s+(?:enabled|start(?:s|ed)?)\s+(?:at|on|when)\s+(?:boot|startup|start\s*up)\s*$")
+    if m:
+        unit = service_name(u.lit(u.o(m, 1)))
+        if unit:
+            u.text = " " * len(u.text)
+            return Plan(f"systemctl is-enabled {shlex.quote(unit)}", "service", [f"does {unit} start at boot"])
+    m = u.peek(r"^\s*(?:(?:show|list|which|what)\s+)?(?:the\s+)?(?:services|programs)\s+(?:that\s+)?(?:start|run|are\s+enabled)\s+(?:at|on)\s+(?:boot|startup)\s*$|"
+               r"^\s*(?:list\s+|show\s+)?(?:the\s+)?enabled\s+services\s*$")
+    if m:
+        u.text = " " * len(u.text)
+        return Plan("systemctl list-unit-files --type=service --state=enabled --no-pager", "service",
+                    ["services that start at boot"])
+    m = u.peek(r"^\s*(?:show\s+|follow\s+|tail\s+|watch\s+)?(?:the\s+)?([\w.@-]+)\s+(?:service\s+)?(?:logs?|journal)(?:\s+live)?\s*$|"
+               r"^\s*(?:show\s+|follow\s+|tail\s+)?(?:the\s+)?(?:logs?|journal)\s+(?:of|for)\s+(?:the\s+)?([\w.@-]+)(?:\s+service)?\s*$")
+    if m:
+        unit = service_name(u.lit(next(g for g in m.groups() if g)))
+        if unit:
+            follow = bool(u.peek(r"\b(?:follow|tail|watch|live)\b"))
+            u.text = " " * len(u.text)
+            return Plan(f"journalctl -u {shlex.quote(unit)} " + ("-f" if follow else "-n 50 --no-pager"), "logs",
+                        [f"{unit} service log" + (", live" if follow else ", last 50 lines")])
+    return None
+
+
+WHEN = (r"(?:\s+(?:in|after)\s+(?P<n>\d+|an?|one)\s*(?P<unit>minutes?|mins?|m|hours?|hrs?|h)\b"
+        r"|\s+at\s+(?P<hh>\d{1,2})(?::(?P<mm>\d{2}))?\s*(?P<ampm>[ap]\.?m\.?)?"
+        r"|\s+(?P<word>tonight|at\s+midnight|later|soon|this\s+evening|tomorrow(?:\s+morning)?))")
+
+
+def h_power_later(u: Utterance) -> Plan | None:
+    """'reboot in 5 minutes', 'shut down at 22:30', 'reboot tonight'."""
+    m = u.peek(r"^\s*(?P<verb>restart|reboot|shut\s*down|power\s*off|turn\s+off|switch\s+off)"
+               rf"(?:\s+(?:the\s+|my\s+|this\s+)?{COMPUTER_WORDS})?{WHEN}\s*$")
+    if not m:
+        return None
+    reboot = m.group("verb") in ("restart", "reboot")
+    flag, what = ("-r ", "reboot") if reboot else ("", "shutdown")
+    word = (m.group("word") or "").replace("at ", "")
+    if m.group("n"):
+        n = 1 if m.group("n") in ("a", "an", "one") else int(m.group("n"))
+        n *= 60 if m.group("unit").startswith("h") else 1
+        when, said = f"+{n}", f"in {n} minutes"
+    elif m.group("hh"):
+        hh, mm = int(m.group("hh")), int(m.group("mm") or 0)
+        ampm = (m.group("ampm") or "").replace(".", "")
+        hh = hh % 12 + (12 if ampm == "pm" else 0) if ampm else hh
+        if hh > 23 or mm > 59:
+            return None
+        when, said = f"{hh:02d}:{mm:02d}", f"at {hh:02d}:{mm:02d}"
+    elif word in ("tonight", "this evening", "midnight"):
+        when, said = ("00:00", "at midnight") if word == "midnight" else ("23:00", "tonight at 23:00")
+    else:
+        u.text = " " * len(u.text)
+        return Plan(f"sudo shutdown {flag}+30", "power", [f"{what} when? say 'in 30 minutes' or 'at 22:00'"],
+                    show_only=True)
+    u.text = " " * len(u.text)
+    return Plan(f"sudo shutdown {flag}{when}", "power", [f"{what} {said}", "cancel with 'cancel the shutdown'"],
+                destructive=True, warning=f"! schedules a {what} {said}")
+
+
 def h_power(u: Utterance) -> Plan | None:
     m = u.peek(r"\b(restart|reboot|shut\s*down|power\s*off|turn\s+off|switch\s+off|suspend|sleep|hibernate)\s+"
                r"(?:the\s+|my\s+|this\s+)?(?:computer|machine|system|pc|laptop|server|box)(?:\s+now)?\s*$")
@@ -3382,7 +3517,7 @@ def h_usb(u: Utterance) -> Plan | None:
     return require(plan, [(mkfs.split()[0], pkg)])
 
 
-HANDLERS = [h_usb, h_recipe, h_system, h_power, h_version, h_installed, h_port, h_pkg_search, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
+HANDLERS = [h_usb, h_power_later, h_service, h_recipe, h_system, h_power, h_version, h_installed, h_port, h_pkg_search, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
             h_find_then, h_reext, h_download, h_compare, h_replace, h_calc, h_copy_move, h_delete, h_read, h_grep, h_count, h_size, h_find, h_list]
 
 
@@ -4186,6 +4321,15 @@ newest oldest recent empty hidden old big
 """.split())
 
 
+# Replies to nobody: "yes" is also a program that prints y forever.
+CHATTER = re.compile(r"(?:yes|yeah|yep|yup|no|nope|nah|ok|okay|k|sure|fine|cool|great|nice|thanks|thank\s+you|thx|ty)"
+                     r"(?:[\s,]+(?:please|thanks|thank\s+you|sir|mate|man|then))*")
+
+# Power commands with words after them never go to bash: systemd's reboot takes
+# "reboot nginx" as a reboot argument and restarts the computer at once.
+POWER_CMDS = {"reboot", "shutdown", "poweroff", "halt"}
+SHUTDOWN_TIME = re.compile(r"now|\+?\d+|\d{1,2}:\d{2}|-[a-zA-Z-]+.*")
+
 # Real commands that are also everyday English verbs ("go up", "kill firefox",
 # "find big files"). For these, a confident rules parse wins over bash.
 AMBIGUOUS_FIRST = {"go", "kill", "find", "open", "make", "which", "who", "file", "install", "compare",
@@ -4210,6 +4354,11 @@ def looks_like_shell(line: str, path_env: str | None = None, cwd: str | None = N
     except ValueError:
         return True
     rest = toks[1:]
+    if (toks[0] in POWER_CMDS and rest and not re.search(r"[|&;<>`$]", line)
+            and not all(SHUTDOWN_TIME.fullmatch(t) for t in rest)):
+        return False
+    if toks[0] == "yes" and not re.search(r"[|&;<>`$]", line):
+        return False                     # "yes please": nobody wants y printed forever
     if (cwd and toks[0] in PREFER_RULES and rest and not any(t.startswith("-") for t in rest)
             and not re.search(r"[|&;<>`$]", line)):
         plan = interpret(line, cwd)
@@ -4898,6 +5047,10 @@ class Shell:
                 "what can you do", "what can i ask", "what can i say", "what can you help with", "what do you understand",
                 "help me", "examples", "show examples", "show me examples", "commands", "what can i do"):
             say(HELP)
+            return 0
+        if CHATTER.fullmatch(low):          # "yes" would run yes(1), which prints y forever
+            say(dim("you're welcome" if low.startswith("thank") else
+                    "nothing is waiting for an answer: say what to do, or 'help'"))
             return 0
         if low in ("again", "repeat", "repeat that", "do it again", "do that again", "run it again",
                    "run that again", "same again", "once more") or line == "!!":
