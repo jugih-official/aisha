@@ -12,11 +12,19 @@ red()   { printf '\033[1;31m%s\033[0m\n' "$*"; }
 green() { printf '\033[1;32m%s\033[0m\n' "$*"; }
 die()   { red "error: $*"; exit 1; }
 
+FORCE=0
 case "${1:-}" in
     -h|--help) sed -n '2,3p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     ""|aisha|--aisha) ;;                      # old spellings still work
+    --force) FORCE=1 ;;
     *) die "unknown option: $1 (try --help)" ;;
 esac
+
+if [ "$FORCE" -eq 0 ] && dpkg -S /usr/bin/aisha >/dev/null 2>&1; then
+    printf '\033[1;33m%s\033[0m\n' "aisha is installed from the Debian package; installing a second copy here would hide it." \
+        "Update the package instead:  ./update.sh   (or ./install.sh --force for a /usr/local copy anyway)"
+    exit 0
+fi
 
 [ -f "$SRC_AISHA" ] || die "cannot find $SRC_AISHA"
 command -v python3 >/dev/null 2>&1 || die "python3 is required but not installed"
@@ -32,8 +40,4 @@ printf '#!/usr/bin/env python3\nimport sys\nsys.path.insert(0, "%s")\nimport ais
 sudo chmod 0755 "$AISHA_BIN_TARGET"
 sudo python3 -m compileall -q "$AISHA_LIB_DIR" || true
 
-if dpkg -S /usr/bin/aisha >/dev/null 2>&1; then
-    printf '\033[1;33m%s\033[0m\n' "note: the aisha Debian package is also installed (/usr/bin/aisha)." \
-        "      Which one runs depends on PATH; remove one with: sudo apt remove aisha  or  ./uninstall.sh"
-fi
 green "aisha $(python3 "$SRC_AISHA" --version 2>/dev/null | awk '{print $NF}') is installed. Start it with: aisha"
