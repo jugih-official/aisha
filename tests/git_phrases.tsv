@@ -291,3 +291,63 @@ compare main and dev	git diff main dev
 difference between v1.0 and main	git diff v1.0 main
 is everything committed	git status
 do i have uncommitted changes	git status
+# --- starting with git: words are read as a request, git's own syntax runs as typed (BASH)
+git undo the last commit	git reset --soft HEAD~1
+git undo last commit	git reset --soft HEAD~1
+git stage everything	git add -A
+git add everything	git add -A
+git commit everything as "fix"	git add -A ;; git commit -m fix
+git commit all changes	git add -A ;; git commit
+git switch to dev	git switch dev
+git go to dev	git switch dev
+git merge dev into main	git merge dev
+git push my changes	git push
+git push this branch	git push -u origin main
+git pull the latest	git pull
+git pull from origin	git pull origin
+git show me the branches	git branch -a
+git list branches	git branch -a
+git which branch am i on	git branch --show-current
+git delete branch feature-x	git branch -d feature-x
+git new branch login	git switch -c login
+git create branch login	git switch -c login
+git throw away my changes	git restore -- .
+git discard changes in app.py	git restore -- app.py
+git stash my changes	git stash push
+git get my stash back	git stash pop
+git history of app.py	git log ;; app.py
+git commits by T	--author=T
+git last 5 commits	-n 5
+git what changed	git status
+git rename this branch to work	git branch -m work
+git tag this as v2.0	git tag v2.0
+git ignore new.txt	>> .gitignore
+git status	BASH
+git pull	BASH
+git push origin main	BASH
+git commit -m "fix the bug"	BASH
+git checkout dev	BASH
+git add .	BASH
+git add app.py	BASH
+git log --oneline	BASH
+git stash pop	BASH
+git merge dev	BASH
+git switch -c new	BASH
+git show HEAD~1	BASH
+git diff main dev	BASH
+git branch -d feature-x	BASH
+git rebase main	BASH
+git commit these "new image"	git add -A ;; git commit -m 'new image'
+git commit "new image"	git commit -m 'new image'
+git commit app.py "new image"	git commit -m 'new image' ;; app.py
+git commit them "x"	git add -A ;; git commit -m x
+git commit all "release prep"	git add -A ;; git commit -m 'release prep'
+commit these "new image"	git add -A ;; git commit -m 'new image'
+git commit -m "new image"	BASH
+git commit -am "new image"	BASH
+git go back to main	git switch main
+go back to dev	git switch dev
+go to dev	git switch dev
+reset to dev	git reset --hard dev
+roll back to v1.0	git reset --hard v1.0
+git go back to main	git switch main

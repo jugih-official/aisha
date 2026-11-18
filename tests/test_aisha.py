@@ -201,7 +201,7 @@ class TestPhraseCorpus(unittest.TestCase):
 
 def check_phrase(phrase, expected, lab):
     threshold = aisha.DEFAULTS["threshold"]
-    if expected == "!SHELL":
+    if expected in ("!SHELL", "BASH"):
         return None if aisha.looks_like_shell(phrase, None, lab) else "should run as bash"
     if aisha.looks_like_shell(phrase, None, lab):
         return "went to bash"

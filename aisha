@@ -49,7 +49,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.10.0"
+VERSION = "0.10.1"
 NAME = "ai$ha"             # the shell's name as shown: ai shell hybrid alpha. The command stays `aisha`
 TAGLINE = "ai shell hybrid alpha"   # ($ in a command name would be read as a variable by every shell)
 
@@ -5146,6 +5146,8 @@ def h_git(u: Utterance) -> Plan | None:
         return plan(f"git switch --detach {ref(m.group('r'))}", [f"look at {m.group('r')} (detached; 'switch back' returns)"])
     m = re.fullmatch(rf"(?:go|roll|move|reset|revert|return|jump|set\s+(?:the\s+)?branch)\s+(?:back\s+)?(?:to|onto)\s+(?:the\s+)?"
                      rf"(?:commit\s+|tag\s+|version\s+)?(?P<r>{GIT_HASH}|\S+)|(?:go|roll|move|step)\s+back\s+{n_pat}\s+commits?", t)
+    if m and m.group("r") and is_branch(m.group("r")) and not re.search(r"\b(?:roll|reset|revert)\b|\bcommit\b|\btag\b", t):
+        m = None                          # "go to dev" switches to the branch (below), it never resets
     if m and (m.group("n") or is_ref(m.group("r") or "")) and not (m.group("r") or "").lower() in ("origin", "remote", "upstream"):
         target = f"HEAD~{_gnum(m.group('n'))}" if m.group("n") else ref(m.group("r"))
         return plan(f"git reset --hard {target}", [f"the branch and files back to {target}"], change=True,
@@ -5229,7 +5231,7 @@ def h_git(u: Utterance) -> Plan | None:
         rest = m.group("rest") or m.group("rest2") or m.group("rest3") or m.group("rest4") or ""
         mm = re.search(r"\"([^\"]+)\"|'([^']+)'", traw) or re.search(r"\b(?:message|msg|saying|note)\s+(.+)$", traw, re.I)
         msg = next((g for g in mm.groups() if g), None) if mm and re.search(r"message|msg|saying|note|\"|'", rest) else None
-        rtag = traw[low.find(tag):low.find(tag) + len(tag)] if tag in low else tag
+        rtag = orig(tag)
         return plan(f"git tag -a {q(rtag)} -m {q(msg)}" if msg else f"git tag {q(rtag)}",
                     f"tag the current commit as {rtag}" + (f": “{msg}”" if msg else ""))
 
@@ -5272,13 +5274,14 @@ def h_git(u: Utterance) -> Plan | None:
                     warning="! rewrites the last commit: push with --force-with-lease if it was already pushed")
     if re.search(r"\b(?:commit|check\s*in)\b", t) and not re.search(
             r"\b(?:last|latest|previous|recent|undo|revert|show|squash|history|log|graph|by|since|search|which|what|cherry|"
-            r"pushed|unpushed|blame|amend|those|these|tag|apply|pick|copy|look|check\s*out|go|reset|mention|mentions|find|"
+            r"pushed|unpushed|blame|amend|tag|apply|pick|copy|look|check\s*out|go|reset|mention|mentions|find|"
             r"about\s+to|everything\s+committed|made|did|do)\b|\bcommits\b|\b[0-9a-f]{7,40}\b", t) \
             or re.match(r"(?:save|snapshot|record)\s+(?:my\s+|the\s+|all\s+(?:my\s+)?)?(?:work|progress|changes)\b", t):
         msg = message()
         if msg and re.fullmatch(r"(?:everything|all|all\s+(?:the\s+)?changes|my\s+(?:work|changes))", msg, re.I):
             msg = None
-        every = re.search(r"\b(?:everything|all|all\s+(?:my\s+|the\s+)?(?:changes|files|work)|my\s+(?:work|progress)|the\s+work)\b", t) or \
+        every = re.search(r"\b(?:everything|all|all\s+(?:my\s+|the\s+)?(?:changes|files|work)|my\s+(?:work|progress)|the\s+work|"
+                          r"these|those|them|these\s+(?:changes|files))\b", re.sub(r"\"[^\"]*\"|'[^']*'|“[^”]*”", "", t)) or \
             re.match(r"(?:save|snapshot|record)\b", t)
         fs = [f for f in files_in(re.sub(r"\"[^\"]*\"|'[^']*'", "", t)) if not msg or f not in msg]
         msg_part = f" -m {q(msg)}" if msg else ""
@@ -5369,7 +5372,7 @@ def h_git(u: Utterance) -> Plan | None:
                     r"(?:go|move|get)\s+back\s+to\s+(?:the\s+)?(?:previous|last|other|old|former)\s+branch|"
                     r"(?:switch|go|change|move)\s+to\s+(?:the\s+)?(?:previous|last|other|former)\s+branch|(?:the\s+)?previous\s+branch", t):
         return plan("git switch -", "back to the branch you were on before")
-    m = re.fullmatch(r"(?:switch|go|change|move|jump|hop|checkout|check\s+out|get\s+on|work\s+on)\s+(?:over\s+)?(?:to|onto|into|on)?\s*(?:the\s+)?"
+    m = re.fullmatch(r"(?:switch|go|change|move|jump|hop|checkout|check\s+out|get\s+on|work\s+on)\s+(?:over\s+|back\s+)?(?:to|onto|into|on)?\s*(?:the\s+)?"
                      r"(?:branch\s+)?(?P<b>[\w./-]+?)(?:\s+branch)?", t)
     if m and (is_branch(m.group("b")) or re.search(r"\bbranch\b", t)) and m.group("b") not in ("back", "previous", "the"):
         b = m.group("b")
@@ -6414,6 +6417,19 @@ newest oldest recent empty hidden old big
 """.split())
 
 
+# git's own subcommands; after them, these words mean the line is a request in words.
+GIT_SUBCOMMANDS = set("""
+add am annotate apply archive bisect blame branch bundle checkout cherry cherry-pick citool clean clone commit config
+describe diff difftool fetch format-patch fsck gc grep gui help init instaweb log ls-files ls-remote maintenance merge
+mergetool mv notes pull push range-diff rebase reflog remote repack replace request-pull reset restore revert rm
+send-email shortlog show show-branch sparse-checkout stage stash status submodule switch tag version whatchanged worktree
+""".split())
+GIT_PLAIN_WORDS = set("""
+to into onto from with as the my all everything changes change this that last latest previous branch branches called named
+new back me please of by in commits files file and it current these those am i on which what is are any everyone
+everybody up down away aside local remote copy one two three four five six seven eight nine ten
+""".split())
+
 # Replies to nobody: "yes" is also a program that prints y forever.
 CHATTER = re.compile(r"(?:y|n|yes|yeah|yep|yup|no|nope|nah|ok|okay|k|sure|fine|cool|great|nice|thanks|thank\s+you|thx|ty)"
                      r"(?:[\s,]+(?:please|thanks|thank\s+you|sir|mate|man|then))*")
@@ -6461,12 +6477,16 @@ def looks_like_shell(line: str, path_env: str | None = None, cwd: str | None = N
             and any(re.fullmatch(r"[a-z][\w.-]*", t) for t in rest) and toks[0] == "kill"
             and not re.search(r"[|&;<>`$]", line)):
         return False                     # "kill -9 firefox": kill takes numbers, the rules take names
-    if (toks[0] == "git" and cwd and len(rest) >= 2 and not any(t.startswith("-") for t in rest)
-            and set(w.lower() for w in rest[1:]) & {"the", "my", "last", "all", "every", "latest", "previous"}
-            and not re.search(r"[|&;<>`$]", line)):
-        plan = interpret(line, cwd)      # "git revert the last commit"
-        if plan and plan.confidence >= threshold:
-            return False
+    if toks[0] == "git" and cwd and rest and not any(t.startswith("-") for t in rest) \
+            and not re.search(r"[|&;<>`$]", line):
+        # "git switch to dev", "git undo the last commit": words, not git's own syntax.
+        # A real subcommand with names only ("git merge dev", "git add app.py") stays git.
+        words = {w.lower() for w in rest[1:]}
+        quoted_msg = rest[0].lower() == "commit" and re.search(r"[\"'“]", line)    # git commit "new image"
+        if rest[0].lower() not in GIT_SUBCOMMANDS or words & GIT_PLAIN_WORDS or quoted_msg:
+            plan = interpret(line, cwd)
+            if plan and plan.confidence >= threshold:
+                return False
     if toks[0] == "reset" and rest and not any(t.startswith("-") for t in rest):
         return False                     # reset(1) takes no words: "reset app.py" is git
     if toks[0] in ("sort", "cut", "order") and re.search(r"\bby\s+(?:the\s+)?(?:\w+\s+)?(?:column|field)\b", line):

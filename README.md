@@ -152,10 +152,17 @@ About 240 kinds of request, without a model:
     file, set your git name and email, update submodules, clone, init,
     remove untracked files, stop tracking a file
 
+  You can start any of these with `git`: `git undo the last commit`,
+  `git switch to dev`, `git merge dev into main`, and
+  `git commit these "new image"` (a quoted message without `-m`: these,
+  them, all or everything commit every change; a file name commits that
+  file). Words after `git` make it a request; git's own syntax
+  (`git merge dev`, `git add .`, `git commit -m "…"`) runs as typed.
+
   Anything that throws work away or rewrites history shows what it will
   touch and asks `[y/N]`. Commands you type (`git pull`, `git commit -m …`)
   run as they are; `gitpull` and `gti status` are read as `git pull` and
-  `git status`. `tests/git_phrases.tsv` holds 276 wordings checked against a
+  `git status`. `tests/git_phrases.tsv` holds 335 wordings checked against a
   real repository.
 - **Users and desktop** — add or delete a user, make someone an admin, who
   has sudo, a user's groups, who can log in, add to a group, change password,
