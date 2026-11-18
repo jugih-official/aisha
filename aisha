@@ -49,7 +49,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.7.1"
+VERSION = "0.7.2"
 
 # ---- configuration ----------------------------------------------------------
 
@@ -5460,29 +5460,51 @@ class Runtime:
             self.proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                          env=server_env(server), start_new_session=True)
         atexit.register(self.stop)
-        deadline = time.time() + max(30.0, self.cfg["llm_timeout"])
+        began = time.time()
+        deadline = began + max(30.0, self.cfg["llm_timeout"])
         health = f"http://127.0.0.1:{self.port}/health"
+        shown = 0
+        tty = sys.stderr.isatty()
+
+        def log_tail(n: int = 8) -> str:
+            try:
+                with open(log_path, "rb") as f:
+                    f.seek(start_pos)
+                    out = f.read().decode(errors="replace")
+            except OSError:
+                return ""
+            return "\n".join(out.strip().splitlines()[-n:])
+
+        def clear():
+            if tty and shown:
+                sys.stderr.write("\r\033[K")
+                sys.stderr.flush()
+
         while time.time() < deadline:
             if self.proc.poll() is not None:
-                try:
-                    with open(log_path, "rb") as f:
-                        f.seek(start_pos)
-                        out = f.read().decode(errors="replace")
-                except OSError:
-                    out = ""
-                return (f"the model server stopped (exit {self.proc.returncode}); its output:\n"
-                        + "\n".join(out.strip().splitlines()[-8:]))
+                clear()
+                return f"the model server stopped (exit {self.proc.returncode}); its output:\n" + log_tail()
             try:
                 with url_open(health, timeout=2) as r:
                     if r.status == 200:
+                        clear()
                         return ""
             except urllib.error.HTTPError:
                 pass  # 503 while the model loads
             except (urllib.error.URLError, OSError):
                 pass
+            waited = int(time.time() - began)
+            if tty and waited >= 3 and waited != shown:   # a slow first start should not look frozen
+                shown = waited
+                sys.stderr.write(f"\r\033[K{dim(f'  loading the model… {waited}s (up to {int(deadline - began)}s)')}")
+                sys.stderr.flush()
             time.sleep(0.3)
+        clear()
+        tail = log_tail()
         self.stop()
-        return f"the model server did not become ready in time (see {log_path})"
+        return (f"the model server did not become ready in {int(deadline - began)}s. Its last output "
+                f"(full log: {log_path}):\n{tail}" if tail else
+                f"the model server did not become ready in time and printed nothing (see {log_path})")
 
     def stop(self) -> None:
         if self.running():
