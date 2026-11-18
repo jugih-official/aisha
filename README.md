@@ -117,11 +117,48 @@ About 240 kinds of request, without a model:
   | `use dhcp on eno1` | `… ipv4.method auto …` |
   | `bring eno1 down` / `enable eno1` | `nmcli device disconnect eno1` / `nmcli device connect eno1` |
   | `turn wifi off` / `airplane mode on` | `nmcli radio wifi off` / `nmcli radio all off && rfkill block bluetooth` |
-- **Git** (inside a repository) — what changed, recent commits, branch,
-  switch/create branch, commit with a message, push, pull, undo last commit,
-  discard changes, diff of a file, who changed a file, stash, clone, init,
-  show/revert the last commit, undo a pull, squash, blame a line, delete a
-  branch, stop tracking a file, unstage, remove untracked files.
+- **Git** (inside a repository), in everyday words and any order. aisha
+  reads the repository's own branches, remotes and tags, so "merge dev"
+  knows dev is a branch, and it keeps names in the case you typed.
+  - *status and diffs:* what changed, is my repo clean, anything to commit,
+    what's staged / about to commit, changes in a file, since the last
+    commit, between two branches or tags
+  - *staging and committing:* stage a file / everything / my changes,
+    unstage, commit (a file, everything, with a message, "save my work as …"),
+    amend, reword the last message, "I forgot app.py in the last commit"
+  - *push, pull, fetch:* push, push this branch and track it, push a
+    branch, force push (with lease), push tags; pull, pull with rebase, pull a
+    branch, "get the latest", "update my repo from github", fetch, fetch all
+  - *branches:* which branch, list (local, remote, merged, unmerged), create
+    (from a base, with or without switching), switch, switch back, rename,
+    delete (force), delete on the remote
+  - *merge, rebase, cherry-pick:* merge X (into Y), squash merge, "update my
+    branch with main", rebase onto X, "put my commits on top of main",
+    interactive rebase of the last N, cherry-pick, abort / continue (only
+    when one is really in progress), conflicts, keep mine / take theirs, mark
+    resolved
+  - *undo and roll back:* undo the last N commits (keeping or throwing away
+    the changes), revert a commit or the last N, go back N commits or to a
+    commit or tag, look at an old commit, make my branch match the remote,
+    discard changes (all, or in a file), reset everything, restore a file
+    (from N commits ago, a branch, a tag), bring back a deleted file, undo a
+    pull or merge
+  - *stash:* stash (with a message, with new files), list, show, apply, pop,
+    drop, clear
+  - *history:* log, graph, last N, by author, mine, since a time, of a file,
+    who changed a file or line, search messages, which commit added some
+    text, show a commit, who made / what did the last commit, unpushed,
+    incoming, ahead or behind
+  - *tags, remotes and more:* list, create (annotated), delete and push
+    tags; list, add, rename, remove remotes and change their URL; ignore a
+    file, set your git name and email, update submodules, clone, init,
+    remove untracked files, stop tracking a file
+
+  Anything that throws work away or rewrites history shows what it will
+  touch and asks `[y/N]`. Commands you type (`git pull`, `git commit -m …`)
+  run as they are; `gitpull` and `gti status` are read as `git pull` and
+  `git status`. `tests/git_phrases.tsv` holds 276 wordings checked against a
+  real repository.
 - **Users and desktop** — add or delete a user, make someone an admin, who
   has sudo, a user's groups, who can log in, add to a group, change password,
   become root, switch user, open a website or app, web search, screenshot,

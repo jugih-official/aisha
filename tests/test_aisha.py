@@ -1261,6 +1261,89 @@ class TestTypos(LabTest):
             self.assertEqual(sh.handle(line), 0, line)
 
 
+class TestGitPhrases(unittest.TestCase):
+    """tests/git_phrases.tsv against a real repository."""
+
+    @staticmethod
+    def make_repo(root):
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+        run = lambda *a, cwd=None: subprocess.run(a, cwd=cwd, env=env, check=True, capture_output=True)
+        run("git", "init", "-q", "--bare", os.path.join(root, "origin.git"))
+        repo = os.path.join(root, "repo")
+        run("git", "init", "-q", "-b", "main", repo)
+        for k, v in [("user.email", "t@t"), ("user.name", "T")]:
+            run("git", "config", k, v, cwd=repo)
+        with open(os.path.join(repo, "README.md"), "w") as f:
+            f.write("hi\n")
+        with open(os.path.join(repo, "app.py"), "w") as f:
+            f.write("print(1)\n")
+        run("git", "add", ".", cwd=repo)
+        run("git", "commit", "-qm", "first", cwd=repo)
+        run("git", "tag", "v1.0", cwd=repo)
+        with open(os.path.join(repo, "README.md"), "a") as f:
+            f.write("more\n")
+        run("git", "commit", "-qam", "second", cwd=repo)
+        run("git", "branch", "dev", cwd=repo)
+        run("git", "branch", "feature-x", cwd=repo)
+        run("git", "remote", "add", "origin", os.path.join(root, "origin.git"), cwd=repo)
+        run("git", "push", "-q", "-u", "origin", "main", cwd=repo)
+        with open(os.path.join(repo, "app.py"), "a") as f:
+            f.write("print(2)\n")
+        with open(os.path.join(repo, "new.txt"), "w") as f:
+            f.write("new\n")
+        aisha._GIT_REFS_CACHE.clear()
+        return repo
+
+    def setUp(self):
+        if not shutil.which("git"):
+            self.skipTest("git not installed")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = self.make_repo(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_phrases(self):
+        failures = []
+        with open(os.path.join(HERE, "git_phrases.tsv")) as f:
+            rows = [l.rstrip("\n").split("\t") for l in f if l.strip() and not l.startswith("#")]
+        for phrase, expected in rows:
+            problem = check_phrase(phrase, expected, self.repo)
+            if problem:
+                failures.append(f"{phrase!r}: {problem}")
+        self.assertEqual(failures, [], "\n" + "\n".join(failures))
+
+    def test_losing_work_or_rewriting_history_asks(self):
+        for phrase in ["undo the last commit", "delete the last commit", "throw away all changes", "discard changes in app.py",
+                       "reset to origin", "force push", "rebase on main", "amend the last commit", "clear all stashes",
+                       "go back to commit v1.0", "force delete branch feature-x", "delete remote branch feature-x"]:
+            p = aisha.interpret(phrase, self.repo)
+            self.assertTrue(p and p.destructive, phrase)
+        p = aisha.interpret("throw away all changes", self.repo)
+        self.assertIn("status", p.preview)                 # shows what would be lost first
+
+    def test_dangerous_misreadings_stay_fixed(self):
+        cases = {"sync with origin": "git pull", "continue the merge": "git merge --continue",
+                 "tag this commit as v2.0": "git tag v2.0", "is my branch up to date": "git status -sb",
+                 "apply commit abc1234 to this branch": "git cherry-pick abc1234",
+                 "find the commit that mentions login": "--grep=login"}
+        for phrase, frag in cases.items():
+            p = aisha.interpret(phrase, self.repo)
+            self.assertIn(frag, p.command, phrase)
+            self.assertNotIn("reset --hard", p.command, phrase)
+        self.assertEqual(aisha.interpret("abort the merge", self.repo).command, "git status")   # nothing in progress
+
+    def test_typed_git_commands_run_as_typed(self):
+        for line in ["git pull", "git push origin main", "git commit -m x", "git log --oneline"]:
+            self.assertTrue(aisha.looks_like_shell(line, None, self.repo), line)
+
+    def test_outside_a_repository_nothing_is_git(self):
+        with tempfile.TemporaryDirectory() as d:
+            for phrase in ["undo the last commit", "push", "list branches", "stash my changes"]:
+                p = aisha.interpret(phrase, d)
+                self.assertFalse(p and p.command.startswith("git ") and p.confidence >= 0.7, phrase)
+
+
 class zipfile_lab:
     def __init__(self, lab):
         self.lab = lab

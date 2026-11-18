@@ -1,0 +1,293 @@
+# phrase	expected — run against a real repository built by TestGitPhrases.make_repo (tests/test_aisha.py):
+#   branches main (current), dev, feature-x; tag v1.0; remote origin; app.py modified; new.txt untracked
+# status
+git status please	git status
+what changed	git status
+what did i change	git status
+is my repo clean	git status
+any uncommitted changes	git status
+show modified files	git status --short || git status
+what files have i changed	git status --short || git status
+# diff
+show my changes	git diff
+show the diff	git diff
+what changed in app.py	git diff -- app.py
+diff of app.py	git diff -- app.py
+show staged changes	git diff --cached || git diff --staged
+what is staged	git diff --cached || git diff --staged
+compare dev with main	git diff main..dev || git diff dev..main || git diff main...dev || git diff dev main || git diff main dev
+diff between main and dev	git diff main..dev || git diff dev..main || git diff main dev || git diff main...dev
+what changed since the last commit	git diff HEAD
+# stage
+stage app.py	git add -- app.py
+add app.py to git	git add -- app.py
+stage everything	git add -A
+stage all changes	git add -A
+add all files to git	git add -A
+unstage app.py	git restore --staged -- app.py
+unstage everything	git restore --staged -- .
+# commit
+commit with message "fix bug"	git commit -m 'fix bug'
+commit "fix bug"	git commit -m 'fix bug'
+commit everything with message "fix bug"	git add -A ;; git commit -m 'fix bug'
+commit all changes as "fix bug"	git add -A ;; git commit -m 'fix bug'
+save my work as "wip"	git add -A ;; git commit -m wip
+commit app.py with message "fix"	git commit -m fix -- app.py || git add -- app.py && git commit -m fix
+make a commit called "fix typo"	git commit -m 'fix typo'
+amend the last commit	git commit --amend
+change the last commit message to "better"	git commit --amend -m better
+fix the last commit message to "better"	git commit --amend -m better
+add app.py to the last commit	git add -- app.py ;; git commit --amend --no-edit
+# push
+push	git push
+push my changes	git push
+push to origin	git push origin
+push to github	git push
+upload my commits	git push
+push this branch	git push -u origin main || git push -u origin HEAD
+publish this branch	git push -u origin main || git push -u origin HEAD
+push dev to origin	git push origin dev || git push -u origin dev
+push and set upstream	git push -u origin main || git push -u origin HEAD
+force push	git push --force-with-lease
+push the tags	git push --tags || git push origin --tags
+# pull / fetch
+pull	git pull
+pull the latest changes	git pull
+get the latest changes	git pull
+update from remote	git pull
+sync with origin	git pull
+download the latest code	git pull
+pull with rebase	git pull --rebase
+fetch	git fetch
+fetch from origin	git fetch origin
+fetch everything	git fetch --all
+# branches
+list branches	git branch
+show all branches	git branch -a
+show remote branches	git branch -r
+which branch am i on	git branch --show-current
+what branch is this	git branch --show-current
+current branch	git branch --show-current
+create a branch called login	git branch login || git switch -c login
+create branch login and switch to it	git switch -c login
+new branch login	git switch -c login || git branch login
+switch to dev	git switch dev
+go to branch dev	git switch dev
+checkout dev	git switch dev || git checkout dev
+change to the dev branch	git switch dev
+switch back	git switch -
+go back to the previous branch	git switch -
+switch to main	git switch main
+create branch hotfix from dev	git switch -c hotfix dev || git branch hotfix dev
+rename branch dev to develop	git branch -m dev develop
+rename this branch to work	git branch -m work
+delete branch feature-x	git branch -d feature-x
+delete the feature-x branch	git branch -d feature-x
+force delete branch feature-x	git branch -D feature-x
+delete remote branch feature-x	git push origin --delete feature-x
+which branches are merged	git branch --merged
+# merge / rebase
+merge dev	git merge dev
+merge dev into this branch	git merge dev
+merge dev into main	git merge dev
+merge the dev branch	git merge dev
+squash merge feature-x	git merge --squash feature-x
+abort the merge	git merge --abort || git status
+cancel the merge	git merge --abort || git status
+continue the merge	git merge --continue || git commit
+rebase on main	git rebase main
+rebase onto dev	git rebase dev
+rebase this branch on main	git rebase main
+abort the rebase	git rebase --abort || git status
+continue the rebase	git rebase --continue
+which files have conflicts	git diff --name-only --diff-filter=U
+show conflicts	git diff --name-only --diff-filter=U || git diff
+keep my version of app.py	git checkout --ours -- app.py
+use their version of app.py	git checkout --theirs -- app.py
+# undo / roll back
+undo the last commit	git reset --soft HEAD~1
+undo the last 3 commits	git reset --soft HEAD~3
+undo the last commit and throw away the changes	git reset --hard HEAD~1
+roll back the last commit	git reset --soft HEAD~1 || git revert --no-edit HEAD
+roll back to the previous commit	git reset --soft HEAD~1 || git reset --hard HEAD~1 || git revert --no-edit HEAD
+revert the last commit	git revert --no-edit HEAD
+revert commit abc1234	git revert --no-edit abc1234
+discard changes in app.py	git restore -- app.py
+discard my changes to app.py	git restore -- app.py
+throw away all changes	git restore -- . || git checkout -- .
+undo all my changes	git restore -- . || git checkout -- .
+reset everything to the last commit	git reset --hard HEAD || git restore -- .
+reset to origin	git reset --hard origin/main || git reset --hard @{u}
+make my branch match the remote	git reset --hard origin/main || git reset --hard @{u}
+restore app.py from the last commit	git restore -- app.py
+restore app.py from 2 commits ago	git restore --source=HEAD~2 -- app.py
+get back the deleted file README.md	git restore -- README.md
+undo git add	git restore --staged
+undo my last git pull	git reset --keep ORIG_HEAD
+go back to commit abc1234	git switch --detach abc1234 || git checkout abc1234 || git reset --hard abc1234
+# stash
+stash my changes	git stash
+stash	git stash
+stash my changes as "half done"	git stash push -m 'half done'
+put my changes aside	git stash
+stash including untracked files	-u ;; git stash
+list stashes	git stash list
+show my stashes	git stash list
+apply the stash	git stash apply || git stash pop
+pop the stash	git stash pop
+bring back my stashed changes	git stash pop
+drop the stash	git stash drop
+clear all stashes	git stash clear
+# history
+show the history	git log
+recent commits	git log
+last 5 commits	git log ;; -n 5
+show the last commit	git show --stat HEAD || git show HEAD
+commits by T	git log ;; --author=T
+my commits	git log ;; --author=
+commits since yesterday	git log ;; --since=yesterday
+commits from last week	git log ;; --since='1 week ago'
+history of app.py	git log ;; -- app.py
+who changed app.py	git log ;; app.py
+search commits for "fix"	git log ;; --grep=fix
+show commit abc1234	git show abc1234
+show the commit graph	git log ;; --graph
+what will i push	git log ;; @{u}..
+unpushed commits	git log ;; @{u}..
+am i behind the remote	git status -sb
+is my branch up to date	git status -sb
+incoming changes	git fetch ;; ..@{u}
+# tags
+list tags	git tag
+show tags	git tag
+create tag v2.0	git tag v2.0
+tag this commit as v2.0	git tag v2.0
+create tag v2.0 with message "release"	git tag -a v2.0 -m release
+delete tag v1.0	git tag -d v1.0
+push tag v1.0	git push origin v1.0
+# remotes
+show remotes	git remote -v
+list remotes	git remote -v
+add remote upstream https://github.com/x/y.git	git remote add upstream https://github.com/x/y.git
+change the origin url to https://github.com/x/z.git	git remote set-url origin https://github.com/x/z.git
+remove remote upstream	git remote remove upstream
+# misc
+cherry pick abc1234	git cherry-pick abc1234
+apply commit abc1234 to this branch	git cherry-pick abc1234
+ignore new.txt	>> .gitignore ;; new.txt
+add new.txt to gitignore	>> .gitignore ;; new.txt
+stop tracking app.py	git rm --cached -- app.py
+remove untracked files	git clean
+set my git name to Jukka	git config --global user.name Jukka
+set my git email to j@example.com	git config --global user.email j@example.com
+update submodules	git submodule update --init --recursive
+who wrote line 1 of README.md	git blame -L 1,1
+# --- more wordings
+send my commits to the server	git push
+upload everything to github	git push
+push it	git push
+push all my commits	git push
+push my branch	git push -u origin main
+push the dev branch	git push -u origin dev
+get the newest code	git pull
+grab the latest changes from origin	git pull
+update my repo from github	git pull
+pull from origin dev	git pull origin dev
+refresh the repo	git pull
+bring my branch up to date	git pull || git status -sb
+commit my work with the message "done"	git add -A ;; git commit -m done
+save my progress as "checkpoint"	git add -A ;; git commit -m checkpoint
+commit app.py as "small fix"	git commit -m 'small fix' ;; app.py
+check in my changes as "x"	git commit -m x
+commit everything	git add -A && git commit
+commit the staged changes	git commit
+quick commit "typo"	git commit -m typo
+reword the last commit to "new text"	git commit --amend -m 'new text'
+i forgot app.py in the last commit	git add -- app.py ;; git commit --amend --no-edit
+add the new files	git add -A
+stage my changes	git add -A
+stage app.py and README.md	git add -- app.py README.md
+track new.txt	git add -- new.txt
+make a new branch named feature-y	git switch -c feature-y
+start a branch called bugfix off main	git switch -c bugfix main
+branch off main as bugfix	git switch -c bugfix main
+create feature-z branch	git switch -c feature-z
+work on dev	git switch dev
+hop over to the dev branch	git switch dev
+check out branch feature-x	git switch feature-x
+go to the previous branch	git switch -
+what branches do i have	git branch -a
+list all remote branches	git branch -r
+kill the feature-x branch	git branch -d feature-x
+get rid of branch feature-x	git branch -d feature-x
+merge feature-x into dev	git switch dev && git merge feature-x
+bring dev into main	git merge dev
+pull in the changes from dev	git merge dev
+update my branch with main	git merge main
+stop merging	git merge --abort || git status
+rebase my branch onto main	git rebase main
+put my commits on top of main	git rebase main
+squash the last 3 commits	git reset --soft HEAD~3
+interactively rebase the last 4 commits	git rebase -i HEAD~4
+undo my last commit	git reset --soft HEAD~1
+take back the last commit	git reset --soft HEAD~1
+delete the last commit	git reset --hard HEAD~1
+remove the last two commits completely	git reset --hard HEAD~2
+undo the last commit but keep the changes	git reset --soft HEAD~1
+revert the last 2 commits	git revert --no-edit HEAD~2..HEAD
+undo commit abc1234	git revert --no-edit abc1234
+go back 2 commits	git reset --hard HEAD~2
+roll back to v1.0	git reset --hard v1.0
+reset to the tag v1.0	git reset --hard v1.0
+look at commit abc1234	git switch --detach abc1234
+discard everything	git restore -- . || git reset --hard
+throw away my local changes	git restore -- .
+forget my changes	git restore -- .
+undo changes to app.py	git restore -- app.py
+reset app.py	git restore -- app.py
+revert app.py	git restore -- app.py
+restore app.py as it was in v1.0	git restore --source=v1.0 -- app.py
+get app.py from dev	git restore --source=dev -- app.py || git checkout dev -- app.py
+throw away my local commits	git reset --hard @{u}
+make my branch exactly like origin	git reset --hard @{u}
+shelve my changes	git stash push
+stash everything including new files	git stash push -u
+get my stash back	git stash pop
+apply my stashed changes	git stash apply
+delete the stash	git stash drop
+what's in the stash	git stash show -p
+who made the last commit	git log -1 || git show
+show me what the last commit changed	git show
+what did the last commit do	git show
+show log	git log
+commit history	git log
+last ten commits	git log ;; -n 10
+commits in the last 3 days	git log ;; --since='3 days ago'
+commits by alice	git log ;; --author=alice
+find the commit that mentions login	git log ;; --grep=login
+which commit added print	git log ;; -S print
+what's new on origin	git fetch ;; ..@{u}
+how far behind am i	git status -sb
+are there changes i haven't pushed	git log ;; @{u}..
+new tag v3.0	git tag v3.0
+release v3.0	git tag v3.0
+mark this as v3.0	git tag v3.0
+remove the tag v1.0	git tag -d v1.0
+push all tags	git push origin --tags
+where does this repo push	git remote -v
+what is the origin url	git remote -v
+point origin to git@github.com:x/y.git	git remote set-url origin git@github.com:x/y.git
+add a remote called backup at https://example.com/r.git	git remote add backup https://example.com/r.git
+copy commit abc1234 here	git cherry-pick abc1234
+pick abc1234	git cherry-pick abc1234
+ignore the build folder	>> .gitignore ;; build
+make git ignore new.txt	>> .gitignore ;; new.txt
+use my version	git checkout --ours
+take theirs for app.py	git checkout --theirs -- app.py
+mark app.py as resolved	git add -- app.py
+what is staged for the commit	git diff --cached
+what am i about to commit	git diff --cached
+compare main and dev	git diff main dev
+difference between v1.0 and main	git diff v1.0 main
+is everything committed	git status
+do i have uncommitted changes	git status

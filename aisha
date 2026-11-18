@@ -49,7 +49,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.9.2"
+VERSION = "0.10.0"
 NAME = "ai$ha"             # the shell's name as shown: ai shell hybrid alpha. The command stays `aisha`
 TAGLINE = "ai shell hybrid alpha"   # ($ in a command name would be read as a variable by every shell)
 
@@ -4883,6 +4883,685 @@ def h_usb(u: Utterance) -> Plan | None:
 
 
 
+# ---- git, in plain words ----------------------------------------------------------------
+# One handler for the whole of everyday git. It reads the repository's own branches,
+# remotes and tags, so "merge dev" knows dev is a branch, and it picks the pieces out of
+# the sentence (refs, files, a message, a count) instead of matching fixed phrases.
+# Anything that throws work away or rewrites history asks [y/N].
+
+def git_dir(cwd: str) -> str | None:
+    d = cwd
+    while True:
+        g = os.path.join(d, ".git")
+        if os.path.isdir(g):
+            return g
+        if os.path.isfile(g):                      # worktrees and submodules: "gitdir: path"
+            try:
+                with open(g) as f:
+                    line = f.read().strip()
+                if line.startswith("gitdir:"):
+                    p = line[7:].strip()
+                    return p if os.path.isabs(p) else os.path.normpath(os.path.join(d, p))
+            except OSError:
+                return None
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+_GIT_REFS_CACHE: dict = {}
+
+
+def git_refs(cwd: str) -> dict:
+    """{'branches', 'remote_branches', 'remotes', 'tags'} of the repository at cwd (cached for 2 s)."""
+    key = git_dir(cwd) or cwd
+    hit = _GIT_REFS_CACHE.get(key)
+    if hit and time.time() - hit[0] < 2:
+        return hit[1]
+    out = _git_refs(cwd)
+    _GIT_REFS_CACHE[key] = (time.time(), out)
+    return out
+
+
+def _git_refs(cwd: str) -> dict:
+    out = {"branches": set(), "remote_branches": set(), "remotes": set(), "tags": set()}
+    if not shutil.which("git"):
+        return out
+    try:
+        r = subprocess.run(["git", "for-each-ref", "--format=%(refname)"], cwd=cwd, capture_output=True,
+                           text=True, timeout=3)
+        rr = subprocess.run(["git", "remote"], cwd=cwd, capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        return out
+    for ref in r.stdout.split():
+        if ref.startswith("refs/heads/"):
+            out["branches"].add(ref[11:])
+        elif ref.startswith("refs/remotes/") and not ref.endswith("/HEAD"):
+            out["remote_branches"].add(ref[13:])
+        elif ref.startswith("refs/tags/"):
+            out["tags"].add(ref[10:])
+    out["remotes"] = set(rr.stdout.split())
+    return out
+
+
+GIT_NUM = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+           "eight": 8, "nine": 9, "ten": 10}
+GIT_HASH = r"[0-9a-f]{7,40}"
+
+
+def _gnum(s: str | None, default: int = 1) -> int:
+    if not s:
+        return default
+    return int(s) if s.isdigit() else GIT_NUM.get(s, default)
+
+
+def _git_since(when: str) -> str | None:
+    w = when.strip().lower()
+    w = re.sub(r"^(?:the\s+)?", "", w)
+    m = re.fullmatch(r"(?:last|past)\s+(?:(\d+|a|an|one|two|three|four|five|six|seven)\s+)?(day|week|month|year|hour)s?", w)
+    if m:
+        return f"{_gnum(m.group(1))} {m.group(2)}{'s' if _gnum(m.group(1)) > 1 else ''} ago"
+    m = re.fullmatch(r"(\d+|a|an|one|two|three)\s+(day|week|month|year|hour)s?(?:\s+ago)?", w)
+    if m:
+        return f"{_gnum(m.group(1))} {m.group(2)}{'s' if _gnum(m.group(1)) > 1 else ''} ago"
+    if w in ("yesterday", "today", "midnight"):
+        return "midnight" if w == "today" else w
+    if w in ("this week",):
+        return "1 week ago"
+    if w in ("this month",):
+        return "1 month ago"
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", w):
+        return w
+    m = re.fullmatch(r"(monday|tuesday|wednesday|thursday|friday|saturday|sunday)", w)
+    if m:
+        return f"last {w}"
+    return None
+
+
+def h_git(u: Utterance) -> Plan | None:
+    raw = u.raw.strip().rstrip(" ?!.")
+    if not raw or not shutil.which("git") or not git_dir(u.cwd):
+        return None
+    # typed git commands run as they are; "git undo the last commit" is words
+    if re.match(r"git\s+(?:-\S+\s+)*[a-z-]+(?:\s+-|\s*$)", raw) and not re.match(
+            r"git\s+(?:undo|uncommit|rollback|roll|go|show\s+me|what|which|how)\b", raw):
+        return None
+    low = " ".join(raw.lower().split())
+    t = re.sub(r"^(?:git\s+|in\s+git\s*,?\s*|on\s+git\s*,?\s*)", "", low)
+    t = re.sub(r"\s+(?:please|pls|for\s+me|now|thanks)$", "", t)
+    traw = raw[len(raw) - len(t):] if raw.lower().endswith(t) else raw   # same text, original case
+    refs = git_refs(u.cwd)
+    branches, rbranches, remotes, tags = refs["branches"], refs["remote_branches"], refs["remotes"], refs["tags"]
+    rawtok = {tok.lower(): tok for tok in re.findall(r"[\w./~@+^-]+", raw)}
+
+    def orig(x):            # names keep the case they were typed in (README.md, Feature-X)
+        return rawtok.get(x, x) if x else x
+    current = git_branch(u.cwd)
+    remote = "origin" if "origin" in remotes or not remotes else sorted(remotes)[0]
+    gd = git_dir(u.cwd)
+
+    def is_branch(b):
+        b = orig(b)
+        return bool(b) and (b in branches or b in rbranches or any(rb.endswith("/" + b) for rb in rbranches))
+
+    def is_ref(x):
+        x = orig(x)
+        return bool(x) and (is_branch(x) or x in tags or re.fullmatch(GIT_HASH, x) or
+                            re.fullmatch(r"head(?:~\d+|\^+)?", x.lower()) or x.upper() == "HEAD")
+
+    def ref(x):
+        x = orig(x)
+        return "HEAD" + x[4:] if x.lower().startswith("head") else x
+
+    def files_in(text):
+        out = []
+        for tok in re.findall(r"[\w./~@+-]+", text):
+            if tok.lower() in ("git", "the", "a", "all", "file", "files", "changes", "my", "it", "this", "commit", "and"):
+                continue
+            tok = orig(tok)
+            if os.path.exists(os.path.join(u.cwd, os.path.expanduser(tok))):
+                out.append(tok)
+        return out
+
+    def message():
+        m = re.search(r"\"([^\"]*)\"|'([^']*)'|“([^”]*)”", traw)
+        if m:
+            return next(g for g in m.groups() if g is not None)
+        m = re.search(r"\b(?:message|msg|saying|that\s+says|described\s+as|with\s+the\s+text|titled|called|named)\s+(.+)$", traw, re.I)
+        if m:
+            return m.group(1).strip()
+        m = re.search(r"\b(?:as|with)\s+(.+)$", traw, re.I)
+        return m.group(1).strip() if m and not re.search(r"\b(?:all|everything|changes|files?)\s*$", m.group(1), re.I) else None
+
+    def plan(cmd, why, change=False, warning=None, preview=None, conf=1.0):
+        u.text = " " * len(u.text)
+        p = Plan(cmd, "git", why if isinstance(why, list) else [why], destructive=change, warning=warning,
+                 preview=preview, confidence=conf)
+        if not change:
+            p.checked = True
+        return p
+
+    q = shlex.quote
+    in_merge = os.path.exists(os.path.join(gd, "MERGE_HEAD"))
+    in_rebase = os.path.isdir(os.path.join(gd, "rebase-merge")) or os.path.isdir(os.path.join(gd, "rebase-apply"))
+    in_pick = os.path.exists(os.path.join(gd, "CHERRY_PICK_HEAD"))
+
+    # -- abort / continue whatever is in progress
+    m = re.fullmatch(r"(?:abort|cancel|stop|quit|give\s+up(?:\s+on)?|undo|back\s+out\s+of|get\s+out\s+of)\s+(?:the\s+|this\s+|my\s+)?"
+                     r"(merge|merging|rebase|rebasing|cherry[- ]?pick(?:ing)?)", t)
+    if m:
+        what = "merge" if m.group(1).startswith("merg") else "rebase" if m.group(1).startswith("rebas") else "cherry-pick"
+        if what == "merge" and not in_merge:
+            if t.startswith("undo"):
+                return plan("git reset --keep ORIG_HEAD", ["no merge in progress: undo the last merge",
+                            "back to before it, local changes kept"], change=True,
+                            warning="! moves the branch back to before the last merge or pull")
+            return plan("git status", "no merge is in progress, nothing to abort", conf=1.0)
+        if what == "rebase" and not in_rebase:
+            return plan("git status", "no rebase is in progress, nothing to abort", conf=1.0)
+        return plan(f"git {what} --abort", f"abort the {what}: back to how it was before", change=True,
+                    warning=f"! drops what the {what} has done so far")
+    m = re.fullmatch(r"(?:continue|resume|finish|complete|conclude|go\s+on\s+with)\s+(?:the\s+|this\s+|my\s+)?(merge|rebase|cherry[- ]?pick)", t)
+    if m:
+        what = "merge" if m.group(1) == "merge" else "rebase" if m.group(1) == "rebase" else "cherry-pick"
+        return plan(f"git {what} --continue", [f"continue the {what}", "after fixing the conflicts and staging the files"])
+    if re.fullmatch(r"skip\s+(?:this|the\s+current)\s+commit", t) and in_rebase:
+        return plan("git rebase --skip", "skip this commit in the rebase", change=True)
+
+    # -- conflicts
+    if re.search(r"\b(?:which|what|show|list|any|are\s+there)\b.*\bconflict", t) or re.fullmatch(r"(?:the\s+)?conflicts", t):
+        return plan("git diff --name-only --diff-filter=U", "files with merge conflicts")
+    m = re.fullmatch(r"(?:keep|use|take|choose|accept|pick)\s+(?:my|mine|our|ours|local|the\s+local|my\s+own)\s*(?:version|side|changes?|copy)?"
+                     r"(?:\s+(?:of|for|in|on)\s+(?P<f>.+))?|(?:keep|use|take|choose|accept|pick)\s+(?:their|theirs|the\s+other|incoming|remote|the\s+incoming|the\s+remote)"
+                     r"\s*(?:version|side|changes?|copy)?(?:\s+(?:of|for|in|on)\s+(?P<f2>.+))?", t)
+    if m:
+        side = "--ours" if m.group(0).split()[1] in ("my", "mine", "our", "ours", "local", "the") and "other" not in t \
+            and "incoming" not in t and "remote" not in t and "their" not in t else "--theirs"
+        fs = files_in(m.group("f") or m.group("f2") or "")
+        target = " ".join(q(f) for f in fs) if fs else "$(git diff --name-only --diff-filter=U)"
+        return plan(f"git checkout {side} -- {target}", [f"resolve with {'your' if side == '--ours' else 'their'} version",
+                    "then stage the file and continue"], change=True, warning="! replaces the file with one side of the conflict")
+    m = re.fullmatch(r"mark\s+(?P<f>.+?)\s+as\s+(?:resolved|fixed|done)", t)
+    if m and files_in(m.group("f")):
+        return plan("git add -- " + " ".join(q(f) for f in files_in(m.group("f"))), "mark as resolved (stage it)")
+
+    # -- stash
+    if re.search(r"\b(?:list|show|see|view|what\s+(?:are|is))\b.*\bstash(?:es)?\b|^stash(?:es|\s+list)$|^my\s+stashes$", t) and \
+            not re.search(r"\bwhat\s+is\s+in\b|\bcontents?\b|\binside\b", t):
+        return plan("git stash list", "stashed changes")
+    if re.search(r"\b(?:what(?:'s|\s+is)\s+in|contents?\s+of|inside)\s+(?:the\s+|my\s+)?(?:last\s+|latest\s+)?stash\b", t):
+        return plan("git stash show -p", "what the latest stash holds")
+    if re.search(r"\b(?:clear|drop|delete|remove|empty|throw\s+away)\s+(?:all\s+(?:the\s+|my\s+)?|every\s+)stash(?:es)?\b|\bclear\s+(?:the\s+)?stash(?:es)?\b", t):
+        return plan("git stash clear", "delete every stash", change=True, warning="! deletes all stashed changes for good",
+                    preview="git stash list")
+    if re.search(r"\b(?:drop|delete|remove|discard|throw\s+away)\s+(?:the\s+|my\s+|that\s+)?(?:last\s+|latest\s+)?stash\b", t):
+        return plan("git stash drop", "delete the latest stash", change=True, warning="! deletes the latest stash")
+    m = re.search(r"\b(pop|unstash|bring\s+back|restore|get\s+back|reapply|re-apply|apply|recover)\b.*\b(?:stash|stashed)\b|^unstash\b|"
+                  r"\b(?:get|bring)\s+(?:my\s+|the\s+)?stash(?:ed\s+changes)?\s+back\b", t)
+    if m:
+        keep = (m.group(1) or "") in ("apply", "reapply", "re-apply") or re.search(r"\bkeep(?:ing)?\s+(?:the\s+|it|a\s+copy)", t)
+        return plan("git stash apply" if keep else "git stash pop",
+                    "put the stashed changes back" + (", keeping the stash" if keep else " and drop the stash"))
+    if re.match(r"(?:stash|shelve)\b|(?:put|set|move)\s+(?:my\s+|the\s+|these\s+|all\s+)?(?:changes|work|edits)\s+aside\b|"
+                r"save\s+(?:my\s+)?(?:changes|work)\s+for\s+later\b|(?:hide|park)\s+(?:my\s+)?(?:changes|work)\b", t):
+        untracked = " -u" if re.search(r"\b(?:untracked|new\s+files|including\s+new|everything)\b", t) else ""
+        msg = None
+        mm = re.search(r"\"([^\"]+)\"|'([^']+)'", traw) or re.search(r"\b(?:as|called|named|with\s+(?:the\s+)?(?:message|name))\s+(.+)$", traw, re.I)
+        if mm:
+            msg = next(g for g in mm.groups() if g)
+            if re.search(r"\buntracked|new\s+files", msg, re.I):
+                msg = None
+        cmd = f"git stash push{untracked} -m {q(msg)}" if msg else f"git stash push{untracked}"
+        return plan(cmd, "put the changes aside" + (f" as “{msg}”" if msg else "") +
+                    (" (untracked files too)" if untracked else ""))
+
+    # -- undo, roll back, revert, reset, restore
+    n_pat = r"(?P<n>\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten)"
+    m = re.search(rf"\b(?:undo|roll\s*back|rollback|uncommit|take\s+back|cancel|reset|remove|delete|drop|get\s+rid\s+of)\s+(?:the\s+|my\s+)?"
+                  rf"(?:last|latest|previous|recent)\s+(?:{n_pat}\s+)?commits?\b", t)
+    if m and not t.startswith("revert"):
+        n = _gnum(m.group("n"))
+        lose = re.search(r"\b(?:throw(?:ing)?\s+away|discard(?:ing)?|delete|lose|losing|drop(?:ping)?|remove|wipe|without\s+keeping|"
+                         r"get\s+rid\s+of|completely|entirely|hard|permanently|for\s+good)\b", t[m.end():]) or \
+            re.match(r"(?:delete|remove|drop|get\s+rid\s+of)\b", t)
+        if lose:
+            return plan(f"git reset --hard HEAD~{n}", [f"remove the last {n} commit{'s' if n > 1 else ''}", "and throw away their changes"],
+                        change=True, preview=f"git log --oneline -n {n}",
+                        warning=f"! deletes the commit{'s' if n > 1 else ''} above and every uncommitted change")
+        return plan(f"git reset --soft HEAD~{n}", [f"undo the last {n} commit{'s' if n > 1 else ''}",
+                    "the changes stay staged, nothing is lost"], change=True, preview=f"git log --oneline -n {n}",
+                    warning="! rewrites history: don't do this to commits you already pushed (use 'revert the last commit')")
+    if re.fullmatch(r"uncommit", t):
+        return plan("git reset --soft HEAD~1", ["undo the last commit", "the changes stay staged"], change=True)
+    m = re.fullmatch(rf"revert\s+(?:the\s+)?(?:last|latest|previous)\s+{n_pat}\s+commits", t)
+    if m:
+        n = _gnum(m.group("n"))
+        return plan(f"git revert --no-edit HEAD~{n}..HEAD", f"new commits that undo the last {n}", change=True)
+    m = re.fullmatch(rf"(?:revert|undo)\s+(?:the\s+)?(?:commit\s+)?(?P<r>{GIT_HASH})", t)
+    if m:
+        return plan(f"git revert --no-edit {m.group('r')}", f"a new commit that undoes {m.group('r')}", change=True)
+    m = re.fullmatch(rf"(?:look\s+at|check\s*out|visit|inspect|open|switch\s+to|go\s+to)\s+(?:the\s+)?(?:old\s+)?commit\s+(?P<r>{GIT_HASH}|\S+)", t)
+    if m and is_ref(m.group("r")):
+        return plan(f"git switch --detach {ref(m.group('r'))}", [f"look at {m.group('r')} (detached; 'switch back' returns)"])
+    m = re.fullmatch(rf"(?:go|roll|move|reset|revert|return|jump|set\s+(?:the\s+)?branch)\s+(?:back\s+)?(?:to|onto)\s+(?:the\s+)?"
+                     rf"(?:commit\s+|tag\s+|version\s+)?(?P<r>{GIT_HASH}|\S+)|(?:go|roll|move|step)\s+back\s+{n_pat}\s+commits?", t)
+    if m and (m.group("n") or is_ref(m.group("r") or "")) and not (m.group("r") or "").lower() in ("origin", "remote", "upstream"):
+        target = f"HEAD~{_gnum(m.group('n'))}" if m.group("n") else ref(m.group("r"))
+        return plan(f"git reset --hard {target}", [f"the branch and files back to {target}"], change=True,
+                    preview=f"git log --oneline {target}..HEAD", warning="! deletes the commits listed above and every uncommitted change")
+    if re.fullmatch(r"(?:roll|go|step)\s+back\s+(?:to\s+)?(?:the\s+)?(?:previous|last|prior|earlier)\s+commit|(?:go|step)\s+back\s+(?:one|a)\s+commit", t):
+        return plan("git reset --hard HEAD~1", ["back to the commit before the last", "the last commit and uncommitted changes are thrown away"],
+                    change=True, preview="git log --oneline -n 1", warning="! deletes the last commit and every uncommitted change")
+    if re.search(r"\b(?:reset|match|matches|same\s+as|exactly\s+like|identical\s+to)\b.*\b(?:origin|remote|upstream|server|github)\b"
+                 r"(?!\s+\S+\s+(?:url|branch))|\b(?:throw\s+away|discard|drop|delete|get\s+rid\s+of)\s+(?:my\s+|all\s+)?(?:local|unpushed)\s+commits", t) \
+            and "url" not in t and not re.search(r"\bremote\s+branch", t):
+        return plan("git fetch && git reset --hard @{u}", ["make this branch exactly like its remote branch"], change=True,
+                    preview="git fetch -q && git log --oneline @{u}..HEAD; git status --short",
+                    warning="! throws away local commits (listed above) and every uncommitted change")
+    m = re.fullmatch(r"(?:reset|restore|revert|clean)\s+(?:everything|all|the\s+(?:repo|working\s+tree|working\s+copy))\s+(?:to|back\s+to)\s+(?:the\s+)?(?:last|latest)\s+commit|"
+                     r"(?:reset|undo)\s+(?:hard|everything)", t)
+    if m:
+        return plan("git reset --hard HEAD", "every file back to the last commit", change=True, preview="git status --short",
+                    warning="! throws away every uncommitted change, staged or not")
+    m = re.fullmatch(r"(?:discard|throw\s+away|undo|drop|lose|remove|delete|get\s+rid\s+of|reset|revert|cancel|forget)\s+(?:all\s+(?:of\s+)?)?(?:the\s+|my\s+)?"
+                     r"(?:local\s+|uncommitted\s+|current\s+|unstaged\s+|unsaved\s+)?(?:changes|edits|modifications|work)(?:\s+(?:here|in\s+this\s+repo))?|"
+                     r"(?:discard|throw\s+away|drop|lose)\s+everything(?:\s+(?:i\s+changed|uncommitted))?", t)
+    if m:
+        return plan("git restore -- .", "throw away the unstaged changes in every tracked file", change=True,
+                    preview="git status --short", warning="! the changes listed above are lost for good")
+    m = re.fullmatch(r"(?:discard|throw\s+away|undo|drop|lose|remove|reset|revert|cancel|forget)\s+(?:all\s+)?(?:the\s+|my\s+)?(?:local\s+|uncommitted\s+)?"
+                     r"(?:changes|edits|modifications)\s+(?:in|to|of|on|for)\s+(?P<f>.+)|(?:reset|revert)\s+(?P<f2>\S+)", t)
+    if m and files_in(m.group("f") or m.group("f2") or ""):
+        fs = files_in(m.group("f") or m.group("f2"))
+        return plan("git restore -- " + " ".join(q(f) for f in fs), f"{', '.join(fs)} back to the last commit", change=True,
+                    preview="git diff --stat -- " + " ".join(q(f) for f in fs), warning="! its uncommitted changes are lost")
+    m2 = re.fullmatch(r"(?:get|take|grab|copy|fetch|bring)\s+(?:the\s+)?(?:file\s+)?(?P<f>[\w./~@+-]+)\s+(?:from|out\s+of)\s+(?:the\s+)?(?:branch\s+|commit\s+|tag\s+)?(?P<r>[\w./~^-]+)(?:\s+branch)?", t)
+    if m2 and is_ref(m2.group("r")) and not is_ref(m2.group("f")):
+        f, r = orig(m2.group("f")), ref(m2.group("r"))
+        return plan(f"git restore --source={r} -- {q(f)}", f"{f} as it is in {r}", change=os.path.exists(os.path.join(u.cwd, f)),
+                    warning=f"! replaces the current {f}" if os.path.exists(os.path.join(u.cwd, f)) else None)
+    m = re.fullmatch(rf"(?:restore|recover|get\s+back|bring\s+back|undelete)\s+(?:the\s+)?(?:deleted\s+|lost\s+|old\s+)?(?:file\s+)?(?P<f>[\w./~@+-]+)"
+                     rf"(?:\s+(?:from|as\s+(?:it\s+was|of)\s+(?:in)?)\s+(?:the\s+)?(?:(?P<n>\d+|one|two|three|four|five)\s+commits?\s+ago|(?:last|latest)\s+commit|"
+                     rf"commit\s+(?P<r>\S+)|(?P<r2>\S+)))?", t)
+    if m and ("." in m.group("f") or "/" in m.group("f") or os.path.exists(os.path.join(u.cwd, m.group("f")))) and \
+            not re.search(r"stash", t):
+        f = orig(m.group("f"))
+        src = f"HEAD~{_gnum(m.group('n'))}" if m.group("n") else (m.group("r") or m.group("r2"))
+        if src and not m.group("n") and not is_ref(src):
+            return None
+        if src:
+            return plan(f"git restore --source={ref(src)} -- {q(f)}", f"{f} as it was in {ref(src)}", change=True,
+                        warning=f"! replaces the current {f}")
+        if os.path.exists(os.path.join(u.cwd, f)):
+            return plan(f"git restore -- {q(f)}", f"{f} back to the last commit", change=True, warning="! its uncommitted changes are lost")
+        return plan(f"git restore -- {q(f)} 2>/dev/null || git checkout \"$(git rev-list -n 1 HEAD -- {q(f)})~1\" -- {q(f)}",
+                    f"bring back the deleted {f} from the last commit that had it")
+
+    # -- staging
+    m = re.fullmatch(r"(?:stage|add|track|git\s+add)\s+(?:all|everything|all\s+(?:the\s+|my\s+)?(?:changes|files|changed\s+files|modified\s+files|new\s+files))"
+                     r"(?:\s+(?:to\s+(?:git|the\s+(?:index|stage|staging\s+area|commit))|for\s+(?:the\s+)?(?:next\s+)?commit))?", t)
+    m = m or re.fullmatch(r"(?:stage|add|track)\s+(?:the\s+|my\s+)?(?:new|untracked|changed|modified|edited)?\s*(?:files|changes|work)", t)
+    if m and not re.search(r"\b(?:zip|tar|archive)\b", t):
+        return plan("git add -A", "stage every change, new files too")
+    m = re.fullmatch(r"(?P<v>stage|track|add)\s+(?P<f>.+?)(?P<s>\s+(?:to\s+(?:git|the\s+(?:index|stage|staging\s+area|repo|repository)|version\s+control)|for\s+(?:the\s+)?(?:next\s+)?commit))?", t)
+    if m and (m.group("v") != "add" or m.group("s") or low.startswith("git ")) and files_in(m.group("f")) \
+            and not re.search(r"\b(?:last|previous)\s+commit\b", t):
+        fs = files_in(m.group("f"))
+        return plan("git add -- " + " ".join(q(f) for f in fs), f"stage {', '.join(fs)}")
+
+    # -- tags (before push: "push the tags")
+    if re.search(r"\bpush\b.*\btags\b|\bpush\s+all\s+(?:the\s+)?tags\b", t):
+        return plan(f"git push {remote} --tags", "push every tag")
+    m = re.fullmatch(r"push\s+(?:the\s+)?tag\s+(?P<t>\S+)", t)
+    if m:
+        return plan(f"git push {remote} {q(m.group('t'))}", f"push the tag {m.group('t')}")
+    if re.search(r"\b(?:list|show|what|which|all)\b.*\btags\b|^tags$", t):
+        return plan("git tag --list --sort=-creatordate", "tags, newest first")
+    m = re.fullmatch(r"(?:delete|remove|drop)\s+(?:the\s+)?tag\s+(?P<t>\S+)", t)
+    if m:
+        return plan(f"git tag -d {q(m.group('t'))}", f"delete the tag {m.group('t')} here (not on the remote)", change=True)
+    m = re.fullmatch(r"(?:create|make|add|new|set)\s+(?:a\s+)?(?:new\s+)?(?:release\s+)?tag\s+(?:called\s+|named\s+)?(?P<t>[\w./-]+)(?P<rest>.*)|"
+                     r"tag\s+(?:this|the\s+(?:current|last|latest)|current|head|it)\s*(?:commit|version|release)?\s+(?:as|with)\s+(?P<t2>[\w./-]+)(?P<rest2>.*)|"
+                     r"tag\s+(?P<t3>v?\d[\w./-]*)(?P<rest3>.*)|(?:mark|release)\s+(?:this\s+)?(?:as\s+|version\s+)?(?:version\s+)?(?P<t4>v?\d[\w./-]*)(?P<rest4>.*)", t)
+    if m:
+        tag = m.group("t") or m.group("t2") or m.group("t3") or m.group("t4")
+        rest = m.group("rest") or m.group("rest2") or m.group("rest3") or m.group("rest4") or ""
+        mm = re.search(r"\"([^\"]+)\"|'([^']+)'", traw) or re.search(r"\b(?:message|msg|saying|note)\s+(.+)$", traw, re.I)
+        msg = next((g for g in mm.groups() if g), None) if mm and re.search(r"message|msg|saying|note|\"|'", rest) else None
+        rtag = traw[low.find(tag):low.find(tag) + len(tag)] if tag in low else tag
+        return plan(f"git tag -a {q(rtag)} -m {q(msg)}" if msg else f"git tag {q(rtag)}",
+                    f"tag the current commit as {rtag}" + (f": “{msg}”" if msg else ""))
+
+    # -- cherry-pick
+    m = re.fullmatch(rf"(?:cherry[- ]?pick|pick|copy|apply|take|bring\s+over|grab)\s+(?:the\s+)?(?:commit\s+)?(?P<r>{GIT_HASH})(?:\s+(?:to|onto|into|on|here|over).*)?", t)
+    if m:
+        return plan(f"git cherry-pick {m.group('r')}", f"copy commit {m.group('r')} onto {current}")
+
+
+    # -- about the last commit
+    if re.fullmatch(r"(?:who|when)\s+(?:made|did|wrote|authored|pushed)\s+(?:the\s+)?(?:last|latest|previous)\s+commit", t):
+        return plan("git log -1 --format='%an <%ae>, %ar: %s'", "who made the last commit, and when")
+    if re.fullmatch(r"what\s+(?:did|does)\s+(?:the\s+)?(?:last|latest|previous)\s+commit\s+(?:do|change|contain)|"
+                    r"(?:show\s+(?:me\s+)?)?what\s+(?:the\s+)?(?:last|latest|previous)\s+commit\s+(?:changed|did|contains)", t):
+        return plan("git show --stat HEAD", "the last commit: message and the files it changed")
+    if re.search(r"\babout\s+to\s+commit\b|\bstaged\s+for\s+(?:the\s+)?commit\b", t):
+        return plan("git diff --cached", "what is staged for the next commit")
+    if re.fullmatch(r"is\s+everything\s+committed|(?:have|did)\s+i\s+commit(?:ted)?\s+everything|is\s+there\s+anything\s+(?:left\s+)?to\s+commit", t):
+        return plan("git status --short && git diff --stat", "anything not committed yet")
+    # -- commit
+    m = re.search(r"\b(?:change|fix|edit|update|reword|correct|rename|rewrite)\s+(?:the\s+)?(?:last\s+|previous\s+|latest\s+)?commit(?:'s)?\s+message\b|"
+                  r"\breword\s+(?:the\s+)?(?:last\s+|previous\s+|latest\s+)?commit\b", t)
+    if m:
+        mm = re.search(r"\"([^\"]+)\"|'([^']+)'|“([^”]+)”", raw) or re.search(r"\b(?:message|commit)\s+to\s+(.+)$", raw, re.I)
+        msg = next((g for g in mm.groups() if g), None) if mm else None
+        return plan(f"git commit --amend -m {q(msg)}" if msg else "git commit --amend",
+                    "change the last commit's message" + (f" to “{msg}”" if msg else " (opens the editor)"), change=True,
+                    warning="! rewrites the last commit: push with --force-with-lease if it was already pushed")
+    m = re.fullmatch(r"(?:add|put|include)\s+(?P<f>.+?)\s+(?:to|in|into)\s+(?:the\s+)?(?:last|previous|latest)\s+commit|"
+                     r"i\s+forgot\s+(?:to\s+(?:add|include)\s+)?(?P<f2>.+?)\s+(?:in|from)\s+(?:the\s+)?(?:last|previous|latest)\s+commit", t)
+    if m and not m.group("f"):
+        m = re.fullmatch(r"i\s+forgot\s+(?:to\s+(?:add|include)\s+)?(?P<f>.+?)\s+(?:in|from)\s+(?:the\s+)?(?:last|previous|latest)\s+commit", t)
+    if m and files_in(m.group("f")):
+        fs = files_in(m.group("f"))
+        return plan("git add -- " + " ".join(q(f) for f in fs) + " && git commit --amend --no-edit",
+                    f"add {', '.join(fs)} to the last commit", change=True, warning="! rewrites the last commit")
+    if re.search(r"\bamend\b", t):
+        return plan("git commit --amend --no-edit", ["add the staged changes to the last commit",
+                    "to change its message: 'change the last commit message to …'"], change=True,
+                    warning="! rewrites the last commit: push with --force-with-lease if it was already pushed")
+    if re.search(r"\b(?:commit|check\s*in)\b", t) and not re.search(
+            r"\b(?:last|latest|previous|recent|undo|revert|show|squash|history|log|graph|by|since|search|which|what|cherry|"
+            r"pushed|unpushed|blame|amend|those|these|tag|apply|pick|copy|look|check\s*out|go|reset|mention|mentions|find|"
+            r"about\s+to|everything\s+committed|made|did|do)\b|\bcommits\b|\b[0-9a-f]{7,40}\b", t) \
+            or re.match(r"(?:save|snapshot|record)\s+(?:my\s+|the\s+|all\s+(?:my\s+)?)?(?:work|progress|changes)\b", t):
+        msg = message()
+        if msg and re.fullmatch(r"(?:everything|all|all\s+(?:the\s+)?changes|my\s+(?:work|changes))", msg, re.I):
+            msg = None
+        every = re.search(r"\b(?:everything|all|all\s+(?:my\s+|the\s+)?(?:changes|files|work)|my\s+(?:work|progress)|the\s+work)\b", t) or \
+            re.match(r"(?:save|snapshot|record)\b", t)
+        fs = [f for f in files_in(re.sub(r"\"[^\"]*\"|'[^']*'", "", t)) if not msg or f not in msg]
+        msg_part = f" -m {q(msg)}" if msg else ""
+        if fs:
+            return plan("git add -- " + " ".join(q(f) for f in fs) + f" && git commit{msg_part} -- " + " ".join(q(f) for f in fs),
+                        f"commit {', '.join(fs)}" + (f": “{msg}”" if msg else ""))
+        if every:
+            return plan(f"git add -A && git commit{msg_part}", "commit every change, new files too" + (f": “{msg}”" if msg else ""))
+        if not msg and re.search(r"\bmy\s+changes\b", t):
+            return plan("git commit -a", "commit the changes to tracked files (opens the editor for the message)")
+        return plan(f"git commit{msg_part}", "commit what is staged" + (f": “{msg}”" if msg else " (opens the editor for the message)"))
+
+    # -- remotes (before push/pull: "add remote", "remove remote")
+    m = re.fullmatch(r"add\s+(?:a\s+)?(?:new\s+)?remote\s+(?:called\s+|named\s+)?(?P<n>[\w.-]+)\s+(?:with\s+(?:the\s+)?url\s+|at\s+|=\s*|pointing\s+to\s+|as\s+)?(?P<url>\S+)", t)
+    if m:
+        url = traw[low.find(m.group("url")):][:len(m.group("url"))]
+        return plan(f"git remote add {m.group('n')} {q(url)}", f"add the remote {m.group('n')}")
+    m = re.fullmatch(r"(?:change|set|update|point|switch)\s+(?:the\s+)?(?:(?P<n>[\w.-]+)\s+)?(?:remote\s+)?url(?:\s+of\s+(?:the\s+)?(?P<n2>[\w.-]+))?\s+to\s+(?P<url>\S+)|"
+                     r"(?:point|set)\s+(?P<n3>[\w.-]+)\s+(?:remote\s+)?to\s+(?P<url2>\S+://\S+|\S+@\S+:\S+)", t)
+    if m:
+        n = m.group("n") or m.group("n2") or m.group("n3")
+        n = n if n and n in remotes else remote
+        u_ = m.group("url") or m.group("url2")
+        url = traw[low.find(u_):][:len(u_)]
+        return plan(f"git remote set-url {n} {q(url)}", f"{n} → {url}", change=True)
+    m = re.fullmatch(r"(?:remove|delete|drop)\s+(?:the\s+)?remote\s+(?P<n>[\w.-]+)", t)
+    if m:
+        return plan(f"git remote remove {m.group('n')}", f"remove the remote {m.group('n')} (the repository there is untouched)", change=True)
+    m = re.fullmatch(r"rename\s+(?:the\s+)?remote\s+(?P<a>[\w.-]+)\s+to\s+(?P<b>[\w.-]+)", t)
+    if m:
+        return plan(f"git remote rename {m.group('a')} {m.group('b')}", f"rename the remote {m.group('a')} to {m.group('b')}")
+    if re.search(r"\b(?:list|show|what|which|my)\b.*\bremotes?\b(?!\s+branch)|^remotes?$|\bwhere\s+(?:does\s+(?:this|it)\s+(?:repo\s+)?push|is\s+(?:the\s+)?(?:origin|remote))\b|"
+                 r"\b(?:origin|remote)\s+url\b|\burl\s+of\s+(?:the\s+)?(?:origin|remote|repo)\b", t) and not re.search(r"\bbranch", t):
+        return plan("git remote -v", "remotes and their addresses")
+
+    # -- branches
+    m = re.search(r"\b(?:delete|remove|drop|get\s+rid\s+of)\s+(?:the\s+)?(?:remote\s+branch\s+(?P<b>[\w./-]+)|(?P<b2>[\w./-]+)\s+(?:branch\s+)?(?:on|from)\s+(?:the\s+)?(?:remote|origin|github|gitlab|server))", t)
+    if m:
+        b = m.group("b") or m.group("b2")
+        b = b.split("/", 1)[1] if "/" in b and b.split("/", 1)[0] in remotes else b
+        return plan(f"git push {remote} --delete {q(b)}", f"delete the branch {b} on {remote}", change=True,
+                    warning=f"! deletes {b} on {remote} for everyone")
+    m = re.fullmatch(r"(?:force\s+)?(?:delete|remove|drop|get\s+rid\s+of|kill|nuke|destroy|trash)\s+(?:the\s+)?(?:local\s+)?(?:branch\s+(?P<b>[\w./-]+)|(?P<b2>[\w./-]+)\s+branch)(?P<rest>.*)", t)
+    if m:
+        b = orig(m.group("b") or m.group("b2"))
+        force = re.search(r"\bforce\b|\banyway\b|\beven\s+if\b|\bunmerged\b|-d\b", t)
+        if b == current:
+            return plan("git branch", f"{b} is the branch you are on: switch to another one first", conf=0.9)
+        return plan(f"git branch {'-D' if force else '-d'} {q(b)}", f"delete the branch {b}" +
+                    ("" if force else " (refused if it is not merged; say 'force delete' to delete anyway)"), change=True)
+    m = re.fullmatch(r"rename\s+(?:this|the\s+current|my|current)\s+branch\s+(?:to|as|into)\s+(?P<b2>[\w./-]+)|"
+                     r"rename\s+(?:the\s+)?(?:branch\s+)?(?P<a>[\w./-]+?)(?:\s+branch)?\s+(?:to|as|into)\s+(?P<b>[\w./-]+)", t)
+    if m:
+        if m.group("b2"):
+            return plan(f"git branch -m {q(m.group('b2'))}", f"rename {current} to {m.group('b2')}")
+        if is_branch(m.group("a")):
+            return plan(f"git branch -m {q(m.group('a'))} {q(m.group('b'))}", f"rename {m.group('a')} to {m.group('b')}")
+    mb = re.fullmatch(r"branch\s+off\s+(?:of\s+)?(?:the\s+)?(?P<base>[\w./-]+)\s+(?:as|called|named|into)\s+(?P<n>[\w./-]+)", t)
+    if mb and is_ref(mb.group("base")):
+        return plan(f"git switch -c {q(orig(mb.group('n')))} {q(orig(mb.group('base')))}", f"create {mb.group('n')} from {mb.group('base')} and switch to it")
+    m = re.search(r"\b(?:create|make|start|new|open|branch\s+off|add)\s+(?:a\s+)?(?:new\s+)?branch\s+(?:called\s+|named\s+)?(?P<n>[\w./-]+)"
+                  r"(?:\s+(?:from|off(?:\s+of)?|based\s+on|on\s+top\s+of|out\s+of)\s+(?:the\s+)?(?:branch\s+)?(?P<base>[\w./-]+))?", t) or \
+        re.fullmatch(r"(?:new|create)\s+(?P<n>[\w./-]+)\s+branch(?:\s+(?:from|off)\s+(?P<base>[\w./-]+))?", t)
+    if m and m.group("n") not in ("called", "named", "and", "from"):
+        base = m.group("base")
+        if base and not is_ref(base):
+            return None
+        stay = re.search(r"\b(?:but\s+)?(?:stay|don'?t\s+switch|without\s+switching|keep\s+(?:me\s+)?on)\b", t)
+        if stay:
+            return plan(f"git branch {q(m.group('n'))}" + (f" {q(base)}" if base else ""), f"create {m.group('n')}, stay on {current}")
+        return plan(f"git switch -c {q(m.group('n'))}" + (f" {q(base)}" if base else ""),
+                    f"create {m.group('n')}" + (f" from {base}" if base else "") + " and switch to it")
+    if re.search(r"\b(?:which|what)\s+branch\b|\bcurrent\s+branch\b|\bbranch\s+(?:am\s+i|are\s+we)\s+on\b|\bon\s+which\s+branch\b|"
+                 r"\bwhat\s+is\s+this\s+branch\b|\bwhere\s+am\s+i\s+in\s+git\b", t) and not re.search(r"\bbranches\b", t):
+        return plan("git branch --show-current", "the branch you are on")
+    if re.search(r"\bbranches\b", t) and re.search(r"\b(?:list|show|see|view|what|which|all|my|every|are)\b|^branches$", t + " ") \
+            or re.fullmatch(r"(?:the\s+)?branches", t):
+        if re.search(r"\b(?:not|un)[- ]?merged\b", t):
+            return plan("git branch --no-merged", "branches not merged into this one")
+        if re.search(r"\bmerged\b", t):
+            return plan("git branch --merged", "branches already merged into this one")
+        if re.search(r"\b(?:remote|origin|server|github|gitlab)\b", t) and not re.search(r"\blocal\b|\bincluding\b", t):
+            return plan("git branch -r", "branches on the remote")
+        if re.search(r"\b(?:all|every|including\s+remote|local\s+and\s+remote)\b", t):
+            return plan("git branch -a", "every branch, local and remote")
+        return plan("git branch -a", "every branch, local and remote")
+    if re.fullmatch(r"(?:switch|change|jump|hop)\s+back(?:\s+to\s+(?:the\s+)?(?:previous|last|other|old|former)\s+branch)?|"
+                    r"(?:go|move|get)\s+back\s+to\s+(?:the\s+)?(?:previous|last|other|old|former)\s+branch|"
+                    r"(?:switch|go|change|move)\s+to\s+(?:the\s+)?(?:previous|last|other|former)\s+branch|(?:the\s+)?previous\s+branch", t):
+        return plan("git switch -", "back to the branch you were on before")
+    m = re.fullmatch(r"(?:switch|go|change|move|jump|hop|checkout|check\s+out|get\s+on|work\s+on)\s+(?:over\s+)?(?:to|onto|into|on)?\s*(?:the\s+)?"
+                     r"(?:branch\s+)?(?P<b>[\w./-]+?)(?:\s+branch)?", t)
+    if m and (is_branch(m.group("b")) or re.search(r"\bbranch\b", t)) and m.group("b") not in ("back", "previous", "the"):
+        b = m.group("b")
+        if not is_branch(b):
+            return plan("git branch -a", f"there is no branch {b}: say 'create branch {b}' to make it", conf=0.9)
+        b = b.split("/", 1)[1] if "/" in b and b.split("/", 1)[0] in remotes and b.split("/", 1)[1] not in branches else b
+        b = orig(b)
+        return plan(f"git switch {q(b)}", f"switch to {b}")
+
+    # -- merge, rebase, cherry-pick
+    m = re.search(r"\bsquash[- ]?merge\s+(?:the\s+)?(?:branch\s+)?(?P<b>[\w./-]+)|\bmerge\s+(?:the\s+)?(?:branch\s+)?(?P<b2>[\w./-]+?)(?:\s+branch)?\s+(?:as|with)\s+(?:a\s+)?squash", t)
+    if m and is_ref(m.group("b") or m.group("b2")):
+        b = m.group("b") or m.group("b2")
+        return plan(f"git merge --squash {q(b)}", [f"{b}'s changes as one set, staged here", "then commit them"])
+    m = re.fullmatch(r"merge\s+(?:in\s+)?(?:the\s+)?(?:branch\s+)?(?P<a>[\w./-]+?)(?:\s+branch)?\s+(?:into|to|onto|in|with)\s+(?:the\s+)?(?:branch\s+)?(?P<b>[\w./-]+?)(?:\s+branch)?|"
+                     r"(?:bring|put)\s+(?:the\s+)?(?:changes\s+(?:from|of)\s+)?(?:branch\s+)?(?P<a2>[\w./-]+?)(?:\s+branch)?\s+into\s+(?:the\s+)?(?:branch\s+)?(?P<b2>[\w./-]+?)(?:\s+branch)?", t)
+    if m:
+        a, b = m.group("a") or m.group("a2"), m.group("b") or m.group("b2")
+        if is_ref(a) and (b in ("this", "here", "current", "mine", current) or is_branch(b)):
+            if b in ("this", "here", "current", "mine", current):
+                return plan(f"git merge {q(a)}", f"merge {a} into {current}")
+            return plan(f"git switch {q(b)} && git merge {q(a)}", f"switch to {b} and merge {a} into it")
+    m = re.fullmatch(r"merge\s+(?:in\s+)?(?:the\s+)?(?:latest\s+)?(?:changes\s+from\s+)?(?:branch\s+)?(?P<a>[\w./-]+?)(?:\s+branch)?"
+                     r"(?:\s+(?:in|here|into\s+(?:this|the\s+current|my)(?:\s+branch)?|into\s+mine))?|"
+                     r"(?:update|sync|refresh)\s+(?:my\s+|this\s+)?(?:branch\s+)?(?:with|from)\s+(?:the\s+)?(?:latest\s+)?(?:branch\s+)?(?P<a2>[\w./-]+?)(?:\s+branch)?|"
+                     r"(?:get|bring\s+in|pull\s+in)\s+(?:the\s+)?(?:latest\s+)?changes\s+from\s+(?:the\s+)?(?:branch\s+)?(?P<a3>[\w./-]+?)(?:\s+branch)?", t)
+    if m:
+        a = m.group("a") or m.group("a2") or m.group("a3")
+        if a in remotes or a in ("remote", "upstream", "server", "github"):
+            pass                                   # "sync with origin" is a pull, below
+        elif is_ref(a):
+            return plan(f"git merge {q(a)}", f"merge {a} into {current}")
+    mr = re.fullmatch(r"(?:put|move|replay|place)\s+(?:my|these|this\s+branch'?s?)\s+(?:commits|changes|work)\s+on\s+top\s+of\s+(?:the\s+)?(?:branch\s+)?(?P<b>[\w./-]+)", t)
+    if mr and is_ref(mr.group("b")):
+        b = orig(mr.group("b"))
+        return plan(f"git rebase {q(b)}", f"replay {current}'s commits on top of {b}", change=True,
+                    warning="! rewrites this branch's commits: don't rebase commits others already have")
+    m = re.fullmatch(r"rebase(?:\s+(?:this|my|the\s+current|current)(?:\s+branch)?)?(?:\s+(?:on|onto|on\s+top\s+of|against|over|with))?\s*(?:the\s+)?(?:latest\s+)?(?:branch\s+)?(?P<b>[\w./-]+?)?(?:\s+branch)?", t)
+    if m and (not m.group("b") or is_ref(m.group("b"))):
+        b = m.group("b")
+        return plan(f"git rebase {q(b)}" if b else "git rebase",
+                    f"replay {current}'s commits on top of {b or 'its upstream'}", change=True,
+                    warning="! rewrites this branch's commits: don't rebase commits others already have")
+    m = re.search(rf"\b(?:interactive(?:ly)?\s+rebase|rebase\s+interactive(?:ly)?|clean\s+up|tidy\s+up|reorder|edit)\s+(?:the\s+)?(?:last\s+)?{n_pat}\s+commits", t)
+    if m:
+        n = _gnum(m.group("n"))
+        return plan(f"git rebase -i HEAD~{n}", f"edit, squash or reorder the last {n} commits in the editor", change=True,
+                    warning="! rewrites those commits")
+    # -- push
+    if re.search(r"\bforce[- ]?push\b|\bpush\b.*\b(?:force(?:fully)?|--force|-f|overwrite\s+(?:the\s+)?remote)\b", t):
+        return plan(f"git push --force-with-lease", ["overwrite the remote branch with yours",
+                    "refused if someone else pushed meanwhile"], change=True, warning="! replaces the remote branch's history")
+    if re.search(r"\b(?:push|publish|share|upload|send)\s+(?:this|my|the\s+current|current|the\s+new|my\s+new)\s+(?:new\s+)?branch\b|\bpublish\b|"
+                 r"\bset\s+(?:the\s+)?upstream\b|\bpush\b.*\b(?:upstream|first\s+time|for\s+the\s+first\s+time|-u)\b|\btrack\s+(?:the\s+)?remote\b", t):
+        return plan(f"git push -u {remote} {q(current) if current else 'HEAD'}", f"push {current} to {remote} and track it")
+    m = re.fullmatch(r"(?:push|upload|send)\s+(?:the\s+)?(?:branch\s+)?(?P<b>[\w./-]+?)(?:\s+branch)?(?:\s+(?:to|up\s+to)\s+(?:the\s+)?(?P<r>[\w.-]+))?", t)
+    if m and is_branch(m.group("b")) and m.group("b") not in remotes:
+        r = m.group("r") if m.group("r") in remotes else remote
+        return plan(f"git push -u {r} {q(m.group('b'))}", f"push {m.group('b')} to {r}")
+    m = re.fullmatch(r"(?:push|upload|send)(?:\s+(?:all\s+)?(?:my|the|all|everything|it|this|these|what\s+i\s+have))*(?:\s+(?:local\s+)?(?:changes|commits|work|code|stuff|branch))?"
+                     r"(?:\s+(?:up|out|online))?(?:\s+(?:to|up\s+to|into)\s+(?:the\s+)?(?P<r>[\w.-]+)(?:\s+(?:repo|repository|remote|server))?)?", t)
+    if m and not re.fullmatch(r"(?:push|upload|send)\s+\S+\.\w+", t):
+        r = m.group("r")
+        if r and r in remotes:
+            return plan(f"git push {r}", f"push to {r}")
+        if r and r not in ("remote", "server", "github", "gitlab", "bitbucket", "cloud", "origin", "repo", "repository", "web", "internet"):
+            return None
+        return plan("git push", f"push {current} to its remote branch")
+
+    # -- pull / fetch
+    m = re.fullmatch(r"fetch\s+(?P<all>everything|all|all\s+remotes|from\s+all\s+remotes|every\s+remote)|"
+                     r"fetch(?:\s+(?:the\s+)?(?:latest|changes|updates|commits|new\s+commits))?(?:\s+(?:from\s+)?(?:the\s+)?(?P<r>[\w.-]+))?", t)
+    if m:
+        if m.group("all"):
+            return plan("git fetch --all --prune", "fetch every remote (nothing changes in your files)")
+        r = m.group("r")
+        return plan(f"git fetch {r}" if r in remotes else "git fetch", f"fetch {r if r in remotes else 'the remote'} (nothing changes in your files)")
+    if re.search(r"\bpull\b.*\brebase\b", t):
+        return plan("git pull --rebase", "pull, putting your commits on top of the new ones")
+    m = re.fullmatch(r"pull(?:\s+(?:the\s+)?(?:latest|newest|recent|changes|updates|code|commits|everything|down|in|it))*(?:\s+(?:from|off)\s+(?:the\s+)?(?P<r>[\w.-]+)(?:\s+(?P<b>[\w./-]+))?)?", t)
+    m2 = re.fullmatch(r"(?:bring|get)\s+(?:my\s+|this\s+|the\s+)?(?:branch|repo|repository|code|checkout)\s+up\s+to\s+date|"
+                      r"(?:get|grab|download|fetch\s+and\s+merge|bring\s+in|receive)\s+(?:the\s+)?(?:latest|newest|new|recent|remote)?\s*(?:changes|code|commits|updates|version|work)"
+                      r"(?:\s+from\s+(?:the\s+)?(?P<r>[\w.-]+))?|(?:update|sync|synchroni[sz]e|refresh)\s+(?:my\s+|this\s+|the\s+)?(?:repo|repository|code|branch|checkout|working\s+copy|local\s+copy)?"
+                      r"\s*(?:from|with)\s+(?:the\s+)?(?P<r2>remote|origin|server|github|gitlab|upstream|[\w.-]+)|(?:update|sync|refresh)\s+(?:the\s+|my\s+|this\s+)(?:repo|repository|code|checkout|working\s+copy)", t)
+    if m or m2:
+        r = (m.group("r") if m else None) or (m2.group("r") or m2.group("r2") if m2 else None)
+        b = m.group("b") if m else None
+        if r and r not in remotes and r not in ("remote", "server", "github", "gitlab", "upstream", "origin", "the"):
+            if is_branch(r):
+                return plan(f"git pull {remote} {q(r)}", f"pull {r} from {remote} into {current}")
+            return None
+        if r in remotes and b:
+            return plan(f"git pull {r} {q(b)}", f"pull {b} from {r}")
+        return plan(f"git pull {r}" if r in remotes else "git pull", f"pull the latest commits into {current}")
+
+    # -- status and diffs
+    m = re.fullmatch(r"(?:compare|diff|difference(?:s)?|changes|what\s+changed|what(?:'s|\s+is)\s+different)\s+(?:between\s+)?(?:the\s+)?(?:branch(?:es)?\s+)?(?P<a>[\w./~^-]+)"
+                     r"(?:\s+branch)?\s+(?:and|with|to|vs\.?|versus|against|from)\s+(?:the\s+)?(?:branch\s+)?(?P<b>[\w./~^-]+)(?:\s+branch)?", t)
+    if m and is_ref(m.group("a")) and is_ref(m.group("b")):
+        return plan(f"git diff {ref(m.group('a'))} {ref(m.group('b'))}", f"what differs between {m.group('a')} and {m.group('b')}")
+    if re.search(r"\b(?:staged|cached|indexed)\s+(?:changes|diff|files)\b|\bwhat(?:'s|\s+is|\s+have\s+i)\s+staged\b|\bwhat\s+will\s+(?:be|i)\s+commit|"
+                 r"\bdiff\s+(?:of\s+)?(?:the\s+)?(?:staged|index|stage)\b", t):
+        return plan("git diff --cached", "what is staged for the next commit")
+    if re.search(r"\b(?:changes|changed|diff)\s+since\s+(?:the\s+)?(?:last|latest)\s+commit\b", t):
+        return plan("git diff HEAD", "every change since the last commit, staged or not")
+    m = re.fullmatch(r"(?:what(?:'s|\s+has|\s+is)?\s+changed|what\s+did\s+i\s+change|(?:show\s+(?:me\s+)?)?(?:the\s+)?(?:changes|diff|differences))\s+(?:in|to|of|for|on)\s+(?P<f>.+)|"
+                     r"(?:diff|changes)\s+(?P<f2>\S+\.\S+)", t)
+    if m and files_in(m.group("f") or m.group("f2")):
+        fs = files_in(m.group("f") or m.group("f2"))
+        return plan("git diff -- " + " ".join(q(f) for f in fs), f"uncommitted changes in {', '.join(fs)}")
+    if re.fullmatch(r"(?:show|view|see|display|print|list)?\s*(?:me\s+)?(?:the\s+|my\s+|all\s+(?:my\s+)?)?(?:current\s+|local\s+|unstaged\s+|uncommitted\s+|working\s+)?"
+                    r"(?:diff|changes|differences|edits|modifications)(?:\s+(?:i\s+made|so\s+far|here))?", t):
+        return plan("git diff", "your uncommitted changes")
+    if re.fullmatch(r"(?:what(?:'s|\s+has|\s+is)?\s+changed|what\s+did\s+i\s+change|(?:repo|git|repository)\s+status|status|"
+                    r"is\s+(?:my|the|this)\s+(?:repo|repository|working\s+(?:tree|copy|directory)|branch|checkout)\s+(?:clean|dirty)|"
+                    r"(?:are\s+there\s+|do\s+i\s+have\s+|any\s+)(?:any\s+)?(?:uncommitted|unsaved|pending|local|unpushed\s+or\s+uncommitted)\s+changes|"
+                    r"(?:anything|something)\s+to\s+commit|(?:show|list|what\s+are)\s+(?:the\s+|my\s+)?(?:modified|changed|uncommitted|dirty|edited|untracked|new)\s+files|"
+                    r"what\s+files\s+(?:have\s+i|did\s+i|have|were|are)\s+(?:changed|modified|touched|edited)|(?:which|what)\s+files\s+(?:are|were)\s+(?:modified|changed))", t):
+        return plan("git status --short && git diff --stat", "what changed since the last commit")
+
+    # -- history
+    if re.search(r"\b(?:graph|tree)\b", t) and re.search(r"\b(?:commit|history|log|branch|git)", t):
+        return plan("git log --oneline --graph --all --decorate -n 40", "the commit graph of every branch")
+    m = re.search(r"\b(?:changes|commits|work)\s+(?:that\s+)?(?:i\s+)?(?:haven'?t|have\s+not|did\s+not|didn'?t|not)\s+(?:yet\s+)?pushed\b|"
+                  r"\b(?:unpushed|not\s+(?:yet\s+)?pushed|local\s+only|outgoing)\s+commits\b|\bcommits\s+(?:i\s+)?(?:have(?:n'?t|\s+not)|that\s+are\s+not|not)\s+(?:yet\s+)?pushed\b|"
+                  r"\bwhat\s+(?:will|would|am\s+i\s+going\s+to)\s+(?:i\s+|be\s+)?push", t)
+    if m:
+        return plan("git log --oneline @{u}..", "your commits the remote doesn't have yet")
+    if re.search(r"\b(?:incoming|new|remote|upstream)\s+(?:changes|commits)\b|\bwhat(?:'s|\s+is)\s+new\s+(?:on|in)\s+(?:the\s+)?(?:remote|origin|server|upstream)\b|"
+                 r"\bwhat\s+(?:would|will)\s+(?:i\s+get|a\s+pull\s+bring|pull\s+bring)", t):
+        return plan("git fetch -q && git log --oneline ..@{u}", "commits on the remote you don't have yet (fetched, not merged)")
+    if re.search(r"\b(?:am\s+i|are\s+we|is\s+(?:my|this|the)\s+(?:branch|repo|code|checkout))\s+(?:behind|ahead|up\s+to\s+date|in\s+sync|current|synced)\b|"
+                 r"\bhow\s+far\s+(?:behind|ahead)\b|\bup\s+to\s+date\s+with\s+(?:the\s+)?(?:remote|origin|upstream)\b|\bbehind\s+(?:the\s+)?(?:remote|origin)\b", t):
+        return plan("git fetch -q && git status -sb | head -n 1", "ahead or behind the remote, after fetching")
+    m = re.fullmatch(r"(?:who|when|which\s+commit)\s+(?:wrote|changed|edited|last\s+changed|touched|added|modified)\s+lines?\s+(?P<a>\d+)"
+                     r"(?:\s*(?:-|to|through|and)\s*(?P<b>\d+))?\s+(?:of|in)\s+(?P<f>.+)|blame\s+lines?\s+(?P<a2>\d+)(?:\s*(?:-|to)\s*(?P<b2>\d+))?\s+(?:of|in)\s+(?P<f2>.+)", t)
+    if m and files_in(m.group("f") or m.group("f2")):
+        a = m.group("a") or m.group("a2")
+        b = m.group("b") or m.group("b2") or a
+        f = files_in(m.group("f") or m.group("f2"))[0]
+        return plan(f"git blame -L {a},{b} -- {q(f)}", f"who last changed line{'s' if a != b else ''} {a}{'–' + b if a != b else ''} of {f}")
+    m = re.fullmatch(r"(?:show\s+|view\s+|display\s+)?(?:the\s+)?(?:history|log|commits|changes)\s+(?:of|for|on|to)\s+(?P<f>.+)|"
+                     r"(?:which\s+)?commits\s+(?:that\s+)?(?:touched|changed|modified|affected|edited)\s+(?P<f2>.+)|(?:who|when)\s+(?:changed|edited|modified|touched)\s+(?P<f3>.+?)(?:\s+last)?", t)
+    if m and files_in(m.group("f") or m.group("f2") or m.group("f3") or ""):
+        f = files_in(m.group("f") or m.group("f2") or m.group("f3"))[0]
+        return plan(f"git log --oneline --follow --format='%h %ad %an  %s' --date=short -- {q(f)}", f"commits that changed {f}, with who and when")
+    if re.search(r"\b(?:my|mine)\s+commits\b|\bcommits\s+(?:i\s+made|by\s+me|i\s+did)\b", t):
+        return plan('git log --oneline --author="$(git config user.name)"', "your commits")
+    m = re.search(r"\bcommits?\s+(?:by|from|of|made\s+by|authored\s+by)\s+(?P<a>[\w.@-]+(?:\s+[A-Z][\w-]+)?)", traw, re.I)
+    if m and not _git_since(m.group("a")) and m.group("a").lower() not in ("last", "the", "yesterday", "today", "this", "branch", "main"):
+        return plan(f"git log --oneline --author={q(m.group('a'))}", f"commits by {m.group('a')}")
+    m = re.search(r"\bcommits?\s+(?:since|from|in\s+the\s+last|during|after|made\s+since|in)\s+(?P<w>.+)$|\b(?:what\s+was\s+committed|history)\s+(?:since|in\s+the\s+last|from)\s+(?P<w2>.+)$", t)
+    if m and _git_since(m.group("w") or m.group("w2")):
+        since = _git_since(m.group("w") or m.group("w2"))
+        return plan(f"git log --oneline --since={q(since)}", f"commits since {since}")
+    m = re.search(r"\b(?:search|find|grep|look\s+for)\s+(?:in\s+)?(?:the\s+)?(?:commits?|history|log|commit\s+messages)\s+(?:for|with|containing|mentioning|about)\s+(?P<q>.+)$|"
+                  r"\bcommits?\s+(?:that\s+)?(?:mention|mentions|mentioning|containing|contains|contain|says|with|about)\s+(?P<q2>.+)$", traw, re.I)
+    if m:
+        s = (m.group("q") or m.group("q2")).strip().strip("\"'")
+        return plan(f"git log --oneline -i --grep={q(s)}", f"commits whose message mentions {s}")
+    m = re.search(r"\b(?:which|what)\s+commit\s+(?:added|introduced|removed|deleted|changed)\s+(?P<q>.+)$|\bwhen\s+was\s+(?P<q2>.+?)\s+(?:added|introduced|removed)$", traw, re.I)
+    if m:
+        s = (m.group("q") or m.group("q2")).strip().strip("\"'")
+        return plan(f"git log --oneline -S {q(s)}", f"commits that added or removed the text {s}")
+    m = re.fullmatch(rf"(?:show|view|display|open|what(?:'s|\s+is)\s+in|what\s+changed\s+in|details\s+of)\s+(?:the\s+)?commit\s+(?P<r>{GIT_HASH}|head~?\d*)", t)
+    if m:
+        return plan(f"git show {ref(m.group('r'))}", f"commit {m.group('r')}: message and changes")
+    m = re.fullmatch(rf"(?:show\s+|view\s+|list\s+)?(?:me\s+)?(?:the\s+)?(?:last|latest|recent|previous)\s+{n_pat}\s+commits", t)
+    if m:
+        return plan(f"git log --oneline --graph --decorate -n {_gnum(m.group('n'))}", f"the last {_gnum(m.group('n'))} commits")
+    if re.fullmatch(r"(?:show|view|display|see|print|list)?\s*(?:me\s+)?(?:the\s+|my\s+)?(?:git\s+|commit\s+|repo\s+|project\s+)?(?:history|log|commit\s+log|commits|commit\s+history)", t):
+        return plan("git log --oneline --graph --decorate -n 20", "the last 20 commits")
+
+    # -- ignore, config, submodules
+    m = re.fullmatch(r"(?:ignore|gitignore|git\s+ignore)\s+(?:the\s+|all\s+)?(?:file\s+|folder\s+|directory\s+)?(?P<f>\S+)(?:\s+(?:folder|directory|dir|file|files))?(?:\s+in\s+git)?|"
+                     r"(?:add|put)\s+(?P<f2>\S+)\s+(?:to|in|into)\s+(?:the\s+)?\.?gitignore(?:\s+file)?|(?:make\s+git|have\s+git|tell\s+git\s+to)\s+ignore\s+(?P<f3>\S+)", t)
+    if m:
+        f = m.group("f") or m.group("f2") or m.group("f3")
+        f = traw[low.find(f):][:len(f)] if f in low else f
+        tracked = subprocess.run(["git", "ls-files", "--error-unmatch", "--", f], cwd=u.cwd, capture_output=True).returncode == 0 \
+            if os.path.exists(os.path.join(u.cwd, f)) else False
+        cmd = f"printf '%s\\n' {q(f)} >> .gitignore" + (f" && git rm -r --cached -q -- {q(f)}" if tracked else "")
+        return plan(cmd, [f"git ignores {f} from now on"] + (["it was tracked: stops tracking it, the file stays"] if tracked else []))
+    m = re.search(r"\b(?:set|change|configure|use)\s+(?:my\s+)?git\s+(?:user\s*)?(?P<k>name|e-?mail|username)\s+(?:to|as)\s+(?P<v>.+)$", traw, re.I)
+    if m:
+        key = "email" if "mail" in m.group("k").lower() else "name"
+        return plan(f"git config --global user.{key} {q(m.group('v').strip())}", f"your git {key} for every repository")
+    if re.search(r"\b(?:update|init|initiali[sz]e|fetch|pull|get|clone)\s+(?:the\s+|all\s+(?:the\s+)?)?submodules?\b|\bsubmodules?\s+update\b", t):
+        return plan("git submodule update --init --recursive", "fetch and check out every submodule")
+    return None
+
+
 GLUE_SUBS = {
     "git": "pull push status log diff add commit checkout switch branch merge rebase fetch clone stash init show reset "
            "restore tag remote blame cherry-pick revert grep mv rm bisect describe",
@@ -4920,7 +5599,7 @@ def h_unglue(u: Utterance) -> Plan | None:
     return Plan(fixed, "did you mean", [f"read '{u.raw.strip()}' as '{fixed}'"], confidence=0.95, source="guess")
 
 
-HANDLERS = [h_unglue, h_usb, h_power_later, h_net, h_service, h_recipe, h_system, h_power, h_version, h_installed, h_port, h_pkg_search, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
+HANDLERS = [h_unglue, h_git, h_usb, h_power_later, h_net, h_service, h_recipe, h_system, h_power, h_version, h_installed, h_port, h_pkg_search, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
             h_find_then, h_reext, h_download, h_compare, h_replace, h_calc, h_copy_move, h_delete, h_read, h_grep, h_count, h_size, h_find, h_list]
 
 
@@ -5755,7 +6434,7 @@ SHUTDOWN_TIME = re.compile(r"now|\+?\d+|\d{1,2}:\d{2}|-[a-zA-Z-]+.*")
 AMBIGUOUS_FIRST = {"go", "kill", "find", "open", "make", "which", "who", "file", "install", "compare",
                    "base64", "convert", "set", "sync", "ssh", "clone", "add", "pull", "push", "display", "shift",
                    "du", "df", "free", "locate", "look", "see", "show", "cd", "zip", "unzip", "head",
-                   "tail", "touch", "less", "truncate", "last", "enable"}
+                   "tail", "touch", "less", "truncate", "last", "enable", "diff", "reset"}
 
 
 # On Debian `edit` is run-mailcap and `open` is openvt: nobody typing
@@ -5788,10 +6467,14 @@ def looks_like_shell(line: str, path_env: str | None = None, cwd: str | None = N
         plan = interpret(line, cwd)      # "git revert the last commit"
         if plan and plan.confidence >= threshold:
             return False
+    if toks[0] == "reset" and rest and not any(t.startswith("-") for t in rest):
+        return False                     # reset(1) takes no words: "reset app.py" is git
     if toks[0] in ("sort", "cut", "order") and re.search(r"\bby\s+(?:the\s+)?(?:\w+\s+)?(?:column|field)\b", line):
         return False                     # "sort people.csv by column 2"
     if toks[0] == "watch" and re.search(r"\blogs?\b", line) and not any(t.startswith("-") for t in rest):
         return False                     # "watch nginx logs live"
+    if toks[0] == "git" and len(toks) > 2 and toks[-1].lower() in ("please", "pls", "thanks") and not re.search(r"[|&;<>`$]", line):
+        return False                     # "git status please": the rules drop the please
     if toks[0] == "yes" and not re.search(r"[|&;<>`$]", line):
         return False                     # "yes please": nobody wants y printed forever
     if (cwd and toks[0] in PREFER_RULES and rest and not any(t.startswith("-") for t in rest)
