@@ -1,12 +1,10 @@
 # ai$ha — ai shell hybrid alpha
 
-**ai$ha** is a shell you can talk to. You start it with `aisha` (a `$` can't
-be part of a command name: every shell would read `$ha` as a variable), and
-the package, folders and settings are called `aisha` too. Type bash as usual, or say what you want
+**ai$ha** is a shell. Type bash as usual, or say what you want
 in plain words. It needs nothing beyond a stock Debian system — Python's
 standard library and the base tools. Most requests are handled by a
 deterministic rule engine with no model at all; an optional small **local**
-LLM is consulted only when the rules are unsure. No API key, no cloud.
+LLM is consulted only when the rules are unsure.
 
 ```
 $ aisha
