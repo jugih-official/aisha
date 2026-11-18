@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # update.sh — pull the latest aisha from GitHub and reinstall it the way it was installed:
-#   from the Debian package -> rebuilds the package and installs it
-#   with ./install.sh       -> runs ./install.sh again (asks nothing)
+#   from the Debian package     -> rebuilds the package and installs it (./install.sh --deb)
+#   as a /usr/local copy        -> copies it there again (./install.sh --local)
 # ./update.sh deb | local  overrides the guess.
 set -euo pipefail
 
@@ -46,17 +46,16 @@ mode="${1:-}"
 if [ -z "$mode" ]; then
     if dpkg -S /usr/bin/aisha >/dev/null 2>&1; then
         mode=deb
-    else
+    elif [ -e /usr/local/bin/aisha ]; then
         mode=local
+    else
+        mode=auto
     fi
 fi
 case "$mode" in
-    deb)
-        echo "aisha came from the Debian package: rebuilding and reinstalling it."
-        rm -f dist/aisha_*_all.deb
-        packaging/debian/build-deb.sh
-        sudo apt install -y --reinstall ./dist/aisha_*_all.deb ;;
-    local|aisha) ./install.sh ;;
+    deb)        ./install.sh --deb ;;
+    local)      ./install.sh --local ;;
+    auto|aisha) ./install.sh ;;
     *) red "unknown mode: $mode (use deb or local)"; exit 2 ;;
 esac
 if [ -e /usr/local/bin/ai ] || [ -e /usr/local/bin/ai-code ]; then

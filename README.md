@@ -253,16 +253,20 @@ Settings live in `~/.config/aisha/config.json` or the environment:
 ## Install
 
 ```sh
-packaging/debian/build-deb.sh            # -> dist/aisha_<version>_all.deb
-sudo apt install ./dist/aisha_*_all.deb  # /usr/bin/aisha, man aisha
+git clone https://github.com/jugih-official/aisha.git
+cd aisha
+./install.sh
 ```
 
-or, without a package, `./install.sh`, which puts it in `/usr/local` and
-asks nothing. Needs Python 3.9+ (Debian 11 or newer). `man aisha` documents
-the options.
+On Debian and Ubuntu, `install.sh` builds the Debian package
+(`packaging/debian/build-deb.sh` → `dist/aisha_<version>_all.deb`) and
+installs it with apt: `/usr/bin/aisha`, `man aisha`, registered as a login
+shell. Elsewhere, or with `./install.sh --local`, it puts aisha in
+`/usr/local` without a package. It asks nothing but your sudo password.
+Needs Python 3.9+ (Debian 11 or newer).
 
 To update, run `./update.sh` in this folder: it pulls the latest version and
-reinstalls aisha the way you installed it (package or `install.sh`).
+reinstalls aisha the way you installed it (package or `/usr/local`).
 `./uninstall.sh` removes it and asks before deleting your settings or a
 downloaded model.
 

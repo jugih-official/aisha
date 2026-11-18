@@ -28,10 +28,9 @@
       <h2>Install</h2>
       <pre><code>git clone https://github.com/jugih-official/aisha.git
 cd aisha
-packaging/debian/build-deb.sh
-sudo apt install ./dist/aisha_*_all.deb</code></pre>
-      <p>Or <code>./install.sh</code>, which puts aisha in <code>/usr/local</code> and asks nothing.
-      Needs Python 3.9+ (Debian 11 or newer).</p>
+./install.sh</code></pre>
+      <p>On Debian and Ubuntu this builds the Debian package and installs it with apt; elsewhere (or with
+      <code>--local</code>) it puts aisha in <code>/usr/local</code>. Needs Python 3.9+ (Debian 11 or newer).</p>
     </section>
 
     <section class="card">
