@@ -72,8 +72,8 @@ Recommends: procps, iproute2, sensible-utils, less
 Suggests: zip, unzip, xdg-utils
 Maintainer: $MAINTAINER
 Homepage: https://github.com/jugih-official/aisha
-Description: natural-language shell with a local LLM fallback
- aisha runs bash commands as usual and also understands plain requests
+Description: ai\$ha (ai shell hybrid alpha), a shell you can talk to
+ ai\$ha, run as aisha, runs bash commands as usual and also understands plain requests
  such as "find recursively files older than 2 months from this folder"
  or "edit logs.txt with micro". A deterministic rule engine builds the
  command and shows what it understood; only when it is unsure does it

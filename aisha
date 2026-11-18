@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""aisha — a natural-language shell.
+"""ai$ha (ai shell hybrid alpha), run as `aisha` — a natural-language shell.
 
 Type bash as usual, or say what you want in plain words:
 
@@ -49,7 +49,9 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.7.3"
+VERSION = "0.8.0"
+NAME = "ai$ha"             # the shell's name as shown: ai shell hybrid alpha. The command stays `aisha`
+TAGLINE = "ai shell hybrid alpha"   # ($ in a command name would be read as a variable by every shell)
 
 # ---- configuration ----------------------------------------------------------
 
@@ -5773,7 +5775,7 @@ class Memory:
 
 # ---- the shell --------------------------------------------------------------------
 
-HELP = """aisha — type bash, or say what you want. Some things you can say:
+HELP = """ai$ha — type bash, or say what you want. Some things you can say:
 
 Files       find files older than 2 months in this folder · find big files · show file tree
             find files containing "invoice" · find duplicate files · delete empty folders
@@ -5979,7 +5981,8 @@ class Shell:
             return 0
         if GREETING.fullmatch(low):
             if re.match(r"(?:who|what)\s+are\s+you", low):
-                say("I'm aisha, a shell you can talk to: type bash as usual, or say what you want done.")
+                say(f"I'm {NAME} ({TAGLINE}), a shell you can talk to: type bash as usual, or say what you "
+                    f"want done. Start me with: aisha")
             else:
                 say(("Hi! " if not low.startswith("how") else "") + "All good here, ready when you are.")
             say(dim("  try: show the biggest files here · what's using my memory · find pdfs older than a month · help"))
@@ -6505,11 +6508,11 @@ class Shell:
         mark = "❯" if self.rc == 0 else "✗"
         branch = git_branch(self.cwd) if self.cfg.get("prompt_git", False) else ""
         if not (sys.stdout.isatty() and not os.environ.get("NO_COLOR")):
-            return f"aisha {where}{' git:' + branch if branch else ''} {mark} "
+            return f"{NAME} {where}{' git:' + branch if branch else ''} {mark} "
         # \001..\002 tell readline the escapes take no width
         c = lambda code, s: f"\001\033[{code}m\002{s}\001\033[0m\002"
         git = f" {c('2', 'git:')}{c('35', branch)}" if branch else ""
-        return f"{c('36', 'aisha')} {c('34', where)}{git} {c('32' if self.rc == 0 else '31', mark)} "
+        return f"{c('36', NAME)} {c('34', where)}{git} {c('32' if self.rc == 0 else '31', mark)} "
 
     def repl(self) -> int:
         try:
@@ -6530,7 +6533,7 @@ class Shell:
             readline = None
         if self.cfg["banner"]:
             llm = f"; language model: {self.llm.label}" if self.llm.enabled else ""
-            say(dim(f"aisha {VERSION} — type bash or plain words. 'help' for examples{llm}"))
+            say(dim(f"{NAME} {VERSION} ({TAGLINE}) — type bash or plain words. 'help' for examples{llm}"))
         code = None
         while code is None:
             self.reap()
@@ -6905,8 +6908,8 @@ def setup(args: list[str]) -> int:
         save_config({"llm_server": None, "llm_model_file": None, "llm_url": None, "llm_model": None})
         say(f"removed {DATA_DIR} and the local model settings")
         return 0
-    say(bold("aisha: optional language model"))
-    say(dim("aisha works without one (rules + built-in model). This adds a small language model for the rest,"))
+    say(bold(f"{NAME}: optional language model"))
+    say(dim(f"{NAME} works without one (rules + built-in model). This adds a small language model for the rest,"))
     say(dim("run by Mozilla's llamafile (llama.cpp in one file), which aisha starts when needed and stops on exit."))
     if "--url" in args:                      # use a server you already run
         i = args.index("--url")
@@ -6981,7 +6984,7 @@ def doctor() -> int:
         mark = green("ok ") if good else (yellow("-- ") if good is None else red("!! "))
         say(f"  {mark} {what}" + (dim(f"  {note}") if note else ""))
 
-    say(bold(f"aisha {VERSION} doctor"))
+    say(bold(f"{NAME} {VERSION} doctor"))
     py = sys.version_info
     line(py >= (3, 9), f"Python {py.major}.{py.minor}.{py.micro}", "3.9 or newer needed")
     ok &= py >= (3, 9)
@@ -7097,7 +7100,7 @@ def main(argv: list[str]) -> int:
         print(USAGE + "\n" + HELP)
         return 0
     if args and args[0] == "--version":
-        print(f"aisha {VERSION}")
+        print(f"{NAME} {VERSION} ({TAGLINE})")
         return 0
     if args and args[0] == "--setup":
         return setup(args[1:])

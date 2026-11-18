@@ -1453,10 +1453,11 @@ class TestPrompt(LabTest):
         sh = aisha.Shell(dict(aisha.DEFAULTS, llm="off"))
         sh.cwd = self.lab
         self.assertNotIn("git:", sh.prompt())            # hidden by default
-        self.assertEqual(sh.prompt().count("aisha"), 1)
+        self.assertEqual(sh.prompt().count(aisha.NAME), 1)
+        self.assertNotIn("aisha", sh.prompt())           # the branch is hidden, the name is ai$ha
         sh.cfg["prompt_git"] = True
         self.assertIn(" git:aisha ", sh.prompt())
-        self.assertTrue(sh.prompt().startswith("aisha "))
+        self.assertTrue(sh.prompt().startswith("ai$ha "))
 
 
 class TestListOptions(LabTest):

@@ -1,6 +1,8 @@
-# aisha
+# ai$ha — ai shell hybrid alpha
 
-**aisha** is a shell you can talk to. Type bash as usual, or say what you want
+**ai$ha** is a shell you can talk to. You start it with `aisha` (a `$` can't
+be part of a command name: every shell would read `$ha` as a variable), and
+the package, folders and settings are called `aisha` too. Type bash as usual, or say what you want
 in plain words. It needs nothing beyond a stock Debian system — Python's
 standard library and the base tools. Most requests are handled by a
 deterministic rule engine with no model at all; an optional small **local**
@@ -264,11 +266,19 @@ installs it with apt: `/usr/bin/aisha`, `man aisha`, registered as a login
 shell. Elsewhere, or with `./install.sh --local`, it puts aisha in
 `/usr/local` without a package. Needs Python 3.9+ (Debian 11 or newer).
 
-The first time, it asks whether new terminal windows should open aisha
-(GNOME Terminal, which Ubuntu and Linux Mint use too, Konsole and Xfce
-Terminal). Logins, ssh and scripts keep bash either way. Change it later with
-`packaging/terminal-default.sh set`, `unset` or `status`; `./install.sh
---no-ask` skips the question. To use aisha everywhere, including ssh, make
+The first time, it asks two things:
+
+- **Add the local language model?** A small model (Qwen2.5-Coder 0.5B run
+  by llamafile, about 550 MB) for the requests the rules don't know. It
+  downloads it with `aisha --setup`. `./install.sh --with-llm` installs it
+  without asking (`./install.sh 1.5b` or `3b` for a bigger model),
+  `--no-llm` skips it, and `aisha --setup` adds it any time later.
+- **Open aisha in new terminal windows?** For GNOME Terminal (which Ubuntu
+  and Linux Mint use too), Konsole and Xfce Terminal. Logins, ssh and
+  scripts keep bash either way. Change it later with
+  `packaging/terminal-default.sh set`, `unset` or `status`.
+
+Neither is asked again on updates; `./install.sh --no-ask` skips both. To use aisha everywhere, including ssh, make
 it your login shell: `chsh -s /usr/bin/aisha` (back: `chsh -s /bin/bash`).
 
 To update, run `./update.sh` in this folder: it pulls the latest version and
