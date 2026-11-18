@@ -67,30 +67,49 @@ konsole_unset() {
 # --- Xfce Terminal --------------------------------------------------------------------
 XFCE_RC="$CFG_DIR/xfce4/terminal/terminalrc"
 xfce_ok() { command -v xfce4-terminal >/dev/null; }
-xfce_is_set() {
-    if command -v xfconf-query >/dev/null && xfconf-query -c xfce4-terminal -p /run-custom-command >/dev/null 2>&1; then
-        [ "$(xfconf-query -c xfce4-terminal -p /run-custom-command 2>/dev/null)" = true ] &&
-            xfconf-query -c xfce4-terminal -p /custom-command 2>/dev/null | grep -q aisha && return 0
-    fi
+# Xfce Terminal is one process for all its windows: a running one keeps its settings in memory
+# and writes them back on exit, so changing its "custom command" setting from outside does not
+# stick. A few lines in ~/.bashrc work in any terminal app instead (see "the bash way" below).
+xfce_old_setting() {  # the custom-command setting an earlier version of this script made
+    if command -v xfconf-query >/dev/null &&
+            [ "$(xfconf-query -c xfce4-terminal -p /run-custom-command 2>/dev/null)" = true ] &&
+            xfconf-query -c xfce4-terminal -p /custom-command 2>/dev/null | grep -q aisha; then return 0; fi
     [ -f "$XFCE_RC" ] && grep -qx 'RunCustomCommand=TRUE' "$XFCE_RC" && grep -q '^CustomCommand=.*aisha' "$XFCE_RC"
 }
-xfce_rc_put() {  # key value
-    mkdir -p "$(dirname "$XFCE_RC")"
-    [ -f "$XFCE_RC" ] || printf '[Configuration]\n' > "$XFCE_RC"
-    if grep -q "^$1=" "$XFCE_RC"; then sed -i "s|^$1=.*|$1=$2|" "$XFCE_RC"; else printf '%s=%s\n' "$1" "$2" >> "$XFCE_RC"; fi
-}
-xfce_set() {
-    if command -v xfconf-query >/dev/null; then
-        xfconf-query -c xfce4-terminal -p /run-custom-command -n -t bool -s true 2>/dev/null
-        xfconf-query -c xfce4-terminal -p /custom-command -n -t string -s "$AISHA" 2>/dev/null
-    fi
-    xfce_rc_put RunCustomCommand TRUE        # older Xfce Terminal reads this file
-    xfce_rc_put CustomCommand "$AISHA"
-}
+xfce_is_set() { bashrc_is_set; }
+xfce_set()    { bashrc_set; }
 xfce_unset() {
-    xfce_is_set || return 0
-    command -v xfconf-query >/dev/null && xfconf-query -c xfce4-terminal -p /run-custom-command -s false 2>/dev/null
-    [ -f "$XFCE_RC" ] && xfce_rc_put RunCustomCommand FALSE
+    if xfce_old_setting; then
+        command -v xfconf-query >/dev/null && xfconf-query -c xfce4-terminal -p /run-custom-command -s false 2>/dev/null
+        [ -f "$XFCE_RC" ] && sed -i 's/^RunCustomCommand=TRUE$/RunCustomCommand=FALSE/' "$XFCE_RC"
+    fi
+    bashrc_unset
+}
+
+# --- the bash way: any terminal app ---------------------------------------------------
+# New interactive bash in a graphical session runs `exec aisha`. Not inside aisha itself
+# (it sets $AISHA for what it runs), not over ssh, not on a text console, not in scripts.
+BASHRC="$HOME/.bashrc"
+BEGIN_MARK="# >>> aisha: open ai\$ha in terminal windows (undo: packaging/terminal-default.sh unset) >>>"
+END_MARK="# <<< aisha <<<"
+bashrc_is_set() { [ -f "$BASHRC" ] && grep -qF "$BEGIN_MARK" "$BASHRC"; }
+bashrc_set() {
+    bashrc_is_set && return 0
+    {
+        printf '\n%s\n' "$BEGIN_MARK"
+        printf '%s\n' 'if [[ $- == *i* && -z "${AISHA:-}" && -z "${AISHA_SKIP:-}" && -z "${SSH_CONNECTION:-}" &&'
+        printf '%s\n' '      -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && command -v aisha >/dev/null; then'
+        printf '%s\n' '    exec aisha'
+        printf '%s\n' 'fi'
+        printf '%s\n' "$END_MARK"
+    } >> "$BASHRC"
+}
+bashrc_unset() {
+    bashrc_is_set || return 0
+    local tmp; tmp="$(mktemp)"
+    awk -v b="$BEGIN_MARK" -v e="$END_MARK" '$0 == b {skip = 1; next} skip && $0 == e {skip = 0; next} !skip' \
+        "$BASHRC" > "$tmp" && cat "$tmp" > "$BASHRC"
+    rm -f "$tmp"
 }
 
 # ------------------------------------------------------------------------------------
@@ -98,7 +117,9 @@ APPS=()
 gnome_ok   && APPS+=(gnome)
 konsole_ok && APPS+=(konsole)
 xfce_ok    && APPS+=(xfce)
-label() { case "$1" in gnome) echo "GNOME Terminal" ;; konsole) echo Konsole ;; xfce) echo "Xfce Terminal" ;; esac; }
+[ ${#APPS[@]} -eq 0 ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && APPS+=(bashrc)   # some other terminal app
+label() { case "$1" in gnome) echo "GNOME Terminal" ;; konsole) echo Konsole ;; xfce) echo "Xfce Terminal" ;;
+                       bashrc) echo "your terminal (through ~/.bashrc)" ;; esac; }
 
 manual() {
     dim "  No supported terminal app found here. In your terminal's preferences, set the profile's"
@@ -131,7 +152,10 @@ case "$ACTION" in
         for a in "${todo[@]}"; do
             if "${a}_set"; then green "  $(label "$a"): new windows open aisha"; else yellow "  $(label "$a"): could not change it"; fi
         done
-        dim "  undo with: packaging/terminal-default.sh unset" ;;
+        if bashrc_is_set; then
+            dim "  (added to ~/.bashrc; for plain bash in one window: AISHA_SKIP=1 bash, or type bash inside aisha)"
+        fi
+        dim "  open a new terminal window to see it. Undo with: packaging/terminal-default.sh unset" ;;
     unset)
         for a in "${APPS[@]}"; do
             if "${a}_is_set"; then "${a}_unset" && green "  $(label "$a"): back to your login shell"; fi

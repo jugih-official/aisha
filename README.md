@@ -275,9 +275,13 @@ It asks two things:
   installs it without asking (`--with-llm 1.5b` or `3b` for a bigger model),
   `--no-llm` skips the question, and `aisha --setup` adds it any time later.
   `./update.sh` only reports it, it doesn't ask.
-- **Open aisha in new terminal windows?** For GNOME Terminal (which Ubuntu
-  and Linux Mint use too), Konsole and Xfce Terminal. Logins, ssh and
-  scripts keep bash either way. Change it later with
+- **Open aisha in new terminal windows?** GNOME Terminal (Ubuntu, Linux
+  Mint Cinnamon) and Konsole get it in their profile. Xfce Terminal (Linux
+  Mint Xfce, Xubuntu) and any other terminal app get four lines in
+  `~/.bashrc` that start aisha in a terminal window. Xfce Terminal keeps its
+  settings in memory, so changing them from outside doesn't stick. Logins,
+  ssh, text consoles and scripts keep bash either way; `AISHA_SKIP=1 bash`
+  gives plain bash in one window. Change it later with
   `packaging/terminal-default.sh set`, `unset` or `status`.
 
 `./install.sh --no-ask` skips both questions. To use aisha everywhere, including ssh, make
