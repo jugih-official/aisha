@@ -280,7 +280,7 @@ It asks two things:
   scripts keep bash either way. Change it later with
   `packaging/terminal-default.sh set`, `unset` or `status`.
 
-Neither is asked again on updates; `./install.sh --no-ask` skips both. To use aisha everywhere, including ssh, make
+`./install.sh --no-ask` skips both questions. To use aisha everywhere, including ssh, make
 it your login shell: `chsh -s /usr/bin/aisha` (back: `chsh -s /bin/bash`).
 
 To update, run `./update.sh` in this folder: it pulls the latest version and
