@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# update.sh — pull the latest version from GitHub and reinstall.
+# update.sh — pull the latest aisha from GitHub and reinstall it the way it was installed:
+#   from the Debian package -> rebuilds the package and installs it
+#   with ./install.sh       -> runs ./install.sh again (asks nothing)
+# ./update.sh deb | local  overrides the guess.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -39,4 +42,23 @@ else
 fi
 
 echo
-./install.sh
+mode="${1:-}"
+if [ -z "$mode" ]; then
+    if dpkg -S /usr/bin/aisha >/dev/null 2>&1; then
+        mode=deb
+    else
+        mode=local
+    fi
+fi
+case "$mode" in
+    deb)
+        echo "aisha came from the Debian package: rebuilding and reinstalling it."
+        rm -f dist/aisha_*_all.deb
+        packaging/debian/build-deb.sh
+        sudo apt install -y --reinstall ./dist/aisha_*_all.deb ;;
+    local|aisha) ./install.sh ;;
+    *) red "unknown mode: $mode (use deb or local)"; exit 2 ;;
+esac
+if [ -e /usr/local/bin/ai ] || [ -e /usr/local/bin/ai-code ]; then
+    dim "The old ai tools are still in /usr/local/bin; ./uninstall.sh offers to remove them."
+fi

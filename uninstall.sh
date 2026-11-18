@@ -1,18 +1,15 @@
 #!/usr/bin/env bash
-# uninstall.sh — remove `ai` and (optionally) its API-key files.
+# uninstall.sh — remove aisha. Asks before deleting your settings or a downloaded model.
 set -euo pipefail
 
-BIN_TARGET=/usr/local/bin/ai
-BROWSER_BIN_TARGET=/usr/local/bin/ai-browser
-DESKTOP_BIN_TARGET=/usr/local/bin/ai-desktop
-CODE_BIN_TARGET=/usr/local/bin/ai-code
 AISHA_BIN_TARGET=/usr/local/bin/aisha
 AISHA_LIB_DIR=/usr/local/lib/aisha
 AISHA_DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/aisha"
 AISHA_CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/aisha"
-BROWSER_PREFIX=/opt/ai-bash
-CFG_DIR_USER="$HOME/.config/ai-bash"
-CFG_DIR_SYS=/etc/ai-bash
+# Left over from when this repo was ai-prompt and also installed the ai tools.
+OLD_BINS=(/usr/local/bin/ai /usr/local/bin/ai-browser /usr/local/bin/ai-desktop /usr/local/bin/ai-code)
+OLD_DIRS_SUDO=(/opt/ai-bash /etc/ai-bash)
+OLD_DIRS_USER=("$HOME/.config/ai-bash")
 
 red()    { printf '\033[1;31m%s\033[0m\n' "$*"; }
 green()  { printf '\033[1;32m%s\033[0m\n' "$*"; }
@@ -34,70 +31,49 @@ remove_path() {
     green "  removed $path"
 }
 
-echo "Uninstalling aisha and the ai tools."
-remove_path "$BIN_TARGET" sudo
-remove_path "$BROWSER_BIN_TARGET" sudo
-remove_path "$DESKTOP_BIN_TARGET" sudo
-remove_path "$CODE_BIN_TARGET" sudo
+ask() {  # ask "question" -> 0 on yes
+    local yn
+    read -r -p "$1 [y/N] " yn
+    case "${yn,,}" in y|yes) return 0 ;; *) return 1 ;; esac
+}
+
+echo "Uninstalling aisha."
 remove_path "$AISHA_BIN_TARGET" sudo
 remove_path "$AISHA_LIB_DIR" sudo
-remove_path "$BROWSER_PREFIX" sudo
-
-# ai-code's Modal GPU backend, if it was deployed. Offer to stop it so it
-# stops reserving any resources (it already scales to zero when idle).
-if command -v modal >/dev/null 2>&1 && modal profile current >/dev/null 2>&1; then
-    if modal app list 2>/dev/null | grep -q "ai-code-llm"; then
-        echo
-        yellow "ai-code's Modal app 'ai-code-llm' is deployed."
-        read -r -p "Stop it on Modal now? [y/N] " yn
-        case "${yn,,}" in
-            y|yes) modal app stop ai-code-llm && green "  stopped ai-code-llm" || yellow "  could not stop it (do it manually: modal app stop ai-code-llm)" ;;
-            *)     dim "  left it running (it scales to zero when idle)." ;;
-        esac
-    fi
+if dpkg -S /usr/bin/aisha >/dev/null 2>&1; then
+    yellow "The aisha Debian package is installed too."
+    ask "Remove it (sudo apt remove aisha)?" && sudo apt remove -y aisha || dim "  kept the package."
 fi
 
-# aisha's downloaded local model (llama.cpp + GGUF), if any.
+# The optional local model (llama.cpp + GGUF), if aisha --setup downloaded one.
 if [ -e "$AISHA_DATA_DIR" ]; then
     echo
     yellow "aisha's local model files are in $AISHA_DATA_DIR ($(du -sh "$AISHA_DATA_DIR" 2>/dev/null | cut -f1))."
-    read -r -p "Delete them? [y/N] " yn
-    case "${yn,,}" in
-        y|yes) remove_path "$AISHA_DATA_DIR" user ;;
-        *)     dim "  kept them." ;;
-    esac
+    ask "Delete them?" && remove_path "$AISHA_DATA_DIR" user || dim "  kept them."
 fi
 
-# aisha's settings, learned phrases and history.
+# Settings, learned phrases and history.
 if [ -e "$AISHA_CFG_DIR" ]; then
     echo
     yellow "aisha's settings, learned phrases and history are in $AISHA_CFG_DIR."
-    read -r -p "Delete them? [y/N] " yn
-    case "${yn,,}" in
-        y|yes) remove_path "$AISHA_CFG_DIR" user ;;
-        *)     dim "  kept them." ;;
-    esac
+    ask "Delete them?" && remove_path "$AISHA_CFG_DIR" user || dim "  kept them."
 fi
 
-# API-key files. Ask before deleting — they hold secrets the user may
-# want to keep for a future reinstall.
-echo
-if [ -e "$CFG_DIR_USER" ] || [ -e "$CFG_DIR_SYS" ]; then
-    yellow "Config files exist (Anthropic key, and any ai-code endpoint/key)."
-    [ -e "$CFG_DIR_USER" ] && echo "  - $CFG_DIR_USER"
-    [ -e "$CFG_DIR_SYS"  ] && echo "  - $CFG_DIR_SYS"
-    read -r -p "Delete them too? [y/N] " yn
-    case "${yn,,}" in
-        y|yes)
-            [ -e "$CFG_DIR_USER" ] && remove_path "$CFG_DIR_USER" user
-            [ -e "$CFG_DIR_SYS"  ] && remove_path "$CFG_DIR_SYS"  sudo
-            ;;
-        *)
-            dim "  kept key files."
-            ;;
-    esac
-else
-    dim "  no key files to remove."
+# The old ai tools, if an earlier install.sh put them here.
+old=()
+for p in "${OLD_BINS[@]}" "${OLD_DIRS_SUDO[@]}" "${OLD_DIRS_USER[@]}"; do
+    [ -e "$p" ] && old+=("$p")
+done
+if [ ${#old[@]} -gt 0 ]; then
+    echo
+    yellow "Left over from the old ai tools (ai, ai-browser, ai-desktop, ai-code), including any saved API keys:"
+    printf '  - %s\n' "${old[@]}"
+    if ask "Delete them too?"; then
+        for p in "${OLD_BINS[@]}" "${OLD_DIRS_SUDO[@]}"; do [ -e "$p" ] && remove_path "$p" sudo; done
+        for p in "${OLD_DIRS_USER[@]}"; do [ -e "$p" ] && remove_path "$p" user; done
+    else
+        dim "  kept them."
+    fi
 fi
 
 echo

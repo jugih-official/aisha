@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>aisha • Getting Started</title>
-  <meta name="description" content="Install and use aisha, the shell you can talk to, and the ai tools." />
+  <meta name="description" content="Install and use aisha, the shell you can talk to." />
   <link rel="stylesheet" href="../styles.css" />
 </head>
 <body>
@@ -19,16 +19,19 @@
     </nav>
     <section class="container">
       <h1>Getting Started</h1>
-      <p class="subtitle">Install once and start asking for shell tasks in natural language.</p>
+      <p class="subtitle">Install once and start asking for shell tasks in plain words.</p>
     </section>
   </header>
 
   <main class="container two-col">
     <section class="card">
       <h2>Install</h2>
-      <pre><code>./install.sh</code></pre>
-      <p>The installer places <code>aisha</code> and the <code>ai</code> tools in <code>/usr/local/bin</code> and can optionally configure browser tools.
-      On Debian you can build a package instead: <code>packaging/debian/build-deb.sh</code>.</p>
+      <pre><code>git clone https://github.com/jugih-official/aisha.git
+cd aisha
+packaging/debian/build-deb.sh
+sudo apt install ./dist/aisha_*_all.deb</code></pre>
+      <p>Or <code>./install.sh</code>, which puts aisha in <code>/usr/local</code> and asks nothing.
+      Needs Python 3.9+ (Debian 11 or newer).</p>
     </section>
 
     <section class="card">
@@ -36,21 +39,17 @@
       <pre><code>aisha
 find files older than 2 months
 list all files here by size
-show free on usb</code></pre>
-      <p>Start <code>aisha</code> and talk to it, or use the one-shot <code>ai</code> tool:</p>
-      <pre><code>ai list all files in cwd
-ai how much RAM is free
-ai search the web for the latest python release</code></pre>
-      <p>Use <code>-n</code> for dry-run and <code>-v</code> for verbose fetch details.</p>
+show free on usb
+delete everything except report.pdf</code></pre>
+      <p>aisha prints what it understood before running. <code>aisha -n …</code> or "how do I …" only shows the command.</p>
     </section>
 
     <section class="card">
-      <h2>API key lookup order</h2>
-      <ol>
-        <li><code>ANTHROPIC_API_KEY</code></li>
-        <li><code>~/.config/ai-bash/anthropic-api-key</code></li>
-        <li><code>/etc/ai-bash/anthropic-api-key</code></li>
-      </ol>
+      <h2>Update and remove</h2>
+      <pre><code>./update.sh
+./uninstall.sh</code></pre>
+      <p><code>update.sh</code> pulls the latest version and reinstalls it the way you installed it.
+      <code>uninstall.sh</code> asks before deleting your settings in <code>~/.config/aisha</code>.</p>
     </section>
 
     <section class="card">
@@ -63,7 +62,7 @@ ai search the web for the latest python release</code></pre>
   </main>
 
   <footer class="footer container">
-    <p>Need details? Check the README for full examples, browser options, and safety notes.</p>
+    <p>Need details? The README has the full list of requests, the safety rules and the optional local model.</p>
   </footer>
 </body>
 </html>
