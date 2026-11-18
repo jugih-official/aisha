@@ -3,18 +3,18 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>ai • Getting Started</title>
-  <meta name="description" content="Install and use ai, the natural-language bash assistant." />
+  <title>aisha • Getting Started</title>
+  <meta name="description" content="Install and use aisha, the shell you can talk to, and the ai tools." />
   <link rel="stylesheet" href="../styles.css" />
 </head>
 <body>
   <header class="subhero">
     <nav class="nav container">
-      <a class="brand" href="../index.html">ai</a>
+      <a class="brand" href="../index.html">aisha</a>
       <div class="links">
         <a href="../index.html">Home</a>
         <a href="getting-started.html">Getting Started</a>
-        <a href="https://github.com/jugih-official/ai-prompt" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/jugih-official/aisha" target="_blank" rel="noopener">GitHub</a>
       </div>
     </nav>
     <section class="container">
@@ -27,11 +27,17 @@
     <section class="card">
       <h2>Install</h2>
       <pre><code>./install.sh</code></pre>
-      <p>The installer places <code>ai</code> in <code>/usr/local/bin/ai</code> and can optionally configure browser tools.</p>
+      <p>The installer places <code>aisha</code> and the <code>ai</code> tools in <code>/usr/local/bin</code> and can optionally configure browser tools.
+      On Debian you can build a package instead: <code>packaging/debian/build-deb.sh</code>.</p>
     </section>
 
     <section class="card">
       <h2>Quick usage</h2>
+      <pre><code>aisha
+find files older than 2 months
+list all files here by size
+show free on usb</code></pre>
+      <p>Start <code>aisha</code> and talk to it, or use the one-shot <code>ai</code> tool:</p>
       <pre><code>ai list all files in cwd
 ai how much RAM is free
 ai search the web for the latest python release</code></pre>
@@ -50,7 +56,7 @@ ai search the web for the latest python release</code></pre>
     <section class="card">
       <h2>Project links</h2>
       <ul>
-        <li><a href="https://github.com/jugih-official/ai-prompt" target="_blank" rel="noopener">Repository</a></li>
+        <li><a href="https://github.com/jugih-official/aisha" target="_blank" rel="noopener">Repository</a></li>
         <li><a href="../README.md">README in this repo</a></li>
       </ul>
     </section>

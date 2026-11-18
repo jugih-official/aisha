@@ -43,7 +43,7 @@ awk '/^## Natural-language shell \(aisha\)/{on=1} on && /^## / && !/aisha/{exit}
 cat > "$PKG/usr/share/doc/aisha/copyright" <<EOF
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: aisha
-Source: https://github.com/jugih-official/ai-prompt
+Source: https://github.com/jugih-official/aisha
 
 Files: *
 Copyright: jugih-official
@@ -71,7 +71,7 @@ Depends: python3 (>= 3.9), bash, coreutils, findutils, grep, debianutils
 Recommends: procps, iproute2, sensible-utils, less
 Suggests: zip, unzip, xdg-utils
 Maintainer: $MAINTAINER
-Homepage: https://github.com/jugih-official/ai-prompt
+Homepage: https://github.com/jugih-official/aisha
 Description: natural-language shell with a local LLM fallback
  aisha runs bash commands as usual and also understands plain requests
  such as "find recursively files older than 2 months from this folder"

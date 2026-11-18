@@ -33,7 +33,7 @@ remove_path() {
     green "  removed $path"
 }
 
-echo "Uninstalling ai-bash."
+echo "Uninstalling aisha and the ai tools."
 remove_path "$BIN_TARGET" sudo
 remove_path "$BROWSER_BIN_TARGET" sudo
 remove_path "$DESKTOP_BIN_TARGET" sudo

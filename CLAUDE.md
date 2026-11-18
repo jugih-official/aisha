@@ -1,4 +1,4 @@
-# ai-prompt
+# aisha (formerly ai-prompt)
 
 ## git-map
 
