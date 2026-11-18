@@ -870,3 +870,11 @@ tail the nginx logs	journalctl -u nginx -f
 watch nginx logs live	journalctl -u nginx -f
 kill all python processes except jupyter	grep -v -- jupyter
 stop python but keep jupyter running	grep -v -- jupyter
+# --- running a file or a program
+run run.sh	bash run.sh
+execute run.sh	bash run.sh
+run the script run.sh	bash run.sh
+start run.sh	bash run.sh
+run src/main.py	python3 src/main.py
+run run.sh as root	sudo bash run.sh || bash run.sh
+run ls	ls

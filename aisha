@@ -49,7 +49,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 NAME = "ai$ha"             # the shell's name as shown: ai shell hybrid alpha. The command stays `aisha`
 TAGLINE = "ai shell hybrid alpha"   # ($ in a command name would be read as a variable by every shell)
 
@@ -1798,7 +1798,8 @@ def h_read(u: Utterance) -> Plan | None:
     elif mode == "program":
         cmd, intent = f"{program[0]} {q}", "open"
         why.append(f"with {program[0]}")
-    elif verb == "open" and not is_text(os.path.join(u.cwd, os.path.expanduser(path))):
+    elif verb == "open" and (not is_text(os.path.join(u.cwd, os.path.expanduser(path)))
+                             or re.search(BINARY_EXT, path.lower())):
         intent = "open"
         if shutil.which("xdg-open") and (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
             cmd = f"xdg-open {q}"
@@ -3828,7 +3829,64 @@ def _purge(vals, u):
     return f"{sudo()}apt purge {q} && {sudo()}apt autoremove"
 
 
+INTERPRETERS = {".sh": "bash", ".bash": "bash", ".py": "python3", ".js": "node", ".pl": "perl", ".rb": "ruby",
+                ".php": "php", ".lua": "lua"}
+
+
+def _run_args(vals, u) -> str:
+    return "".join(" " + shlex.quote(u.lit(a)) for a in (vals.get("_raw_args") or "").split())
+
+
+def _run_file(vals, u):
+    """'run install.sh' -> ./install.sh (or bash install.sh when it is not executable)."""
+    path = _lit(vals, "path", u)
+    full = os.path.join(u.cwd, os.path.expanduser(path))
+    if not os.path.isfile(full):
+        return None
+    shown = path if path.startswith(("/", "./", "../", "~")) else "./" + path
+    ext = os.path.splitext(path)[1].lower()
+    if os.access(full, os.X_OK):
+        cmd = shlex.quote(shown) if shown != shown.replace(" ", "") else shown
+    elif ext in INTERPRETERS:
+        cmd = f"{INTERPRETERS[ext]} {qpath(path)}"
+    else:
+        try:
+            with open(full, "rb") as f:
+                first = f.readline(200)
+        except OSError:
+            return None
+        m = re.match(rb"#!\s*(\S+)(?:\s+(\S+))?", first)
+        if not m:
+            return None                  # not a program: "run notes.txt" means nothing
+        prog = (m.group(2) if m.group(1).endswith(b"/env") and m.group(2) else m.group(1)).decode(errors="replace")
+        cmd = f"{os.path.basename(prog)} {qpath(path)}"
+    root = "sudo " if vals.get("_raw_root") else ""
+    return root + cmd + _run_args(vals, u)
+
+
+def _run_program(vals, u):
+    """'run htop', 'launch firefox': a program on PATH (a file here is run by 'run file')."""
+    name = _lit(vals, "word", u)
+    if os.path.exists(os.path.join(u.cwd, name)) or not shutil.which(name) or name in ("the", "it", "this"):
+        return None
+    verb = vals["_raw_verb"].lower()
+    root = "sudo " if vals.get("_raw_root") else ""
+    if verb in ("launch", "open", "start") and GUI and not root:
+        return f"nohup {shlex.quote(name)}{_run_args(vals, u)} >/dev/null 2>&1 &"
+    return root + shlex.quote(name) + _run_args(vals, u)
+
+
+RUN_VERB = r"(?P<verb>run|execute|exec|start|launch|open)"
+RUN_TAIL = r"(?P<args>(?:\s+(?:-\S+|qlit\d+|\d+))*)(?P<root>\s+(?:as\s+root|with\s+sudo|as\s+admin))?\s*$"
+
+
 GAME_RECIPES = [
+    # -- running things
+    Recipe("run file", [rf"^\s*{RUN_VERB}\s+(?:the\s+|my\s+)?(?:script|program|file|installer)?\s*(?:called\s+|named\s+)?{P}{RUN_TAIL}",
+                        rf"^\s*{RUN_VERB}\s+(?:the\s+)?(?:script|program|file)\s+(?:called\s+|named\s+)?{P}{RUN_TAIL}"],
+           _run_file),
+    Recipe("run program", [rf"^\s*{RUN_VERB}\s+(?:the\s+)?(?:program\s+|app\s+|command\s+)?(?P<word>[a-z][\w.+-]*){RUN_TAIL}"],
+           _run_program),
     # -- text
     Recipe("lines without", [rf"\b(?:show\s+|print\s+|list\s+)?(?:the\s+|all\s+)?(?:lines?|rows?)\s+(?:in|of|from)\s+{F}\s+(?:that\s+)?(?:don'?t|do\s+not|doesn'?t|does\s+not|not|without)\s+(?:contain(?:ing)?\s+|have\s+|having\s+|include\s+|mention\s+|match\s+)?(?P<text>\S+)\s*$",
                              rf"\b(?:show\s+|print\s+|list\s+)?(?:the\s+|all\s+)?(?:lines?|rows?)\s+(?:that\s+)?(?:don'?t|do\s+not|doesn'?t|does\s+not|not|without)\s+(?:contain(?:ing)?\s+|have\s+|having\s+|include\s+|mention\s+|match\s+)?(?P<text>\S+)\s+(?:in|of|from)\s+{F}\s*$",

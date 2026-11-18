@@ -1142,6 +1142,28 @@ class TestFindingsGame(LabTest):
             self.assertEqual(sh.handle(line), 0, line)
 
 
+class TestRunThings(LabTest):
+    def test_run_an_executable_file_here(self):
+        path = os.path.join(self.lab, "install.sh")
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\necho installed\n")
+        os.chmod(path, 0o755)
+        self.assertEqual(self.cmd("run install.sh"), "./install.sh")
+        self.assertEqual(self.cmd("run install.sh --no-ask"), "./install.sh --no-ask")
+        r = subprocess.run(["bash", "-c", self.cmd("run install.sh")], cwd=self.lab, capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), "installed")
+
+    def test_a_script_without_x_runs_through_its_interpreter(self):
+        with open(os.path.join(self.lab, "tool"), "w") as f:
+            f.write("#!/usr/bin/env python3\nprint(1)\n")
+        self.assertEqual(self.cmd("run tool"), "python3 tool")
+
+    def test_a_text_file_is_not_run(self):
+        p = self.plan("run README.md")
+        self.assertFalse(p and p.confidence >= aisha.DEFAULTS["threshold"] and "README.md" in p.command
+                         and not p.command.startswith(("cat", "less")))
+
+
 class zipfile_lab:
     def __init__(self, lab):
         self.lab = lab
