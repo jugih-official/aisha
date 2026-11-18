@@ -49,7 +49,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 NAME = "ai$ha"             # the shell's name as shown: ai shell hybrid alpha. The command stays `aisha`
 TAGLINE = "ai shell hybrid alpha"   # ($ in a command name would be read as a variable by every shell)
 
@@ -5923,8 +5923,8 @@ class Runtime:
         return self.proc is not None and self.proc.poll() is None
 
     def start(self) -> None:
-        if self.running():
-            return
+        if self.running() or server_answers(f"http://127.0.0.1:{self.port}/v1"):
+            return                       # this window's, or one another aisha window started
         os.makedirs(DATA_DIR, exist_ok=True)
         log_path = os.path.join(DATA_DIR, "llama-server.log")
         server = self.cfg["llm_server"]
@@ -5974,6 +5974,9 @@ class Runtime:
         while time.time() < deadline:
             if self.proc.poll() is not None:
                 clear()
+                if server_answers(f"http://127.0.0.1:{self.port}/v1"):
+                    self.proc = None             # another window started it at the same moment: use that one
+                    return ""
                 return f"the model server stopped (exit {self.proc.returncode}); its output:\n" + log_tail()
             try:
                 with url_open(health, timeout=2) as r:
@@ -5998,13 +6001,86 @@ class Runtime:
                 f"the model server did not become ready in time and printed nothing (see {log_path})")
 
     def stop(self) -> None:
+        """At exit: the model server is shared by every aisha window, so the last one stops it."""
         if self.running():
+            if other_aishas():
+                self._write_pid(self.proc.pid)   # another window still uses it; the last one stops it
+                self.proc = None
+                return
             self.proc.terminate()
             try:
                 self.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+            self._write_pid(None)
         self.proc = None
+
+    def stop_if_last(self) -> None:
+        """At exit of a window that used a server another window started."""
+        if self.running() or other_aishas():
+            return
+        pid = self._read_pid()
+        if pid and _cmdline(pid).find(os.path.basename(self.cfg.get("llm_model_file") or "\0")) >= 0:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        self._write_pid(None)
+
+    @property
+    def pid_file(self) -> str:
+        return os.path.join(DATA_DIR, "llama-server.pid")
+
+    def _write_pid(self, pid: int | None) -> None:
+        try:
+            if pid:
+                with open(self.pid_file, "w") as f:
+                    f.write(str(pid))
+            elif os.path.exists(self.pid_file):
+                os.remove(self.pid_file)
+        except OSError:
+            pass
+
+    def _read_pid(self) -> int | None:
+        try:
+            with open(self.pid_file) as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+
+
+def _cmdline(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\0", b" ").decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def other_aishas() -> list[int]:
+    """Other aisha shells running as this user (interactive ones, not 'aisha -c' or -n)."""
+    me, out = os.getpid(), []
+    try:
+        pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return out
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    for pid in pids:
+        if pid == me:
+            continue
+        try:
+            if uid is not None and os.stat(f"/proc/{pid}").st_uid != uid:
+                continue
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                args = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+        except OSError:
+            continue
+        if not args:
+            continue
+        prog = next((a for a in args[:3] if os.path.basename(a) in ("aisha", "aisha.py")), None)
+        if prog and not any(a in ("-c", "-n", "--setup", "--version", "--lines") for a in args[args.index(prog) + 1:]):
+            out.append(pid)
+    return out
 
 
 def ollama_models(url: str) -> list[str]:
@@ -6091,6 +6167,9 @@ class LLM:
             hint = "" if self._hinted else " Run 'aisha --setup' to add a local model."
             self._hinted = True
             raise LLMError(f"no LLM reachable at {self.cfg['llm_url']} ({reason}).{hint}") from None
+        if self.runtime.configured and not self.runtime.running() and not getattr(self, "_watch_last", False):
+            self._watch_last = True          # a server another window started: stop it if we are the last
+            atexit.register(self.runtime.stop_if_last)
         try:
             return data["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError, TypeError):
@@ -6987,7 +7066,7 @@ class Shell:
         where = "~" + self.cwd[len(home):] if self.cwd == home or self.cwd.startswith(home + "/") else self.cwd
         if len(where) > 40:
             where = "…/" + "/".join(where.rstrip("/").split("/")[-2:])
-        mark = "❯" if self.rc == 0 else "✗"
+        mark = "❯"                      # red when the last command failed (in colour)
         branch = git_branch(self.cwd) if self.cfg.get("prompt_git", False) else ""
         if not (sys.stdout.isatty() and not os.environ.get("NO_COLOR")):
             return f"{NAME} {where}{' git:' + branch if branch else ''} {mark} "
