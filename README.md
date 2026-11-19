@@ -65,6 +65,33 @@ About 240 kinds of request, without a model:
   in the name, world-writable, unreadable, not mine, not executable, full
   path, size in bytes, empty a folder but keep it, add a file to a zip,
   password-protected zips, extract one file, the real trash.
+- **Search** — `search` (or look for, hunt for, seek, scan, dig up, track
+  down, locate, grep) in the ways people say it. `search` on its own lists
+  examples. aisha takes these words even where a `search` program is
+  installed (Linux Mint has one); `search -flags` still runs that program.
+  - *a file name is a name:* `search for main.py`, `look up notes.txt`,
+    `search the whole computer for nginx.conf` find the file (`-iname`), they
+    never grep for its name; `main.py or notes.txt` finds either
+  - *search <place> for <what>:* run1, ~/data, here, home, my downloads /
+    documents / desktop, the system / everywhere (`/`), python files, the
+    code. Text gives the matching lines; a kind of file finds those files
+    (`search downloads for pdfs`, `scan run1 for csv files`)
+  - *by name or by content, in so many words:* search file names / titles /
+    pdf names for X, by name, with X in the name; search file contents / the
+    text of files for X, by content
+  - *text:* the word / phrase / text X, lines containing X, "quoted words",
+    where does X appear, where is TODO used in the code, in which file is X
+    mentioned, which files have the word X
+  - *how:* case sensitive or ignoring case, whole word, only file names
+    (`grep -l`), exactly (`-name Notes`), X or Y, since monday / after a date
+    / before a date
+  - *where things are:* which folder is notes.txt in (prints the folder),
+    full path of X, does X exist / check if there is a pdf here (prints
+    `not found: X` when there is none)
+
+  Folders are matched by name, never grepped. `tests/search_phrases.tsv`
+  holds 126 wordings; every command that stays inside the test folder is also
+  run.
 - **Text** — line N or lines N–M, line numbers, sort, unique lines, remove
   duplicate lines, count matches, reverse, pretty-print JSON, CSV as a
   table, append or write a line, empty a file, base64, upper/lower case,

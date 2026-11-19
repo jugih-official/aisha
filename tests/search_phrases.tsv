@@ -1,0 +1,141 @@
+# phrase	expected — searching files, folders and text, in the words people use for it.
+# Same format as phrases.tsv (fragments separated by " ;; ", alternatives by " || ").
+# Runs against test_aisha.make_corpus(); every command that stays below the lab is also run.
+# -- the bare word, and search with plain words (also where a `search` program is installed)
+search	you can say
+search notes	-iname '*note*' ;; grep -IqiF -e note
+search pressure	pressur
+search notes.txt	-iname notes.txt
+search report.pdf	-iname report.pdf
+search main.py	-iname main.py
+search *.py	-iname '*.py'
+search dir src	-type d ;; -iname '*src*'
+search inside src	find src
+search "pressure"	grep -rniIF ;; pressure
+# -- a file name is a name to find, never text to grep for
+search for main.py	find . ;; -iname main.py
+search for the file notes.txt	-iname notes.txt
+look for notes.txt	-iname notes.txt
+hunt for report.pdf	-iname report.pdf
+track down main.py	-iname main.py
+seek report.pdf	-iname report.pdf
+browse for notes.txt	-iname notes.txt
+lookup notes.txt	-iname notes.txt
+look up notes.txt	-iname notes.txt
+can you find notes.txt	-iname notes.txt
+i am looking for notes.txt	-iname notes.txt
+show me where main.py is	find . ;; -iname main.py
+find main.py in src	find src ;; -iname main.py
+search my home for report.pdf	find ~ ;; -iname report.pdf
+search the whole computer for report.pdf	find / -xdev ;; -iname report.pdf
+search everywhere for report.pdf	find / -xdev ;; -iname report.pdf
+search the system for nginx.conf	find / -xdev ;; -iname nginx.conf
+search for *.csv	-iname '*.csv'
+# -- folders are found by name
+search folder src	-type d ;; -iname '*src*'
+search for the src directory	-type d ;; -iname '*src*'
+locate folder src	-type d ;; -iname '*src*'
+# -- places said in words: search <place> for <what>
+search run1 for pressure	grep -rniIF ;; pressure run1
+search in run1 for pressure	pressure run1
+look through run1 for notes	notes run1
+look in run1 for pressure	pressure run1
+search through run1 for pressure	pressure run1
+search downloads for pdf	find ~/Downloads ;; *.pdf
+search the documents folder for budget	budget ~/Documents
+search my documents for budget	budget ~/Documents
+search home folder for pdfs	find ~ ;; *.pdf
+scan the folder for pdfs	find . ;; *.pdf
+scan run1 for csv files	find run1 ;; *.csv
+look inside run1 for csv files	find run1 ;; *.csv
+check run1 for csv files	find run1 ;; *.csv
+search everything for pressure	grep -rniIF ;; pressure
+search across all files for pressure	grep -rniIF ;; pressure
+search all python files for TODO	--include='*.py' ;; TODO
+search python files for print or TODO	--include='*.py' ;; -e print -e TODO
+search my code for print	--include='*.py' ;; print
+search the code for TODO	--include='*.py' ;; TODO
+# -- by name or by content, said in so many words
+search filenames for notes	-iname '*note*'
+search file names for notes	-iname '*note*'
+search by name notes	-iname '*note*'
+search files by name measur	-iname '*measur*'
+find files with note in the name	-iname '*note*'
+search names containing note	-iname '*note*'
+search file contents for pressure	grep -rniIF ;; pressure
+search the contents of files for pressure	grep -rniIF ;; pressure
+search by content pressure	grep -rniIF ;; pressure
+# -- text: the word, the phrase, lines
+search the word pressure	grep -rniIF ;; pressure
+search for the text pressure	grep -rniIF ;; pressure
+search for the phrase "measured pressure"	'measured pressure'
+search for lines containing pressure	grep -rniIF ;; pressure
+search for text pressure in csv files	--include='*.csv' ;; pressure
+search for the word pressure in all files	grep -rniIF ;; pressure
+grep pressure	grep -rniIF ;; pressure
+grep for pressure	grep -rniIF ;; pressure
+grep pressure in txt files	--include='*.txt' ;; pressure
+# -- how: case, whole words, only file names, exactly, or
+search for notes case sensitive	grep -rnIF ;; notes
+search for pressure in run1 case sensitive	grep -rnIF ;; pressure run1
+search for pressure ignoring case	grep -rniIF ;; pressure
+search for error case sensitive in logs.txt	grep -nF -- error logs.txt
+search for error exactly in logs.txt	grep -nF -- error logs.txt
+search for whole word pressure	grep -rniIFw ;; pressure
+search for the exact word pressure	Fw ;; pressure
+search for pressure, show only file names	grep -rliIF ;; pressure
+search for pressure and list the files	grep -rliIF ;; pressure
+search for Notes exactly	-name Notes
+search exact name notes.txt	-name notes.txt
+search run1 for pressure or temperature	-e pressure -e temperature ;; run1
+search for pressure or temperature	-o \( -iname '*temperatur*'
+search for files containing pressure or temperature	-exec grep -IqiF -e pressur {} \; -o -exec grep -IqiF -e temperatur
+# -- name shapes
+search for files starting with notes	-iname 'notes*'
+search for files ending with .txt	-iname '*.txt'
+search files that start with m	-iname 'm*'
+find files that end in csv	-iname '*.csv'
+# -- dates
+search for files modified after monday	-newermt 'last monday'
+search for files changed since yesterday	-newermt 'yesterday 00:00'
+find files modified before 2026-01-01	! -newermt 2026-01-01
+search for files changed since 3 days ago	-newermt '3 days ago'
+# -- which folder, what path, does it exist
+which folder is notes.txt in	-iname notes.txt -printf '%h\n'
+what folder is notes.txt in	-iname notes.txt -printf '%h\n'
+which directory is main.py in	-iname main.py -printf '%h\n'
+in which folder is notes.txt	-iname notes.txt -printf '%h\n'
+find the folder where main.py is	-iname main.py -printf '%h\n'
+which folder has notes.txt	-iname notes.txt -printf '%h\n'
+get me the path of notes.txt	find "$PWD" ;; -iname notes.txt
+full path of README.md	realpath -- README.md
+does main.py exist	-iname main.py ;; || echo 'not found: main.py'
+does notes.txt exist in run1	find run1 ;; -iname notes.txt
+does a folder called src exist	-type d ;; *src*
+check if notes.txt exists	-iname notes.txt ;; not found
+check whether there is a pdf here	*.pdf ;; not found
+# -- not searches, or not this handler's: left to the others
+which folder is the largest	du -sh
+check backup.zip for errors	zipfile -t || unzip -t
+search the web for linux tips	duckduckgo
+search for a package called htop	search htop
+look up example.com	getent ahosts example.com
+# -- found while testing unseen wordings
+search for report	-iname '*report*'
+look for print	-iname '*print*'
+search titles for report	-iname '*report*'
+search pdf names for report	*.pdf ;; -iname '*report*'
+search for main.py or notes.txt	\( -iname main.py -o -iname notes.txt \)
+search for pressure (case sensitive)	grep -rnIF ;; -- pressure .
+look everywhere for notes.txt	find / -xdev ;; -iname notes.txt
+where does the word pressure appear	grep -rniIF ;; pressure
+find where the word pressure appears	grep -rniIF ;; pressure
+where is TODO used in the code	--include='*.py' ;; TODO
+in which file is pressure mentioned	grep -rliIF ;; pressure
+which files have the word eggs in them	grep -rliIF ;; eggs
+which files contain the word password	-exec grep -IqiF -e password
+search for files whose content mentions eggs	-exec grep -IqiF -e eggs
+search for executables in run1	find run1 ;; -executable
+find the path of main.py	find "$PWD" ;; -iname main.py
+search for notes but not in run1	-not -path './run1/*'
+search my desktop for screenshots	find ~/Desktop ;; *.png

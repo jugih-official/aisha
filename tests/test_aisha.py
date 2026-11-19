@@ -219,6 +219,71 @@ def check_phrase(phrase, expected, lab):
     return f"missing {missing} in: {plan.command}" if missing else None
 
 
+class TestSearchPhrases(unittest.TestCase):
+    """tests/search_phrases.tsv, and what the search commands really print."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.lab = self.tmp.name
+        make_corpus(self.lab)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def rows(self):
+        with open(os.path.join(HERE, "search_phrases.tsv")) as f:
+            return [l.rstrip("\n").split("\t") for l in f if l.strip() and not l.startswith("#")]
+
+    def out(self, phrase):
+        p = aisha.interpret(phrase, self.lab)
+        r = subprocess.run(["bash", "-c", p.command], cwd=self.lab, capture_output=True, text=True, timeout=20)
+        return r
+
+    def test_phrases(self):
+        failures = []
+        for phrase, expected in self.rows():
+            problem = check_phrase(phrase, expected, self.lab)
+            if problem:
+                failures.append(f"{phrase!r}: {problem}")
+        self.assertEqual(failures, [], "\n" + "\n".join(failures))
+
+    def test_commands_run(self):
+        """Every search that stays inside the lab is valid bash (grep/find exit 0 or 1, nothing on stderr)."""
+        bad = []
+        for phrase, _ in self.rows():
+            p = aisha.interpret(phrase, self.lab)
+            if not p or re.search(r"(?:^|\s)(?:~|/)(?:\s|/|$)|\$HOME|getent|xdg-open|apt|unzip|du ", p.command):
+                continue
+            r = subprocess.run(["bash", "-c", p.command], cwd=self.lab, capture_output=True, text=True, timeout=20)
+            if r.returncode > 1 or r.stderr.strip():
+                bad.append(f"{phrase!r}: {p.command} -> {r.returncode} {r.stderr.strip()[:120]}")
+        self.assertEqual(bad, [], "\n" + "\n".join(bad))
+
+    def test_results(self):
+        self.assertEqual(self.out("search for main.py").stdout.split(), ["./src/main.py"])
+        self.assertEqual(self.out("which folder is notes.txt in").stdout.split(), ["./run1"])
+        self.assertEqual(self.out("does zzz.txt exist").stdout.strip(), "not found: zzz.txt")
+        self.assertEqual(self.out("does notes.txt exist").stdout.split(), ["./run1/notes.txt"])
+        self.assertEqual(self.out("search run1 for pressure or eggs").stdout.count("\n"), 2)
+        self.assertEqual(self.out("search for Pressure case sensitive").stdout, "")
+        self.assertIn("run1/notes.txt", self.out("search for pressure, only file names").stdout)
+        self.assertEqual(sorted(self.out("search for *.csv").stdout.split()), ["./people.csv", "./run1/measurements_01.csv"])
+
+    def test_search_program_does_not_shadow_the_words(self):
+        """Linux Mint installs /usr/local/bin/search: plain words still go to aisha, its flags still go to it."""
+        with tempfile.TemporaryDirectory() as bindir:
+            fake = os.path.join(bindir, "search")
+            with open(fake, "w") as f:
+                f.write("#!/bin/sh\necho mint-search\n")
+            os.chmod(fake, 0o755)
+            path = bindir + os.pathsep + os.environ.get("PATH", "")
+            for line in ["search notes", "search run1 for pressure", "search for main.py", "search"]:
+                self.assertFalse(aisha.looks_like_shell(line, path, self.lab), line)
+            self.assertTrue(aisha.looks_like_shell("search -s in . for pressure", path, self.lab))
+        self.assertTrue(aisha.looks_like_shell("grep -rn pressure .", None, self.lab))
+        self.assertTrue(aisha.looks_like_shell("grep pressure run1/notes.txt", None, self.lab))
+
+
 class TestEverydayPhrases(LabTest):
     """The phrases people type most, with the variants and typos they type them with."""
 

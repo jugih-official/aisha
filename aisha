@@ -32,6 +32,7 @@ Standard library only. Python 3.9+.
 from __future__ import annotations
 
 import atexit
+import difflib
 import glob as globmod
 import json
 import os
@@ -49,7 +50,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.10.1"
+VERSION = "0.11.0"
 NAME = "ai$ha"             # the shell's name as shown: ai shell hybrid alpha. The command stays `aisha`
 TAGLINE = "ai shell hybrid alpha"   # ($ in a command name would be read as a variable by every shell)
 
@@ -390,6 +391,14 @@ def qpath(p: str) -> str:
     return shlex.quote(p)
 
 
+# Words that describe files rather than text in them ("search for executables in run1").
+FILE_KINDS = set("""
+big large huge small tiny empty hidden old new recent latest newest oldest biggest largest smallest
+executable executables symlink symlinks link links duplicates duplicate subfolders subdirectories dirs
+""".split())
+FILE_NAME = re.compile(r"[\w.+-]*[A-Za-z_][\w-]*\.[A-Za-z0-9]{1,8}")   # notes.txt, report.v2.pdf
+
+
 def is_pathlike(tok: str) -> bool:
     return (tok == ".." or bool(re.search(r"[/~*?]", tok))
             or bool(re.fullmatch(r"[\w.+-]*[A-Za-z_][\w-]*\.[A-Za-z0-9]{1,8}", tok)))
@@ -464,10 +473,11 @@ class Utterance:
     (file names keep their capitals). Quoted strings become qlitN tokens.
     """
 
-    def __init__(self, text: str, cwd: str, literals: list[str] | None = None):
+    def __init__(self, text: str, cwd: str, literals: list[str] | None = None, auto: set | None = None):
         self.raw = text
         self.cwd = cwd
         self.literals: list[str] = list(literals or [])
+        self.auto: set[int] = set(auto or ())   # literals typed bare (a file name), not "quoted"
         text = (text.replace("’", "'").replace("‘", "'")
                     .replace("“", '"').replace("”", '"'))
 
@@ -487,6 +497,7 @@ class Utterance:
             if ((is_pathlike(t) and not re.fullmatch(r"\*?\.[A-Za-z0-9]{1,8}|qlit\d+", t, re.I))
                     or (t.startswith(".") and len(t) > 1 and os.path.lexists(os.path.join(cwd, t)))):
                 self.literals.append(t)
+                self.auto.add(len(self.literals) - 1)
                 toks[i] = f"qlit{len(self.literals) - 1}"
         self.orig = " ".join(t for t in toks if t)
         self.low = "".join(c.lower() if len(c.lower()) == 1 else c for c in self.orig)
@@ -516,6 +527,14 @@ class Utterance:
     def lit(self, tok: str) -> str:
         m = re.fullmatch(r"qlit(\d+)", tok.lower())
         return self.literals[int(m.group(1))] if m else tok
+
+    def bare_name(self, tok: str) -> str | None:
+        """The file name a bare (unquoted) token like notes.txt stands for, else None."""
+        m = re.fullmatch(r"qlit(\d+)", tok.lower())
+        if not m or int(m.group(1)) not in self.auto:
+            return None
+        lit = self.literals[int(m.group(1))]
+        return lit if FILE_NAME.fullmatch(os.path.basename(lit.rstrip("/")) or "-") and "*" not in lit else None
 
     def remaining(self) -> list[tuple[str, str, int]]:
         """(low, orig, start) for each word still unmasked."""
@@ -554,6 +573,9 @@ class FindSpec:
     not_empty: bool = False
     not_hidden: bool = False
     no_ext: bool = False
+    case: bool = False               # names and text matched case-sensitively
+    or_content: bool = False         # "pressure or temperature": any keyword, not all
+    glob_here: bool = False          # a typed *.log made the search top-level only
 
     def narrowed(self) -> bool:
         return bool(self.exts or self.names or self.hidden or self.empty or self.executable
@@ -629,7 +651,32 @@ def time_args(n, unit: str, sign: str) -> list[str]:
     return ["-mmin", f"{sign}{round(days * 1440)}"]   # 2.5 months is not 2 months
 
 
+WEEKDAYS = r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+ISO_DATE = r"(?:19|20)\d\d-[01]?\d-[0-3]?\d"
+
+
+def take_since(u: Utterance, spec: FindSpec) -> bool:
+    """'modified since monday', 'changed after 2026-11-01', 'created before last week'."""
+    m = u.take(rf"\b{MOD}(since|after|before|until|till|prior\s+to)\s+(?:the\s+)?"
+               rf"(yesterday|today|this\s+morning|(?:last\s+)?{WEEKDAYS}|last\s+(?:week|month|year)|"
+               rf"(?:a|one|\d+)\s+(?:days?|weeks?|months?|years?)\s+ago|{ISO_DATE})\b")
+    if not m:
+        return False
+    rel, when = m.group(1), re.sub(r"\s+", " ", m.group(2))
+    date = {"yesterday": "yesterday 00:00", "today": "today 00:00", "this morning": "today 00:00",
+            "last week": "1 week ago", "last month": "1 month ago", "last year": "1 year ago"}.get(when, when)
+    if re.fullmatch(WEEKDAYS, when):
+        date = f"last {when}"
+    date = re.sub(r"^(?:a|one)\s", "1 ", date)
+    newer = rel in ("since", "after")
+    spec.time = (["-newermt"] if newer else ["!", "-newermt"]) + [shlex.quote(date)]
+    spec.why.append(f"modified {'since' if newer else 'before'} {when}")
+    return True
+
+
 def take_time(u: Utterance, spec: FindSpec) -> None:
+    if take_since(u, spec):
+        return
     if u.take(rf"\b{MOD}today\b"):
         spec.daystart, spec.time = True, ["-mtime", "0"]
         spec.why.append("modified today")
@@ -820,7 +867,8 @@ def home_alias(tok: str, cwd: str) -> str | None:
 
 # Words after "in" that are not folders ("in them", "in python files", "in total").
 NOT_PLACES = {"them", "it", "its", "their", "there", "total", "order", "detail", "details", "general",
-              "particular", "size", "use", "case", "full", "short", "summary", "bytes", "words", "lines"}
+              "particular", "size", "use", "case", "full", "short", "summary", "bytes", "words", "lines",
+              "name", "names", "filename", "filenames", "content", "contents", "text", "file"}
 
 
 def looks_like_place(tok: str, low: str) -> bool:
@@ -897,11 +945,12 @@ def take_ext(u: Utterance, spec: FindSpec) -> None:
               r"(?:that\s+have\s+|having\s+)?no\s+(?:file\s+)?extensions?|extensionless)\b"):
         spec.no_ext = True
         spec.why.append("no extension")
-    for m in list(re.finditer(r"(?<![\w/~.])\*?\.([a-z0-9]{1,8})\b(?![/\w.])", u.text)):
+    for m in list(re.finditer(r"(?:\b(?:that\s+|which\s+)?(?:end|ends|ending)\s+(?:with|in)\s+)?"
+                              r"(?<![\w/~.])(\*?)\.([a-z0-9]{1,8})\b(?![/\w.])", u.text)):
         u.blank(m.start(), m.end())
-        add_exts(spec, [m.group(1)])
-        if m.group(0).startswith("*") and spec.rec is None:
-            spec.rec = False        # a typed *.log means this folder, as in bash
+        add_exts(spec, [m.group(2)])
+        if m.group(1) and spec.rec is None:
+            spec.rec, spec.glob_here = False, True   # a typed *.log means this folder, as in bash
     for pat in (r"\b(?:with\s+|having\s+)?(?:the\s+|an?\s+)?(?:extension|suffix)\s+\.?([a-z0-9]{1,8})\b",
                 r"\b\.?([a-z0-9]{1,8})\s+(?:extension|suffix)\b"):
         m = re.search(pat, u.text)
@@ -920,8 +969,8 @@ def take_name(u: Utterance, spec: FindSpec) -> None:
         (r"\bwith\s+(?:a\s+)?(?:file)?names?\s+(?:(containing|including|like|matching|that\s+contains?)|(starting\s+with|beginning\s+with)|(ending\s+with))\s+(\S+)", None),
         (r"\b(?:file)?names?\s+(?:(like|matching|containing)|(starting\s+with|beginning\s+with|that\s+starts?\s+with)|(ending\s+with|that\s+ends?\s+with))\s+(\S+)", None),
         (r"\b(?:that\s+are\s+|which\s+are\s+)?(?:named|called|titled)\s+(\S+)", "named"),
-        (r"\b(?:starting|beginning)\s+with\s+(\S+)", "start"),
-        (r"\bending\s+(?:in|with)\s+(\S+)", "end"),
+        (r"\b(?:(?:that|which)\s+)?(?:starting|beginning|starts?|begins?)\s+with\s+(\S+)", "start"),
+        (r"\b(?:(?:that|which)\s+)?(?:ending|ends?)\s+(?:in|with)\s+(\S+)", "end"),
         (r"\bwith\s+(\S+)\s+in\s+(?:the|their|its)\s+(?:file)?names?\b", "contains"),
     ]
     for pat, kind in rules:
@@ -950,7 +999,8 @@ def take_name(u: Utterance, spec: FindSpec) -> None:
         spec.why.append(f"name ~ {glob}")
 
 
-EXPLICIT = (r"\b(?:(?:that|which)\s+)?(?:contains?|containing|mentions?|mentioning|"
+EXPLICIT = (r"\bwhose\s+(?:contents?|text)\s+(?:contains?|mentions?|includes?|has|have|says?)\b|"
+            r"\b(?:(?:that|which)\s+)?(?:contains?|containing|mentions?|mentioning|"
             r"(?:includes?|including|with|matching)\s+the\s+(?:text|word|string|phrase))\b")
 VAGUE_ANY = (r"\b(?:(?:that|which)\s+(?:has|have|had|holds?|stores?|keeps?)|having|holding|"
              r"with)\b")
@@ -1002,6 +1052,8 @@ def take_content(u: Utterance, spec: FindSpec) -> None:
         if not keys:
             continue
         add_keywords(u, spec, keys, mode)
+        if len(keys) > 1 and re.search(r"\bor\b", tail):
+            spec.or_content = True
         label = {"content": "content", "any": "name or content", "name": "name"}[mode]
         shown = ", ".join(c[2] for c in spec.content[-len(keys):])
         note = f'; "{" ".join(dropped)}" is generic' if dropped else ""
@@ -1093,7 +1145,14 @@ kill run execute install send upload download print sort
 def absorb_keywords(u: Utterance, spec: FindSpec, mode: str, limit: int = 2) -> int:
     """Leftover nouns become name/content keywords ("find the budget pdf")."""
     words = [w for w in u.leftover() if w not in TIMEISH and w not in ACTION_WORDS
-             and w not in NEG_WORDS and not re.fullmatch(r"\d+", w)][:limit]   # a bare number is no search term
+             and w not in NEG_WORDS and not re.fullmatch(r"\d+", w)]   # a bare number is no search term
+    texty = {"word", "words", "text", "string", "phrase", "term", "keyword"}
+    if len([w for w in words if w not in texty]) >= 1 and any(w in texty for w in words):
+        for low, orig, start in u.remaining():            # "files that have the word eggs": eggs, not "word"
+            if low in texty:
+                u.blank(start, start + len(orig))
+        words = [w for w in words if w not in texty]
+    words = words[:limit]
     if not words:
         return 0
     for w in words:
@@ -1101,6 +1160,19 @@ def absorb_keywords(u: Utterance, spec: FindSpec, mode: str, limit: int = 2) -> 
             if low == w:
                 u.blank(start, start + len(orig))
                 break
+    # A file name typed bare ("look for notes.txt") is that file's name, never text to grep for.
+    names = [w for w in words if u.bare_name(w)]
+    for w in names:
+        glob = os.path.basename(u.bare_name(w).rstrip("/"))
+        spec.names.append(glob)
+        spec.why.append(f"name = {glob}")
+    words = [w for w in words if w not in names]
+    if not words:
+        return 0
+    if mode == "any" and spec.ftype == "d":
+        mode = "name"
+    if len(words) > 1 and re.search(r"\b(?:or|either)\b", u.low):
+        spec.or_content = True
     if mode == "name":
         for w in words:
             lit = u.lit(w)
@@ -1112,7 +1184,8 @@ def absorb_keywords(u: Utterance, spec: FindSpec, mode: str, limit: int = 2) -> 
             spec.why.append(f"name ~ {glob}")
     else:
         add_keywords(u, spec, words, mode)
-        spec.why.append("name or content ~ " + ", ".join(c[2] for c in spec.content[-len(words):]))
+        spec.why.append("name or content ~ " + ", ".join(c[2] for c in spec.content[-len(words):])
+                        + (" (any of them)" if spec.or_content else ""))
     return len(words)
 
 
@@ -1162,18 +1235,38 @@ def find_tests(spec: FindSpec) -> list[str]:
     t += spec.size
     if spec.time:
         t += (["-daystart"] if spec.daystart else []) + spec.time
+    name_test = "-name" if spec.case else "-iname"
+    whole = [g for g in spec.names if not re.search(r"[*?\[]", g)]
+    if len(whole) > 1:                       # "main.py or notes.txt": a file has one name
+        grp = []
+        for g in whole:
+            grp += (["-o"] if grp else []) + [name_test, shlex.quote(g)]
+        t += ["\\("] + grp + ["\\)"]
     for g in spec.names:
-        t += ["-iname", shlex.quote(g)]
+        if len(whole) > 1 and g in whole:
+            continue
+        t += [name_test, shlex.quote(g)]
     for pat in spec.exclude:
         t += ["-not", "-path", shlex.quote(pat)]
+    tests = []
     for mode, needle, *_ in spec.content:
-        grep = ["-exec", "grep", "-IqiF", "-e", shlex.quote(needle), "{}", "\\;"]
+        if spec.ftype == "d" and mode == "any":
+            mode = "name"                    # a folder has a name, not text to grep
+        grep = ["-exec", "grep", "-IqF" if spec.case else "-IqiF", "-e", shlex.quote(needle), "{}", "\\;"]
         if mode == "content":
-            t += grep
+            tests.append(grep)
         elif mode == "name":
-            t += ["-iname", shlex.quote(f"*{needle}*")]
+            tests.append([name_test, shlex.quote(f"*{needle}*")])
         else:
-            t += ["\\(", "-iname", shlex.quote(f"*{needle}*"), "-o"] + grep + ["\\)"]
+            tests.append(["\\(", name_test, shlex.quote(f"*{needle}*"), "-o"] + grep + ["\\)"])
+    if spec.or_content and len(tests) > 1:
+        grp = []
+        for x in tests:
+            grp += (["-o"] if grp else []) + x
+        t += ["\\("] + grp + ["\\)"]
+    else:
+        for x in tests:
+            t += x
     return t
 
 
@@ -1324,6 +1417,8 @@ def h_find(u: Utterance) -> Plan | None:
         return finish(u, plan, 0, spec)
     if verbless and (not (spec.narrowed() or spec.sort) or u.leftover() or spec.unparsed):
         return None          # only a pure description of files: "delete…", "convert…" are not searches
+    if spec.glob_here and spec.rec is False:
+        spec.rec = None                      # "search for *.csv": find looks in every subfolder
     guessed = absorb_keywords(u, spec, "name" if by_name else "any")
     cmd = render_find(spec)
     plan = Plan(cmd, "find", [where_label(spec, True)] + spec.why)
@@ -1541,8 +1636,11 @@ def h_grep(u: Utterance) -> Plan | None:
             term = u.o(m, 1)
     if not term:
         return None
+    if u.bare_name(term.strip()) and not (target and (resolve(u.lit(target.strip()), u.cwd, "file")
+                                                      or is_pathlike(u.lit(target.strip())))):
+        return None       # "search my home for report.pdf" finds the file (h_find), it does not grep for its name
     low_term = term.lower()
-    if low_term in FILLER or low_term in GENERIC or type_word(low_term) or low_term in ("big", "large", "empty", "hidden"):
+    if low_term in FILLER or low_term in GENERIC or type_word(low_term) or low_term in FILE_KINDS:
         return None
     u.text = " " * len(u.text)  # the whole sentence is consumed by the pattern
     needle = u.lit(term)
@@ -1573,6 +1671,479 @@ def h_grep(u: Utterance) -> Plan | None:
         return plan
     return Plan(f"grep -rniIF --exclude-dir=.git -- {shlex.quote(needle)} .", "search text",
                 why + ["here and subfolders"])
+
+
+# ---- search: the words people use for searching ------------------------------------
+# "search" in all its wordings: where to look, what for, and how (by name, by
+# content, case, whole words). Only answers what it is sure of; everything else
+# falls through to h_grep and h_find.
+
+SEARCH_HELP = [
+    "search for notes                 files whose name or text has 'notes'",
+    "search for report.pdf            a file by its name (anywhere below here)",
+    "search run1 for pressure         lines with 'pressure' in the files in run1",
+    "search the word error in logs    lines, in the .log files",
+    "search file names for budget     names only",
+    "search file contents for todo    text only",
+    "search for pdfs in my downloads  by type, in ~/Downloads",
+    "search the whole computer for x  everywhere (/)",
+    "which folder is notes.txt in     the folder, not the file",
+    "does notes.txt exist             finds it or says it is not there",
+    "add: case sensitive, whole word, only file names, exactly, or, modified since monday",
+]
+
+SEARCH_VERB = (r"^\s*(?P<v>search(?:ing)?|grep(?:ping)?|look(?:ing)?|hunt(?:ing)?|seek(?:ing)?|scan(?:ning)?|"
+               r"brows(?:e|ing)|dig(?:ging)?|track(?:ing)?|comb(?:ing)?|check(?:ing)?|find(?:ing)?|locate)\b"
+               r"(?P<p>(?:\s+(?:for|up|down|out|me|around)\b)*)\s*")
+# "look"/"dig"/"track" mean searching only with a particle: look for, dig up, track down
+NEEDS_PARTICLE = ("look", "looking", "dig", "digging", "track", "tracking", "hunt", "hunting", "comb", "combing")
+SEARCH_CASE = (r"\b(?:case[- ]?sensitive(?:ly)?|match(?:ing)?\s+(?:the\s+)?case|with\s+(?:the\s+)?(?:exact|same|matching)\s+case|"
+               r"exact\s+case|respect(?:ing)?\s+(?:the\s+)?case|(?:upper|lower)\s*case\s+matters)\b")
+SEARCH_NOCASE = (r"\b(?:not\s+case[- ]?sensitive|case[- ]?insensitive(?:ly)?|ignor(?:e|ing)\s+(?:the\s+)?case|in\s+any\s+case|"
+                 r"regardless\s+of\s+(?:the\s+)?case|whatever\s+the\s+case|(?:upper\s+or\s+lower|any)\s*case)\b")
+SEARCH_WORD = (r"\b(?:as\s+an?\s+)?(?:whole|entire|full|complete|exact|separate)\s+words?(?:\s+only)?\b|\bonly\s+whole\s+words?\b|"
+               r"\bword\s+match(?:es|ing)?\b|\bnot\s+(?:as\s+)?part\s+of\s+(?:another|other|a\s+longer)\s+words?\b")
+SEARCH_FILES_ONLY = (r"(?:,\s*|\b)(?:and\s+)?(?:(?:show|list|give|print|return|tell)(?:\s+me)?\s+)?(?:only|just)\s+(?:the\s+)?"
+                     r"(?:(?:matching\s+)?file\s*names?|names\s+of\s+(?:the\s+)?files|(?:matching\s+)?files|paths)\b|"
+                     r"\b(?:file\s*names?|files|paths)\s+only\b|\band\s+(?:list|show)\s+(?:me\s+)?(?:the\s+)?(?:matching\s+)?files\b|"
+                     r"\bwithout\s+(?:the\s+)?(?:matching\s+)?lines\b")
+SEARCH_EXACT = (r"\b(?:with\s+)?(?:the\s+)?exact\s+(?:file\s*)?name\b|\b(?:named|called)\s+exactly\b|\bexact\s+match\b|"
+                r"\bexactly(?:\s+(?:that|this)(?:\s+name)?)?\b")
+# what the search is about, said in so many words
+BY_NAME = (r"\b(?:by|in|on|from|using)\s+(?:the\s+|their\s+|its\s+|file\s*)?(?:file\s*)?names?\b|\bnames?\s+only\b|"
+           r"\bin\s+(?:the\s+)?filenames?\b")
+BY_TEXT = (r"\b(?:by|in|from|using)\s+(?:the\s+|their\s+|its\s+)?(?:file\s+)?(?:contents?|text)\b|"
+           r"\b(?:inside|within|in)\s+(?:the\s+)?(?:files|documents)\b|\binside\s+(?:of\s+)?(?:them|it)\b")
+TEXT_LEAD = (r"^(?:the\s+|a\s+|an\s+)?(?:words?|text|strings?|phrases?|terms?|keywords?|expressions?|sentences?|"
+             r"lines?\s+(?:that\s+)?(?:contain(?:s|ing)?|with|mentioning|matching|saying|having)|"
+             r"(?:occurrences?|instances?|mentions?|uses?|usages?)\s+of)\s+")
+# "search <place> for <what>": the place, said in words
+SYSTEM_PLACE = (r"(?:the\s+)?(?:whole\s+|entire\s+|full\s+)?(?:system|computer|machine|pc|laptop|disks?|drives?|hard\s*drive|"
+                r"file\s*system|filesystem|root)|everywhere|everything\s+on\s+(?:my|this|the)\s+(?:computer|machine|disk|pc)")
+
+
+def _search_place(text: str, orig: str, u: Utterance):
+    """('name'|'text'|'dir'|'file', root) for the words between the verb and 'for', or None."""
+    t = re.sub(r"^(?:in|inside|into|through|thru|within|across|throughout|under|on|over|all\s+over)\s+", "", text.strip())
+    off = len(text.strip()) - len(t)
+    o = orig.strip()[off:]
+    m = re.match(r"^(?:all\s+(?:of\s+)?(?:the\s+|my\s+)?|every\s+|each\s+|the\s+|my\s+|our\s+|this\s+|these\s+)", t)
+    if m and not re.match(r"(?:this|the)\s+(?:folder|directory|dir|project|repo|place)\b", t):
+        t, o = t[m.end():], o[m.end():]
+    if re.fullmatch(r"(?:file\s*)?names?|filenames?|names?\s+of\s+(?:the\s+|all\s+|my\s+)?files|(?:file\s+)?titles?", t):
+        return "name", []
+    m = re.fullmatch(r"(\S+)\s+(?:file\s*)?(?:names?|titles?)|names?\s+of\s+(?:the\s+|all\s+|my\s+)?(\S+?)(?:\s+files)?", t)
+    if m and type_word(m.group(1) or m.group(2)):
+        return "name", type_word(m.group(1) or m.group(2))[1]      # "search pdf names for report"
+    if re.fullmatch(r"(?:(?:file|the)\s+)?(?:contents?|texts?)(?:\s+of\s+(?:the\s+|all\s+|my\s+|every\s+)?files)?|"
+                    r"files?|everything|all|it|them|insides?\s+of\s+(?:the\s+)?files|"
+                    r"(?:the\s+)?files?\s+(?:here|in\s+here)", t):
+        return "text", "."
+    if re.fullmatch(SYSTEM_PLACE, t):
+        return "dir", "/"
+    if re.fullmatch(r"home(?:\s+(?:folder|directory|dir))?|~|\$home|homedir", t):
+        return "dir", "~"
+    if re.fullmatch(r"(?:this|the|current|present)\s+(?:folder|directory|dir|place|location)|here|"
+                    r"(?:this|the)\s+(?:project|repo|repository|codebase|source\s+tree)|folder|directory|dir|cwd|"
+                    r"(?:sub-?folders|sub-?directories)", t):
+        return "dir", "."
+    if re.fullmatch(r"(?:the\s+)?parent(?:\s+(?:folder|directory|dir))?|\.\.", t):
+        return "dir", ".."
+    m = re.fullmatch(r"(downloads?|documents|desktop|pictures|music|videos|templates)(?:\s+(?:folder|directory|dir))?", t)
+    if m and not os.path.isdir(os.path.join(u.cwd, o[:m.end(1)])):
+        return "dir", "~/" + XDG_DIRS[m.group(1)]
+    m = (re.fullmatch(r"(?:(?:folder|directory|dir|sub-?folder)\s+(?:called\s+|named\s+)?)?(\S+)", t)
+         or re.fullmatch(r"(\S+)\s+(?:folder|directory|dir|sub-?folder)", t))
+    if not m or type_word(t.split()[0]) or re.search(r"\bfiles?\b", t):
+        # "the code", "python files", "all text files in run1": a kind of file, maybe somewhere
+        sub = Utterance(orig, u.cwd, u.literals, u.auto)
+        sub.text = text
+        spec = FindSpec()
+        parse_filters(sub, spec)
+        if sub.leftover() or not spec.exts or resolve(o.strip(), u.cwd, "file"):
+            return None
+        return "filter", spec
+    tok = u.lit(o[m.start(1):m.end(1)])
+    named_folder = m.group(0) != m.group(1)
+    path = home_alias(tok, u.cwd) or resolve(tok, u.cwd, "dir")
+    if path:
+        return "dir", path
+    f = resolve(tok, u.cwd, "file")
+    if f:
+        return "file", f
+    if named_folder or re.search(r"[/~$]", tok):
+        return "dir", tok                    # a folder that is not there: the command says so
+    return None
+
+
+def _grep_plan(needles: list[str], root: str, *, file: str | None = None, exts=(), case=False, word=False,
+               files_only=False, rec=True, why=()) -> Plan:
+    flags = ("" if file else "-r" if rec else "") + ("l" if files_only else "n") + ("" if case else "i") \
+        + ("" if file else "I") + "F" + ("w" if word else "")
+    flags = "-" + flags.lstrip("-")
+    pats = (["--", shlex.quote(needles[0])] if len(needles) == 1
+            else [x for n in needles for x in ("-e", shlex.quote(n))])
+    if file:
+        cmd = " ".join(["grep", flags, *pats, qpath(file)])
+        where = f"in {file}"
+    else:
+        includes = [f"--include={shlex.quote('*.' + e)}" for e in exts]
+        target = qpath(root) if rec else (qpath(root).rstrip("/") + "/*" if root != "." else "*")
+        cmd = " ".join(["grep", flags, *includes, "--exclude-dir=.git", *pats, target])
+        place = {".": "here", "~": "home", "/": "whole system", "..": "parent folder"}.get(root, root)
+        where = place + (" and subfolders" if rec else " (top level only)")
+        if root == "/":
+            cmd += " 2>/dev/null"
+    shown = " or ".join(f'"{n}"' for n in needles)
+    return Plan(cmd, "search text", [f"text {shown}", "case-sensitive" if case else "case-insensitive"]
+                + (["whole words"] if word else []) + (["file names only"] if files_only else [])
+                + [where] + list(why))
+
+
+SEARCH_STOP = set("""
+the a an for me in of with and or any all some every my our to that which is are here there it them this these those
+""".split())
+
+
+def _search_find(u: Utterance, root: str | None, mode: str, case: bool, exact: bool, intent: str = "find",
+                 exts=()) -> Plan:
+    spec = FindSpec()
+    parse_filters(u, spec)
+    if exts:
+        add_exts(spec, [e for e in exts if e not in spec.exts])
+    # what follows "search ... for" is the search term even when it is a common word ("report", "show")
+    common = [(low, orig, start) for low, orig, start in u.remaining()
+              if low in FILLER and low not in SEARCH_STOP and not exact]
+    if common and not [w for w in u.leftover()]:
+        for low, orig, start in common:
+            u.blank(start, start + len(orig))
+        add_keywords(u, spec, [low for low, _, _ in common], "name" if mode == "name" else "any")
+        spec.why.append(("name ~ " if mode == "name" else "name or content ~ ") + ", ".join(c[2] for c in spec.content[-len(common):]))
+    if root is not None and spec.root == ".":
+        spec.root = root
+    if spec.glob_here:
+        spec.rec = None
+    if exact:
+        for low, orig, start in u.remaining():
+            if low not in FILLER:
+                spec.names.append(u.lit(orig))     # as typed: "Notes exactly" is Notes, not *note*
+                u.blank(start, start + len(orig))
+        spec.names = [g[1:-1] if g.startswith("*") and g.endswith("*") and len(g) > 2 else g for g in spec.names]
+        spec.case = True
+        spec.why.append("exact name")
+    if mode == "name":                          # "by name", "file names": never the text inside
+        for c in [c for c in spec.content]:
+            spec.names.append(f"*{c[1]}*")
+            spec.content.remove(c)
+        spec.why = [w.replace("name or content ~", "name ~").replace("content ~", "name ~") for w in spec.why]
+    guessed = absorb_keywords(u, spec, mode)
+    if case:
+        spec.case = True
+        spec.why.append("case-sensitive")
+    if not (spec.narrowed() or spec.ftype or spec.sort):
+        return None
+    plan = Plan(render_find(spec), intent, [where_label(spec, True)] + spec.why)
+    return finish(u, plan, guessed, spec)
+
+
+def h_search(u: Utterance) -> Plan | None:
+    low = u.text.strip()
+    if re.fullmatch(r"(?:search|searching)(?:\s+(?:help|for|commands?|how))?", low):
+        lines = " ".join(shlex.quote(x) for x in ["you can say, for example:", *SEARCH_HELP])
+        plan = Plan(f"printf '%s\\n' {lines}", "search help", ["what search understands"])
+        plan.runs_on_question = True
+        return plan
+    m = re.match(r"\s*(?:show|tell)\s+me\s+where\s+(?:is\s+|are\s+)?(?:the\s+|my\s+)?(?:file\s+)?(?P<x>\S+)(?:\s+(?:is|are|lives|went))?\s*$", u.text)
+    if m and _subject(u, m):
+        u.text = u.text[:m.start()] + "find".ljust(m.start("x") - m.start()) + u.text[m.start("x"):m.end("x")] \
+            + " " * (len(u.text) - m.end("x"))
+    u.text = re.sub(r"[()\[\]]", " ", u.text)        # "search for pressure (case sensitive)"
+    p = _folder_of(u) or _path_of(u) or _exists(u) or _where_text(u)
+    if p:
+        return p
+    m = re.match(SEARCH_VERB, u.text)
+    if not m:
+        return None
+    verb, particle = m.group("v"), m.group("p").split()
+    if verb in NEEDS_PARTICLE and not particle and not re.match(r"(?:in|inside|into|through|thru|within|everywhere|all\s+over|around)\b", u.text[m.end():]):
+        return None
+    if verb.startswith("check") and not re.search(r"\bfor\b", u.text[m.end():]):
+        return None                                   # "check disk space" is not a search
+    if re.match(r"(?:the\s+)?(?:web|internet|net|online|google|wikipedia|youtube)\b", u.text[m.end():]):
+        return None                                   # the web search recipe
+    grep_verb = verb.startswith("grep")
+    find_verb = verb.startswith(("find", "locate"))
+    lookup = verb.startswith("look") and "up" in particle
+    u.blank(m.start(), m.end())
+    # how to search
+    nocase = bool(u.take(SEARCH_NOCASE))
+    case = bool(u.take(SEARCH_CASE))
+    word = bool(u.take(SEARCH_WORD))
+    files_only = bool(u.take(SEARCH_FILES_ONLY))
+    exact = bool(u.take(SEARCH_EXACT))
+    # "with spaces in their names", "with note in the name": take_name reads those itself
+    by_name = (not u.peek(r"\bwith\s+(?:an?\s+)?\S+\s+in\s+(?:(?:the|their|its)\s+)?(?:file\s*)?names?\b")
+               and bool(u.take(BY_NAME)))
+    by_text = bool(u.take(BY_TEXT))
+    mode = "name" if by_name else "text" if (by_text or word or grep_verb) else None
+    # "search <place> for <what>" (not "find X for Y": find takes what first)
+    rest = u.text[m.end():]
+    root, file, exts = None, None, []
+    pm = None if find_verb or lookup else re.match(r"^\s*(?P<place>\S.*?)\s+for\s+(?P<what>\S.*)$", rest)
+    if pm:
+        place = _search_place(pm.group("place"), u.orig[m.end() + pm.start("place"):m.end() + pm.end("place")], u)
+        if not place:
+            return None                                       # "search apt for htop", "search the logs for": others know
+        kind, where = place
+        u.blank(m.end() + pm.start("place"), m.end() + pm.start("what"))
+        if kind == "filter":
+            kind, exts, where = "dir", where.exts, where.root
+        if kind == "name":
+            mode, exts = "name", where
+        elif kind == "text":
+            mode = mode or "text"
+        elif kind == "file":
+            if verb.startswith("check"):
+                return None                                   # "check backup.zip for errors" tests the archive
+            file = where
+            mode = "text"
+        else:
+            root = where
+    # the words of the search itself
+    lead = len(u.text) - len(u.text.lstrip())
+    tl = re.match(TEXT_LEAD, u.text[lead:])
+    if tl:
+        u.blank(lead, lead + tl.end())
+        if mode != "name":
+            mode = "text"
+    # FILLER is not used here: "print", "show" or "list" can be what is searched for
+    words = [w for w, _, _ in u.remaining() if w not in ("the", "a", "an", "for", "me", "please", "some", "any")]
+    if not words:
+        return None
+    bare = [w for w in words if u.bare_name(w)]
+    if mode is None and exact:
+        im = re.search(r"\s(?:in|inside)\s+(\S+)\s*$", u.text)
+        in_file = im and resolve(u.lit(u.o(im, 1)), u.cwd, "file")
+        mode = "text" if in_file else "name"            # "error exactly in logs.txt" vs "Notes exactly"
+    if mode is None and (case or nocase or files_only) and not (bare and len(words) == len(bare)):
+        mode = "text"                                   # case and "only file names" are about text
+    if mode is None:
+        if bare and len(words) == len(bare) and (not lookup or _file_ext(u.bare_name(bare[0]))):
+            mode = "file"                                     # "search for main.py", "look up notes.txt"
+        elif root is not None and not lookup:
+            mode = "place"
+        elif lookup:
+            return None                                       # "look up example.com" is dns
+        elif verb.startswith(("dig", "brows", "scan", "comb", "seek", "hunt", "track")):
+            mode = "any"                                      # words only this handler knows as "search"
+        elif not u.leftover() and not find_verb:
+            mode = "any"                                      # "search for report": the word is the search
+        elif not (case or exact or files_only or u.peek(r"\bor\b") and len(words) > 1):
+            return None                                       # plain wording: h_find and h_grep do it
+    if exact and mode in (None, "file", "place"):
+        mode = "name"
+    if mode == "text":
+        return _search_text(u, root, file, case, word, files_only, exact, exts)
+    if mode == "place":
+        # "search run1 for pressure": text, unless the words describe files ("search run1 for csv files")
+        probe = Utterance(u.text, u.cwd, u.literals, u.auto)
+        spec = FindSpec()
+        parse_filters(probe, spec)
+        if spec.narrowed() or spec.ftype or spec.sort or [w for w in probe.leftover() if probe.bare_name(w)]:
+            if exts:
+                return None                                   # "search python files for csv files": unclear
+            return _search_find(u, root, "any", case, exact, "search")
+        return _search_text(u, root, None, case, word, files_only, exact, exts)
+    plan = _search_find(u, root, "name" if mode in ("name", "file") else "any", case, exact, "search", exts)
+    if plan and lookup:
+        plan.why.append("look up = find the file")
+    return plan
+
+
+def _file_ext(name: str) -> bool:
+    """A real file extension, not a web domain: notes.txt yes, example.com no."""
+    ext = name.rsplit(".", 1)[-1].lower()
+    known = {e for _, exts in TYPE_WORDS.values() for e in exts} | {"txt", "conf", "cfg", "ini", "md", "doc", "docx"}
+    return ext in known
+
+
+def _search_text(u: Utterance, root, file, case, word, files_only, exact, exts=()) -> Plan | None:
+    """grep: the needles are what is left; 'in <where>' after them says where."""
+    text = u.text
+    exts, rec = list(exts), True
+    wm = re.search(r"\s(?:in|inside|within|across|throughout|under|through)\s+(?P<w>\S.*)$", text)
+    if wm and file is None:
+        sub = Utterance(u.orig[wm.start("w"):wm.end("w")], u.cwd, u.literals, u.auto)
+        sub.text = text[wm.start("w"):wm.end("w")]
+        tname = u.lit(u.orig[wm.start("w"):wm.end("w")].strip())
+        f = resolve(tname, u.cwd, "file") or (unique_stem_below(tname, u.cwd) if " " not in tname else None)
+        if f:
+            file = f
+        else:
+            spec = FindSpec()
+            parse_filters(sub, spec)
+            path, _ = first_target(sub, "dir")
+            if path:
+                spec.root = path
+            if sub.leftover():
+                return None
+            exts = exts or spec.exts
+            root = spec.root if spec.root != "." or root is None else root
+            rec = spec.rec is not False
+        u.blank(wm.start(), wm.end())
+    if file is None and root is None:
+        root = "."
+    origs = [u.orig[mm.start():mm.end()] for mm in re.finditer(r"\S+", u.text)]
+    joined = " ".join(u.lit(o) for o in origs)
+    # the user's own words are the needle ("print" too); only a leading article goes
+    parts = [p.strip() for p in re.split(r"\s*(?:,|\bor\b|\beither\b)\s*", joined) if p.strip()]
+    parts = [re.sub(r"(?i)^(?:(?:the|a|an|for|me)\s+)+", "", p) for p in parts]
+    parts = [p for p in parts if p and p.lower() not in ("the", "a", "an", "for", "me", "it", "them", "please")]
+    if not parts:
+        return None
+    if exact:
+        case = True
+    return _grep_plan(parts, root, file=file, exts=exts, case=case, word=word, files_only=files_only, rec=rec,
+                      why=[f"type: {' '.join('.' + e for e in exts)}"] if exts else [])
+
+
+FOLDER_W = r"(?:folder|directory|dir|sub-?folder|sub-?directory)"
+
+
+def _subject(u: Utterance, m) -> str | None:
+    """The thing searched for; not a word like "largest" ("which folder is the largest" is about sizes)."""
+    tok = u.lit(u.o(m, "x"))
+    low = tok.lower()
+    if low in FILLER or low in GENERIC or low in SORT_WORD or low in TIMEISH or low in NEG_WORDS:
+        return None
+    if not (FILE_NAME.fullmatch(os.path.basename(tok)) or "/" in tok or re.fullmatch(r"qlit\d+", u.o(m, "x").lower())) \
+            and (re.search(r"(?:est|ier|er)$", low) and not os.path.exists(os.path.join(u.cwd, tok))
+                 or low in ("empty", "full", "hidden", "open", "used", "mounted", "shared", "free", "here")
+                 or difflib.get_close_matches(low, list(SORT_WORD), n=1, cutoff=0.8)):   # "largset"
+        return None
+    return tok
+
+
+def _name_glob(tok: str) -> str:
+    return tok if "." in tok or re.search(r"[*?\[]", tok) else f"*{tok}*"
+
+
+def _folder_of(u: Utterance) -> Plan | None:
+    """'which folder is notes.txt in', 'find the folder where main.py is': the folder, not the file."""
+    pats = [
+        rf"^(?:in\s+)?(?:which|what)\s+{FOLDER_W}\s+(?:is|are|has|have|contains?|holds?|keeps?)\s+(?:the\s+|my\s+)?(?:file\s+)?(?P<x>\S+)"
+        rf"(?:\s+(?:in|located\s+in|stored\s+in|saved\s+in|kept\s+in|located|stored|saved|kept))?\s*$",
+        rf"^(?:in\s+)?(?:which|what)\s+{FOLDER_W}\s+(?:did\s+i\s+(?:put|save|leave)|do\s+i\s+have)\s+(?:the\s+|my\s+)?(?:file\s+)?(?P<x>\S+)(?:\s+in)?\s*$",
+        rf"^(?:find|show(?:\s+me)?|tell\s+me|get|give\s+me|search\s+for|look\s+for|locate|what\s+is|which\s+is)\s+(?:the\s+)?"
+        rf"(?:{FOLDER_W}|parent\s+{FOLDER_W}|location)\s+(?:where|that\s+(?:has|contains|holds)|containing|holding|with|of|for)\s+"
+        rf"(?:the\s+|my\s+)?(?:file\s+)?(?P<x>\S+)(?:\s+(?:is|lives|sits|was\s+saved))?\s*$",
+        rf"^where\s+(?:is|are)\s+(?:the\s+)?{FOLDER_W}\s+(?:with|containing|that\s+(?:has|contains|holds))\s+(?:the\s+)?(?:file\s+)?(?P<x>\S+)\s*$",
+    ]
+    for pat in pats:
+        m = re.match(r"\s*" + pat[1:], u.text)
+        if m:
+            x = _subject(u, m)
+            if not x:
+                return None
+            glob = _name_glob(os.path.basename(x))
+            cmd = f"find . -path '*/.git' -prune -o -iname {shlex.quote(glob)} -printf '%h\\n' | sort -u"
+            return Plan(cmd, "find folder", ["here and subfolders", f"name ~ {glob}", "shows the folder it is in"])
+    return None
+
+
+USED_W = (r"(?:appears?|occurs?|(?:is|are)\s+(?:used|mentioned|written|referenced|defined|called|found)|used|mentioned|written|"
+          r"referenced|defined|called|found|shows?\s+up|comes?\s+up)")
+TEXT_NOUN = r"(?:the\s+)?(?:words?|text|strings?|phrases?|terms?|keywords?|names?)\s+"
+
+
+def _where_text(u: Utterance) -> Plan | None:
+    """'where does the word pressure appear', 'in which file is TODO used', 'which files have the word eggs'."""
+    t = u.text
+    m = (re.match(rf"\s*(?:find|show(?:\s+me)?|tell\s+me)?\s*where\s+(?:does|do|is|are|did)?\s*(?:{TEXT_NOUN})?(?P<t>\S+(?:\s+\S+)?)\s+"
+                  rf"{USED_W}(?:\s+(?P<w>(?:in|inside|under|within|across)\s+.+))?\s*$", t)
+         or re.match(rf"\s*find\s+where\s+(?:{TEXT_NOUN})?(?P<t>\S+(?:\s+\S+)?)\s+{USED_W}(?:\s+(?P<w>(?:in|inside|under)\s+.+))?\s*$", t))
+    files_only = False
+    if not m:
+        m = (re.match(rf"\s*(?:in\s+)?(?:which|what)\s+files?\s+(?:is|are|does|do|did)\s+(?:{TEXT_NOUN})?(?P<t>\S+(?:\s+\S+)?)\s+"
+                      rf"(?:{USED_W}|appear|occur)(?:\s+(?P<w>(?:in|inside|under)\s+.+))?\s*$", t)
+             or re.match(rf"\s*(?:which|what)\s+files?\s+(?:have|has|mentions?|includes?|uses?)\s+(?:{TEXT_NOUN})(?P<t>\S+(?:\s+\S+)?)"
+                         rf"(?:\s+in\s+(?:them|it))?(?:\s+(?P<w>(?:in|inside|under)\s+.+))?\s*$", t))
+        files_only = bool(m)
+    if not m:
+        return None
+    needle = u.lit(u.o(m, "t"))
+    if needle.lower() in FILLER or needle.lower() in GENERIC or u.bare_name(u.o(m, "t")):
+        return None
+    root, exts, file = ".", [], None
+    if m.group("w"):
+        where = re.sub(r"^(?:in|inside|under|within|across)\s+", "", u.o(m, "w"))
+        file = resolve(u.lit(where.strip()), u.cwd, "file")
+        if not file:
+            sub = Utterance(where, u.cwd, u.literals, u.auto)
+            spec = FindSpec()
+            parse_filters(sub, spec)
+            path, _ = first_target(sub, "dir")
+            if sub.leftover():
+                return None
+            root, exts = path or spec.root, spec.exts
+    return _grep_plan([needle], root, file=file, exts=exts, files_only=files_only,
+                      why=[f"type: {' '.join('.' + e for e in exts[:6])}"] if exts else [])
+
+
+def _path_of(u: Utterance) -> Plan | None:
+    """'get me the path of notes.txt', 'full path to main.py'."""
+    m = re.match(r"\s*(?:(?:get|give|show|tell|find)(?:\s+me)?\s+|what\s+is\s+|print\s+|copy\s+)?(?:the\s+)?(?:full\s+|absolute\s+|whole\s+|complete\s+)?"
+                 r"(?:path|location)\s+(?:of|to|for)\s+(?:the\s+|my\s+)?(?:file\s+|folder\s+|directory\s+)?(?P<x>\S+)\s*$", u.text)
+    if not m:
+        return None
+    x = _subject(u, m)
+    if not x:
+        return None
+    if os.path.exists(os.path.join(u.cwd, os.path.expanduser(x))):
+        return Plan(f"realpath -- {qpath(x)}", "path", [f"full path of {x}"])
+    glob = _name_glob(os.path.basename(x))
+    return Plan(f"find \"$PWD\" -path '*/.git' -prune -o -iname {shlex.quote(glob)} -print", "path",
+                ["here and subfolders", f"name ~ {glob}", "full paths"])
+
+
+def _exists(u: Utterance) -> Plan | None:
+    """'does main.py exist', 'check if there is a pdf here', 'is there a folder called src'."""
+    t = u.text
+    m = (re.match(r"^\s*(?:does|do)\s+(?P<s>.+?)\s+exists?(?P<w>\s+.+)?\s*$", t)
+         or re.match(r"^\s*(?:check|see|test|find\s+out|tell\s+me)\s+(?:if|whether)\s+(?:there\s+(?:is|are)\s+)?(?P<s>.+?)"
+                     r"(?:\s+(?:exists?|is\s+(?:there|here|present)|are\s+(?:there|here)))(?P<w>\s+.+)?\s*$", t)
+         or re.match(r"^\s*(?:check|see|test|find\s+out|tell\s+me)\s+(?:if|whether)\s+there\s+(?:is|are)\s+(?P<s>.+?)(?P<w>)\s*$", t))
+    if not m:
+        return None
+    s, off = m.group("s"), m.start("s")
+    sm = re.match(rf"(?:(?:a|an|the|any|some|my)\s+)?(?:(?P<k>file|{FOLDER_W})s?\s+(?:called\s+|named\s+)?)?(?P<x>\S+)", s)
+    if not sm:
+        return None
+    x = u.lit(u.orig[off + sm.start("x"):off + sm.end("x")])
+    where = (u.orig[off + sm.end():off + len(s)] + " " + u.orig[m.start("w"):m.end("w")]).strip()
+    if where and not re.match(r"(?:here|in|inside|under|on|anywhere|somewhere|below)\b", where.lower()):
+        return None
+    spec = FindSpec()
+    if where:
+        sub = Utterance(re.sub(r"(?i)^(?:anywhere|somewhere|below)\b", "", where), u.cwd, u.literals, u.auto)
+        parse_filters(sub, spec)
+        if sub.leftover():
+            return None
+    k = sm.group("k")
+    t_ = type_word(x.lower())
+    if not (k or t_ or FILE_NAME.fullmatch(os.path.basename(x)) or os.path.exists(os.path.join(u.cwd, os.path.expanduser(x)))):
+        return None                                   # "does docker exist": a program, not a file
+    if t_ and not os.path.exists(os.path.join(u.cwd, x)):
+        add_exts(spec, t_[1], t_[0])
+    elif x.lower() in FILLER or x.lower() in GENERIC or x.lower() in TIMEISH:
+        return None
+    else:
+        spec.names.append(_name_glob(os.path.basename(x)))
+        spec.why.append(f"name ~ {spec.names[-1]}")
+    if k:
+        spec.ftype = "f" if k == "file" else "d"
+    cmd = render_find(spec) + f" | grep . || echo {shlex.quote('not found: ' + x)}"
+    return Plan(cmd, "exists?", [where_label(spec, True)] + spec.why + ["says so when there is none"])
 
 
 def h_count(u: Utterance) -> Plan | None:
@@ -5602,7 +6173,7 @@ def h_unglue(u: Utterance) -> Plan | None:
     return Plan(fixed, "did you mean", [f"read '{u.raw.strip()}' as '{fixed}'"], confidence=0.95, source="guess")
 
 
-HANDLERS = [h_unglue, h_git, h_usb, h_power_later, h_net, h_service, h_recipe, h_system, h_power, h_version, h_installed, h_port, h_pkg_search, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
+HANDLERS = [h_unglue, h_git, h_search, h_usb, h_power_later, h_net, h_service, h_recipe, h_system, h_power, h_version, h_installed, h_port, h_pkg_search, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
             h_find_then, h_reext, h_download, h_compare, h_replace, h_calc, h_copy_move, h_delete, h_read, h_grep, h_count, h_size, h_find, h_list]
 
 
@@ -6487,6 +7058,21 @@ def looks_like_shell(line: str, path_env: str | None = None, cwd: str | None = N
             plan = interpret(line, cwd)
             if plan and plan.confidence >= threshold:
                 return False
+    if (cwd and toks[0] == "search" and not any(t.startswith("-") for t in rest)
+            and not re.search(r"[|&;<>`$]", line)):
+        # "search notes", "search run1 for pressure": aisha's search, also where a
+        # search script is installed (Linux Mint has one); its -flags still reach it.
+        plan = interpret(line, cwd)
+        if plan and plan.confidence >= threshold:
+            return False
+    if (cwd and toks[0] == "grep" and rest and not any(t.startswith("-") for t in rest)
+            and not re.search(r"[|&;<>`$]", line)
+            and not any(os.path.exists(os.path.join(cwd, os.path.expanduser(t))) for t in rest[1:])
+            and not any(re.search(r"[*?/]", t) for t in rest[1:])):
+        # "grep pressure" would wait for input forever; "grep for todo in python files" is words
+        plan = interpret(line, cwd)
+        if plan and plan.confidence >= threshold:
+            return False
     if toks[0] == "reset" and rest and not any(t.startswith("-") for t in rest):
         return False                     # reset(1) takes no words: "reset app.py" is git
     if toks[0] in ("sort", "cut", "order") and re.search(r"\bby\s+(?:the\s+)?(?:\w+\s+)?(?:column|field)\b", line):
