@@ -50,7 +50,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.11.0"
+VERSION = "0.11.1"
 NAME = "ai$ha"             # the shell's name as shown: ai shell hybrid alpha. The command stays `aisha`
 TAGLINE = "ai shell hybrid alpha"   # ($ in a command name would be read as a variable by every shell)
 
@@ -7461,6 +7461,11 @@ class LLM:
             return f"{self.cfg['llm_model']} (local llama.cpp, starts when needed)"
         return f"{self.cfg['llm_model']} at {self.cfg['llm_url']}"
 
+    @property
+    def brief(self) -> str:
+        """The label for the start line: without the note on when the model starts."""
+        return self.label.replace(", starts when needed", "")
+
     def _post(self, messages: list[dict]) -> str:
         import http.client
         try:
@@ -8431,8 +8436,8 @@ class Shell:
         except ImportError:
             readline = None
         if self.cfg["banner"]:
-            llm = f"; language model: {self.llm.label}" if self.llm.enabled else ""
-            say(dim(f"{NAME} {VERSION} ({TAGLINE}) — type bash or plain words. 'help' for examples{llm}"))
+            llm = f"; hybrid model: {self.llm.brief}" if self.llm.enabled else ""
+            say(dim(f"{NAME} {VERSION} ({TAGLINE}) — 'help' for examples{llm}"))
         code = None
         while code is None:
             self.reap()
