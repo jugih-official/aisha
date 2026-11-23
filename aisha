@@ -3,7 +3,7 @@
 
 Type bash as usual, or say what you want in plain words:
 
-    aisha ~/lab ❯ find files in this folder that have the measurement data
+    aisha ~/lab $ find files in this folder that have the measurement data
     → find · here and subfolders · files · name or content ~ "measur" (from "measurement"; "data" is generic)
     $ find . -path '*/.git' -prune -o -type f \\( -iname '*measur*' -o -exec grep -IqiF -e measur {} \\; \\) -print
 
@@ -8409,7 +8409,7 @@ class Shell:
         where = "~" + self.cwd[len(home):] if self.cwd == home or self.cwd.startswith(home + "/") else self.cwd
         if len(where) > 40:
             where = "…/" + "/".join(where.rstrip("/").split("/")[-2:])
-        mark = "❯"                      # red when the last command failed (in colour)
+        mark = "$"                      # red when the last command failed (in colour)
         branch = git_branch(self.cwd) if self.cfg.get("prompt_git", False) else ""
         if not (sys.stdout.isatty() and not os.environ.get("NO_COLOR")):
             return f"{NAME} {where}{' git:' + branch if branch else ''} {mark} "

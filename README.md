@@ -8,17 +8,17 @@ LLM is consulted only when the rules are unsure.
 
 ```
 $ aisha
-aisha ~/lab ❯ find recursively files older that 2 months from this folder
+aisha ~/lab $ find recursively files older that 2 months from this folder
 → find · here and subfolders · modified older than 2 months (60 days)
 $ find . -path '*/.git' -prune -o -type f -mtime +60 -print
 ./run1/old-results.csv
 
-aisha ~/lab ❯ edit logs.txt with micro
+aisha ~/lab $ edit logs.txt with micro
 → edit · logs.txt · with micro
 $ micro logs.txt
 
-aisha ~/lab ❯ git status                  # real commands run in bash unchanged
-aisha ~/lab ❯ delete all .tmp files
+aisha ~/lab $ git status                  # real commands run in bash unchanged
+aisha ~/lab $ delete all .tmp files
 → delete · here and subfolders · type: .tmp
 $ find . -type f -iname '*.tmp' -not -path '*/.git/*' -delete
 1 match:
