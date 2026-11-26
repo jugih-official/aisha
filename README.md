@@ -210,10 +210,11 @@ About 240 kinds of request, without a model:
   timestamps, bytes or KB; hidden included or only, files only, folders only,
   folders first, type markers. "list all the files in this folder by time,
   oldest first, including hidden" → `ls -lhAtr`.
-- **How `ls` lists**: one per line with the size (K, M, G) and the last
-  modified time, folders first, then files, each newest first, in color
-  (folders blue, programs green, links cyan; `LS_COLORS` if set). aisha
-  makes `ls` and `dir` run `ls -lh --color=auto --group-directories-first -t`
+- **How `ls` lists**: one per line with only the size (K, M, G), the last
+  modified time and the name (no permissions, owner or group), folders
+  first, then files, each newest first, in color (folders blue, programs
+  green, links cyan; `LS_COLORS` if set). aisha makes `ls` and `dir` run
+  `ls -ogh --group-directories-first -t` without the permissions column
   (and sets `ll`, `la`, `l` as on Debian), and "list files" lists the same
   way. `ls -1`, `ls -C`, `ls -m` still give names only, and so does `ls` into
   a pipe or a file (`ls | wc -l`, `$(ls)`), as with plain ls.

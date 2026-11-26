@@ -1,4 +1,4 @@
-.TH AISHA 1 "November 2026" "aisha 0.12.1" "User Commands"
+.TH AISHA 1 "November 2026" "aisha 0.12.2" "User Commands"
 .SH NAME
 aisha \- ai$ha (ai shell hybrid alpha), a shell you can talk to
 .SH SYNOPSIS
@@ -146,7 +146,7 @@ settings (same keys as the environment variables, lower case without AISHA_)
 .TP
 .I ~/.config/aisha/aisharc
 bash aliases, functions and exports loaded at start (as is ~/.bash_aliases).
-Before them aisha sets ls and dir to list one per line with size and modified time,
+Before them aisha sets ls and dir to list one per line with only the size, modified time and name,
 folders first, then files, newest first, in color;
 an ls alias or function here replaces that
 .TP
