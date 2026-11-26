@@ -46,10 +46,10 @@ Upstream-Name: aisha
 Source: https://github.com/jugih-official/aisha
 
 Files: *
-Copyright: jugih-official
-License: none-declared
- The upstream repository does not declare a license yet.
+Copyright: 2026 jugih
+License: MIT
 EOF
+tail -n +3 "$REPO/LICENSE" | sed 's/^$/./; s/^/ /' >> "$PKG/usr/share/doc/aisha/copyright"
 gzip -9cn > "$PKG/usr/share/doc/aisha/changelog.gz" <<EOF
 aisha ($VERSION) unstable; urgency=low
 

@@ -6,6 +6,11 @@ standard library and the base tools. Most requests are handled by a
 deterministic rule engine with no model at all; an optional small **local**
 LLM is consulted only when the rules are unsure.
 
+> **Alpha software, no warranty.** ai$ha turns words into real shell
+> commands and runs them — some with `sudo`, some that delete, overwrite or
+> uninstall. Read the command it shows before you answer `y`. See
+> [Disclaimer](#disclaimer) and [License](#license).
+
 ```
 $ aisha
 aisha ~/lab $ find recursively files older that 2 months from this folder
@@ -400,7 +405,7 @@ downloaded model.
 
 This repository used to be called `ai-prompt` and also held the `ai`,
 `ai-browser`, `ai-desktop` and `ai-code` CLIs; they were removed in 0.7.1
-(the last commit with them is `e11586d`). `./uninstall.sh` also offers to
+(the last commit with them is `0c31a02`). `./uninstall.sh` also offers to
 remove copies of them left in `/usr/local/bin`.
 
 ## Roadmap
@@ -414,3 +419,36 @@ remove copies of them left in `/usr/local/bin`.
 Tests: `python3 -m unittest discover -s tests` (unit tests, the phrase
 corpus, a pty-free shell session, injection checks, and the model runtime
 against a stand-in server).
+
+## Disclaimer
+
+ai$ha is alpha software, provided as is, without warranty of any kind (see
+[License](#license)). You use it at your own risk.
+
+- **It runs real commands on your machine.** Whatever ai$ha shows after `$`
+  is run by bash with your permissions, and with root's when the command
+  starts with `sudo`. The rules, the built-in model and the optional language
+  model can all misread a request. When a request in words deletes,
+  overwrites, uninstalls, formats a drive or rewrites git history, aisha asks
+  `[y/N]` first; other requests run without asking, and commands you type
+  yourself run as typed, as in bash (see [Safety](#safety)). Read the command
+  before you confirm, and keep backups.
+- **Guesses are guesses.** `uninstall <name>` removes the *closest*
+  installed match and says so; a typo can match something you did not mean.
+- **Outside services.** aisha works offline. A few requests use services on
+  the internet when you ask for them: the weather (wttr.in), your public IP
+  (ifconfig.me), web search (DuckDuckGo, in your browser), checking whether
+  you are online (deb.debian.org), and `aisha --setup` downloads from
+  Hugging Face and GitHub. Nothing is sent anywhere otherwise; there is no
+  telemetry.
+- **Models have their own licenses.** The default Qwen2.5-Coder 0.5B and the
+  1.5B model are Apache 2.0, and llamafile/llama.cpp are Apache 2.0/MIT. The
+  optional **3B** model (`--setup 3b`) is under the Qwen Research License,
+  which does not allow commercial use. aisha downloads a model only when you
+  ask; it does not ship one.
+- Not affiliated with any of the projects or services named here.
+
+## License
+
+[MIT](LICENSE) © 2026 jugih. You may use, copy, change and share ai$ha,
+also commercially, as long as the copyright and license notice stay with it.
