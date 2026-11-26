@@ -210,13 +210,16 @@ About 240 kinds of request, without a model:
   timestamps, bytes or KB; hidden included or only, files only, folders only,
   folders first, type markers. "list all the files in this folder by time,
   oldest first, including hidden" → `ls -lhAtr`.
-- **How `ls` lists**: folders first, then files, each newest first, in
-  color (folders blue, programs green, links cyan; `LS_COLORS` if set).
-  aisha sets `ls` and `dir` to `ls --color=auto --group-directories-first -t`
-  (and `ll`, `la`, `l` as on Debian), and "list files" uses the same order.
+- **How `ls` lists**: one per line with the size (K, M, G) and the last
+  modified time, folders first, then files, each newest first, in color
+  (folders blue, programs green, links cyan; `LS_COLORS` if set). aisha
+  makes `ls` and `dir` run `ls -lh --color=auto --group-directories-first -t`
+  (and sets `ll`, `la`, `l` as on Debian), and "list files" lists the same
+  way. `ls -1`, `ls -C`, `ls -m` still give names only, and so does `ls` into
+  a pipe or a file (`ls | wc -l`, `$(ls)`), as with plain ls.
   Any sort you ask for still wins (`ls -S`, "by size"); "by name" runs
-  `command ls`, past the alias. An `ls` alias of your own in
-  `~/.bash_aliases` or `aisharc`, or `unalias ls`, replaces it.
+  `command ls`, past it. An `ls` alias or function of your own in
+  `~/.bash_aliases` or `aisharc` replaces it; `unset -f ls` turns it off.
 - **USB drives** — list connected drives and devices, free space, mount,
   unmount, eject (power off), format to NTFS / FAT32 / exFAT / ext4 with a
   label. aisha reads the drives itself, names the real device in the

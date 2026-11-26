@@ -50,7 +50,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.12.0"
+VERSION = "0.12.1"
 NAME = "ai$ha"             # the shell's name as shown: ai shell hybrid alpha. The command stays `aisha`
 TAGLINE = "ai shell hybrid alpha"   # ($ in a command name would be read as a variable by every shell)
 
@@ -7854,12 +7854,17 @@ command once and it learns it — with your file names as slots, so it works for
 
 AISHARC = os.path.join(CFG_DIR, "aisharc")
 RC_FILES = ["~/.bash_aliases", AISHARC]
-# How ls lists by default: folders first, then files, each newest first, in color (folders blue,
-# programs green, links cyan: ls's own colors, or LS_COLORS). Loaded before the files above, so an
-# alias there (or 'unalias ls') wins. ll/la/l are Debian's, through the same ls.
+# How ls lists by default: one per line with size (K, M, G) and last modified time, folders first,
+# then files, each newest first, in color (folders blue, programs green, links cyan: ls's own
+# colors, or LS_COLORS). -1, -C, -x or -m still pick another layout, and into a pipe or a file it
+# gives names only, as ls does ('ls | wc -l', '$(ls)'). Loaded before the files above, so an ls
+# alias or function there (or 'unset -f ls') wins. ll/la/l are Debian's, through the same ls.
 LS_STYLE = "--color=auto --group-directories-first -t"
-DEFAULT_ALIASES = (f"alias ls='ls {LS_STYLE}' dir='ls {LS_STYLE}' "
-                   "ll='ls -alF' la='ls -A' l='ls -CF'")
+DEFAULT_ALIASES = (
+    "ls() { local __a __l=-lh; [ -t 1 ] || __l=; for __a; do case $__a in --) break ;; --*) ;; "
+    "-*1*) __l= ;; esac; done; command ls $__l " + LS_STYLE + " \"$@\"; }\n"
+    "dir() { ls \"$@\"; }\n"
+    "alias ll='ls -alF' la='ls -A' l='ls -CF'")
 
 
 class ExitShell(Exception):
