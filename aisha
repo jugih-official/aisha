@@ -50,7 +50,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.11.1"
+VERSION = "0.12.0"
 NAME = "ai$ha"             # the shell's name as shown: ai shell hybrid alpha. The command stays `aisha`
 TAGLINE = "ai shell hybrid alpha"   # ($ in a command name would be read as a variable by every shell)
 
@@ -1593,7 +1593,8 @@ def h_list(u: Utterance) -> Plan | None:
     has_total = long_fmt
     if opts["only"] == "files":
         hide = [] if show_all else ["-not", "-name", "'.*'"]
-        flags = " ".join(x for x in ["-" + short if short else "", *extra] if x)
+        short += "t" if key is None else ""        # find runs ls itself, past the alias: newest first
+        flags = " ".join(x for x in ["-" + short, *extra, "--color=auto"] if x)
         cmd = " ".join(["find", qpath(spec.root), "-maxdepth", "1", "-mindepth", "1", "-type", "f", *hide,
                         "-exec", "ls", flags + (" " if flags else "") + "--", "{}", "+"])
         cmd = re.sub(r"\s+", " ", cmd)
@@ -1607,7 +1608,11 @@ def h_list(u: Utterance) -> Plan | None:
         else:
             target = qpath(spec.root) if root else ""
         flags = " ".join(x for x in ["-" + short if short else "", *extra] if x)
-        cmd = " ".join(x for x in ("ls", flags, "--" if target else "", target) if x)
+        # by name: past the ls alias, which sorts newest first (ls has no flag back to names)
+        by_name = key == "name"
+        ls = "command ls" if by_name else "ls"
+        style = LS_STYLE.replace(" -t", "") if by_name else ""
+        cmd = " ".join(x for x in (ls, flags, style, "--" if target else "", target) if x)
     if spec.limit:
         cmd += f" | head -n {spec.limit + 1 if has_total else spec.limit}"
     return finish(u, Plan(cmd, "list", why), guessed, spec)
@@ -3022,6 +3027,121 @@ def install_cmd(pkgs: list[str], remove: bool = False) -> str | None:
     return f"{sudo()}{verb} {' '.join(pkgs)}"
 
 
+def _lines(cmd: list[str]) -> list[str]:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return r.stdout.splitlines() if r.returncode == 0 else []
+
+
+def installed_software() -> list[tuple[str, str, str]]:
+    """(kind, name to remove it by, name people call it) for what is installed:
+    the system's packages, flatpak apps and snaps."""
+    pm, out = pkg_manager(), []
+    listing = {"apt": ["dpkg-query", "-W", "-f=${Package}\\n"], "dnf": ["rpm", "-qa", "--qf", "%{NAME}\\n"],
+               "zypper": ["rpm", "-qa", "--qf", "%{NAME}\\n"], "pacman": ["pacman", "-Qq"],
+               "apk": ["apk", "info"], "brew": ["brew", "list", "-1"]}.get(pm or "")
+    for line in _lines(listing) if listing else []:
+        name = line.strip().split(":")[0]
+        if name:
+            out.append((pm, name, name))
+    if shutil.which("flatpak"):
+        for line in _lines(["flatpak", "list", "--app", "--columns=application,name"]):
+            app, _, label = line.partition("\t")
+            if app.strip():
+                out.append(("flatpak", app.strip(), label.strip() or app.strip()))
+    if shutil.which("snap"):
+        for line in _lines(["snap", "list"])[1:]:
+            if line.split():
+                out.append(("snap", line.split()[0], line.split()[0]))
+    return out
+
+
+NOT_AN_APP = re.compile(r"^lib|-(?:dev|dbg|doc|docs|common|data|l10n|locale|i18n)\b|^fonts?-|^python3?-|^gir1")
+
+
+def nearest_installed(query: str, software: list | None = None) -> list[tuple[str, str, str]]:
+    """What installed software 'query' most likely means, best first ([] for nothing close):
+    the exact package, a flatpak by its shown name, the package a command comes from, a
+    package with the word in its name (chrome: google-chrome-stable), then a typo away."""
+    software = installed_software() if software is None else software
+    q = query.lower().strip()
+    qn = re.sub(r"\s+", "-", q)
+    words = q.split()
+    if not q:
+        return []
+    owner = None
+    exact = any(n.lower() == qn or (k == "flatpak" and l.lower() == q) for k, n, l in software)
+    exe = shutil.which(qn) if pkg_manager() == "apt" and not exact else None
+    if exe:
+        for line in _lines(["dpkg", "-S", os.path.realpath(exe)]) or _lines(["dpkg", "-S", exe]):
+            owner = line.split(":")[0].strip()
+            break
+    scored = []
+    for kind, name, label in software:
+        n, lab = name.lower(), label.lower()
+        app_part = n.rsplit(".", 1)[-1] if kind == "flatpak" else n
+        parts = set(re.split(r"[-._+]", n))
+        if n == qn or (kind == "flatpak" and (lab == q or app_part == qn)):
+            score = 1.0
+        elif owner and n == owner:
+            score = 0.95
+        elif NOT_AN_APP.search(n):
+            continue
+        elif all(w in parts for w in words) or (len(qn) >= 4 and n.startswith(qn + "-")) or \
+                (kind == "flatpak" and all(w in lab.split() for w in words)):
+            score = 0.9 - len(n) / 1000
+        else:
+            r = max(difflib.SequenceMatcher(None, qn, app_part).ratio(),
+                    difflib.SequenceMatcher(None, q, lab).ratio())
+            if r < 0.8:
+                continue
+            score = r * 0.85
+        scored.append((score, kind, name, label))
+    scored.sort(key=lambda x: (-x[0], len(x[2])))
+    seen, best = set(), []
+    for _, kind, name, label in scored:
+        if (kind, name) not in seen:
+            seen.add((kind, name))
+            best.append((kind, name, label))
+    return best[:3]
+
+
+def remove_cmd(kind: str, name: str, purge: bool = False) -> str:
+    q = shlex.quote(name)
+    if kind == "flatpak":
+        return f"flatpak uninstall {'--delete-data ' if purge else ''}{q}"
+    if kind == "snap":
+        return f"{sudo()}snap remove {'--purge ' if purge else ''}{q}"
+    if kind == "apt" and purge:
+        return f"{sudo()}apt purge {q} && {sudo()}apt autoremove"
+    return install_cmd([q], remove=True) or f"{sudo()}apt remove {q}"
+
+
+def uninstall_plan(query: str, purge: bool = False) -> Plan | None:
+    """Remove the installed software nearest to 'query', saying so when it is not an exact name."""
+    software = installed_software()
+    if not software:
+        return None                     # nothing could be listed: the package manager decides
+    hits = nearest_installed(query, software)
+    if not hits:
+        return Plan(f"echo {shlex.quote(f'nothing installed matches: {query}')}", "packages",
+                    [f"{query}: not installed"])
+    kind, name, label = hits[0]
+    shown = f"{label} ({name})" if label != name else name
+    why = [f"{'purge' if purge else 'remove'} {shown} with {kind}"]
+    exact = name.lower() == re.sub(r"\s+", "-", query.lower().strip()) or label.lower() == query.lower().strip()
+    warning = "! removes the package and its settings" if purge else "! changes installed software"
+    if not exact:
+        why.append(f"nearest installed match to '{query}'")
+        others = ", ".join(n for _, n, _ in hits[1:])
+        if others:
+            why.append(f"also close: {others}")
+        warning = f"! removes {shown}, the closest installed match to '{query}'"
+    return Plan(remove_cmd(kind, name, purge), "packages", why, destructive=True, warning=warning)
+
+
 def require(plan: Plan, reqs: list) -> Plan:
     """Prefix an install step when a tool the plan needs is missing."""
     missing = [(c, p) for c, p in reqs if not shutil.which(c)]
@@ -3088,6 +3208,15 @@ def h_process(u: Utterance) -> Plan | None:
 
 
 def h_package(u: Utterance) -> Plan | None:
+    m = u.peek(r"^\s*(?:please\s+)?(uninstall|purge)\s+(?:the\s+)?(?:package\s+|program\s+|app\s+|software\s+)?"
+               r"([\w.+-]+(?:\s+[\w.+-]+){0,2}?)(?:\s+(?:package|program|app|software))?(?:\s+(?:completely|entirely|fully))?\s*$")
+    if m and pkg_manager():
+        name = u.o(m, 2).strip()
+        if not os.path.exists(os.path.join(u.cwd, name)) and name.lower() not in FILLER:
+            plan = uninstall_plan(name, purge=m.group(1) == "purge" or bool(re.search(r"\b(?:completely|entirely|fully)\s*$", u.low)))
+            if plan:
+                u.text = " " * len(u.text)
+                return plan
     m = u.peek(r"\b(install|uninstall|remove|purge)\s+(?:the\s+)?(?:package\s+|program\s+|app\s+)?(\S+)(?:\s+(?:package|program|app))?$")
     if m and (m.group(1) in ("install", "uninstall", "purge") or u.peek(r"\b(?:package|program|app)\b")):
         name = u.lit(u.o(m, 2))
@@ -3096,6 +3225,11 @@ def h_package(u: Utterance) -> Plan | None:
                 name.lower() in ("folder", "file", "directory", "dir", "files", "folders") or \
                 os.path.exists(os.path.join(u.cwd, name)):
             return None
+        if m.group(1) != "install":
+            plan = uninstall_plan(name, purge=m.group(1) == "purge")
+            if plan:
+                u.text = " " * len(u.text)
+                return plan
         cmd = install_cmd([shlex.quote(name)], remove=m.group(1) != "install")
         if not cmd:
             return None
@@ -4100,6 +4234,8 @@ def _apply_recipe(r: Recipe, u: Utterance) -> Plan | None:
         if not cmd:
             continue
         u.blank(m.start(), m.end())
+        if isinstance(cmd, Plan):          # the recipe made the whole plan (uninstall: the nearest match)
+            return cmd
         u.take(r"^\s*(?:please\s+)?(?:find|search\s+for|search|locate|look\s+for|hunt\s+for|list|show(?:\s+me)?|"
                r"get(?:\s+me)?|give\s+me|print|display|view|tell\s+me)\b")
         u.take(r"\b(?:find|list|show|search)\s*$")
@@ -4828,6 +4964,9 @@ def _purge(vals, u):
     pm, name = pkg_manager(), _lit(vals, "word", u)
     if name.lower() in FILLER or os.path.exists(os.path.join(u.cwd, name)):
         return None
+    plan = uninstall_plan(name, purge=True)
+    if plan:
+        return plan
     q = shlex.quote(name)
     if pm != "apt":
         return install_cmd([q], remove=True)
@@ -7715,6 +7854,12 @@ command once and it learns it — with your file names as slots, so it works for
 
 AISHARC = os.path.join(CFG_DIR, "aisharc")
 RC_FILES = ["~/.bash_aliases", AISHARC]
+# How ls lists by default: folders first, then files, each newest first, in color (folders blue,
+# programs green, links cyan: ls's own colors, or LS_COLORS). Loaded before the files above, so an
+# alias there (or 'unalias ls') wins. ll/la/l are Debian's, through the same ls.
+LS_STYLE = "--color=auto --group-directories-first -t"
+DEFAULT_ALIASES = (f"alias ls='ls {LS_STYLE}' dir='ls {LS_STYLE}' "
+                   "ll='ls -alF' la='ls -A' l='ls -CF'")
 
 
 class ExitShell(Exception):
@@ -7853,8 +7998,7 @@ class Shell:
     def load_rc(self) -> None:
         """Aliases, functions and exports from ~/.bash_aliases and aisharc."""
         files = [os.path.expanduser(f) for f in RC_FILES if os.path.isfile(os.path.expanduser(f))]
-        if files:
-            self.run("\n".join(f". {shlex.quote(f)}" for f in files))
+        self.run("\n".join([DEFAULT_ALIASES] + [f". {shlex.quote(f)}" for f in files]))
 
     # -- entry point for one line
     def handle(self, line: str) -> int:

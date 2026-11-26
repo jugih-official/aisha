@@ -22,6 +22,10 @@ _spec = importlib.util.spec_from_loader("aisha", _loader)
 aisha = importlib.util.module_from_spec(_spec)
 sys.modules["aisha"] = aisha
 _loader.exec_module(aisha)
+# What counts as installed, the same on every machine: the phrases name these.
+REAL_INSTALLED = aisha.installed_software
+aisha.installed_software = lambda: [("apt", n, n) for n in ("htop", "nginx", "firefox", "nodejs", "libc6")] + \
+    [("flatpak", "com.github.PintaProject.Pinta", "Pinta"), ("flatpak", "org.mozilla.Thunderbird", "Thunderbird")]
 
 
 def make_lab(root):
@@ -933,6 +937,43 @@ class TestReviewRegressions(LabTest):
         self.assertEqual(sh.env.get("FROM_RC"), "yes")
         self.assertIn("hi", sh.names)
 
+    def test_ls_lists_folders_then_files_newest_first(self):
+        d = os.path.join(self.lab, "lsorder")
+        os.makedirs(d)
+        for i, (name, is_dir) in enumerate([("old_dir", True), ("old.txt", False),
+                                            ("new_dir", True), ("new.txt", False)]):
+            p = os.path.join(d, name)
+            os.mkdir(p) if is_dir else open(p, "w").close()
+            os.utime(p, (1_000_000 + i * 100,) * 2)
+        sh = self.shell()
+        self.assertIn("ls", sh.names)
+        for line in ["ls", "dir"]:
+            sh.handle(f"cd {d} && {line} -1 > ../ls.out; cd {self.lab}")
+            self.assertEqual(" ".join(self.read("ls.out").split()), "new_dir old_dir new.txt old.txt", line)
+        plan = aisha.interpret("list files by name", self.lab)
+        self.assertTrue(plan.command.startswith("command ls "), plan.command)
+
+    def test_uninstall_finds_the_nearest_installed(self):
+        sw = aisha.installed_software()
+        near = lambda q: [n for _, n, _ in aisha.nearest_installed(q, sw)][:1]
+        self.assertEqual(near("htop"), ["htop"])
+        self.assertEqual(near("firefx"), ["firefox"])                       # a typo away
+        self.assertEqual(near("pinta"), ["com.github.PintaProject.Pinta"])  # a flatpak by its name
+        self.assertEqual(near("thunderbird"), ["org.mozilla.Thunderbird"])
+        self.assertEqual(near("libc"), [])                                  # libraries are not guessed
+        self.assertEqual(near("zzzqqq"), [])
+        if aisha.pkg_manager() == "apt":
+            p = aisha.interpret("uninstall firefx", self.lab)
+            self.assertIn("remove firefox", p.command)
+            self.assertTrue(p.destructive)
+            self.assertIn("closest installed match", p.warning)
+            self.assertEqual(aisha.interpret("uninstall pinta", self.lab).command,
+                             "flatpak uninstall com.github.PintaProject.Pinta")
+            self.assertEqual(aisha.interpret("purge pinta", self.lab).command,
+                             "flatpak uninstall --delete-data com.github.PintaProject.Pinta")
+            p = aisha.interpret("uninstall zzzqqq", self.lab)
+            self.assertTrue(p.command.startswith("echo ") and not p.destructive, p.command)
+
     def test_real_commands_are_not_replaced(self):
         for line in ["time make", "watch date", "sort names", "kill 1234", "kill %1"]:
             self.assertTrue(aisha.looks_like_shell(line, None, self.lab), line)
@@ -1731,7 +1772,7 @@ class TestListOptions(LabTest):
     def test_parameters(self):
         cases = {
             "list all the files on this folder by time": "ls -lhAt",
-            "list all the files on this folder by file name": "ls -lhA",
+            "list all the files on this folder by file name": "command ls -lhA --color=auto --group-directories-first",
             "list files by size smallest first": "ls -lhSr",
             "list files sorted by date oldest first": "ls -lhtr",
             "list files newest last": "ls -lhtr",
@@ -1739,7 +1780,7 @@ class TestListOptions(LabTest):
             "list files by version": "ls -lhv",
             "list files by access time": "ls -lhtu",
             "list files by creation date": "ls -lht --time=birth",
-            "list files z to a": "ls -lhr",
+            "list files z to a": "command ls -lhr --color=auto --group-directories-first",
             "list files in reverse order": "ls -lhr",
             "list one file per line": "ls -1",
             "list file names only": "ls -1",
@@ -1752,7 +1793,7 @@ class TestListOptions(LabTest):
             "list files with type markers": "ls -lhF",
             "order the files by size": "ls -lhS",
             "list everything by date and show hidden": "ls -lhAt",
-            "list only files by size": "find . -maxdepth 1 -mindepth 1 -type f -not -name '.*' -exec ls -lhS -- {} +",
+            "list only files by size": "find . -maxdepth 1 -mindepth 1 -type f -not -name '.*' -exec ls -lhS --color=auto -- {} +",
         }
         for phrase, cmd in cases.items():
             self.assertEqual(self.cmd(phrase), cmd, phrase)

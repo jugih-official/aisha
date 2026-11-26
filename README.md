@@ -115,6 +115,13 @@ About 240 kinds of request, without a model:
   files of a package, recently installed, check for updates, upgrade, clean
   up old packages, install several at once, purge, fix broken packages,
   upgrade everything except the kernel, which packages take the most space.
+  `uninstall <software>` (or `purge`, or `remove the … package`) looks
+  through what is installed — the system's packages, flatpak apps and snaps
+  — and removes the nearest match after a `[y/N]`: `uninstall firefx` →
+  `sudo apt remove firefox`, `uninstall pinta` → `flatpak uninstall
+  com.github.PintaProject.Pinta`, `uninstall node` → `nodejs` (the package
+  that `node` comes from). When it is not the exact name, the warning says
+  so; when nothing installed is close, it says that instead of guessing.
 - **Shell** — variables, aliases (saved to `aisharc`), adding to `PATH`,
   what a command does, its manual, repeat every N seconds, time a command,
   run in the background, as root, notify when done, `again`.
@@ -203,6 +210,13 @@ About 240 kinds of request, without a model:
   timestamps, bytes or KB; hidden included or only, files only, folders only,
   folders first, type markers. "list all the files in this folder by time,
   oldest first, including hidden" → `ls -lhAtr`.
+- **How `ls` lists**: folders first, then files, each newest first, in
+  color (folders blue, programs green, links cyan; `LS_COLORS` if set).
+  aisha sets `ls` and `dir` to `ls --color=auto --group-directories-first -t`
+  (and `ll`, `la`, `l` as on Debian), and "list files" uses the same order.
+  Any sort you ask for still wins (`ls -S`, "by size"); "by name" runs
+  `command ls`, past the alias. An `ls` alias of your own in
+  `~/.bash_aliases` or `aisharc`, or `unalias ls`, replaces it.
 - **USB drives** — list connected drives and devices, free space, mount,
   unmount, eject (power off), format to NTFS / FAT32 / exFAT / ext4 with a
   label. aisha reads the drives itself, names the real device in the

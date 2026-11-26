@@ -1,4 +1,4 @@
-.TH AISHA 1 "November 2026" "aisha 0.11.1" "User Commands"
+.TH AISHA 1 "November 2026" "aisha 0.12.0" "User Commands"
 .SH NAME
 aisha \- ai$ha (ai shell hybrid alpha), a shell you can talk to
 .SH SYNOPSIS
@@ -145,7 +145,9 @@ editor used by "edit FILE" (through sensible-editor on Debian)
 settings (same keys as the environment variables, lower case without AISHA_)
 .TP
 .I ~/.config/aisha/aisharc
-bash aliases, functions and exports loaded at start (as is ~/.bash_aliases)
+bash aliases, functions and exports loaded at start (as is ~/.bash_aliases).
+Before them aisha sets ls and dir to list folders first, then files, newest first, in color;
+an ls alias here replaces that
 .TP
 .I ~/.local/share/aisha
 downloaded llama.cpp runtime and model
