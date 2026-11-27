@@ -217,7 +217,8 @@ About 240 kinds of request are handled without a model:
   descending; long, names only, one per line, columns, comma-separated, full
   timestamps, bytes or KB; hidden files included or only, files only, folders
   only, folders first, type markers. "list all the files in this folder by
-  time, oldest first, including hidden" → `ls -lhAtr`.
+  time, oldest first, including hidden" → `ls -lhAtr`; "list files in the order
+  of time" and "list files in time order" → `ls -lht`.
 - **`ls` output**: one entry per line with only the size (K, M, G), the last
   modified time and the name (no permissions, owner or group); folders first,
   then files, each newest first; in color (folders blue, programs green,

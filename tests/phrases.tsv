@@ -527,6 +527,16 @@ list directories first	--group-directories-first
 order the files by size	ls -lhS
 list everything by date and show hidden	ls -lhAt
 list files chronologically	ls -lhtr
+list files in the order of time	ls -lht
+list files in order of time	ls -lht
+list the files in time order	ls -lht
+show files in order of date	ls -lht
+list files in order of modification	ls -lht
+list files in date order	ls -lht
+list files in reverse time order	ls -lhtr
+list files in order of their size	ls -lhS
+list files in size order	ls -lhS
+find pdf files in order of time	-iname '*.pdf' ;; sort -r
 
 # -- usb (drive actions are in TestUSB, which fakes the drive)
 list all connected usb	USB drives || lsblk

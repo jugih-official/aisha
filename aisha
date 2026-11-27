@@ -50,7 +50,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.12.3"
+VERSION = "0.12.4"
 NAME = "ai$ha"             # the shell's name as shown: ai shell hybrid alpha. The command stays `aisha`
 TAGLINE = "ai shell hybrid alpha"   # ($ in a command name would be read as a variable by every shell)
 
@@ -747,9 +747,12 @@ def take_sort_limit(u: Utterance, spec: FindSpec) -> None:
     if word:
         key = "recent" if "recent" in word else word.split()[0]
         spec.sort = SORT_WORD.get(key, ("time", True))
-    m = u.take(r"\b(?:sorted|sort(?:ed)?|ordered|order|arranged)?\s*by\s+(size|date|time|name|age|"
-               r"modification\s+(?:date|time)|(?:last\s+)?modified)"
+    key_words = r"size|date|time|name|age|modification\s+(?:date|time)|(?:last\s+)?modified|modification"
+    m = u.take(rf"\b(?:(?:sorted|sort(?:ed)?|ordered|order|arranged)?\s*by|(?:in\s+)?(?:the\s+)?order\s+of)\s+"
+               rf"(?:their\s+|the\s+)?({key_words})"
                r"(?:\s+(desc(?:ending)?|asc(?:ending)?|reversed?|in\s+reverse))?\b")
+    m = m or u.take(rf"\b(?:in\s+)?(?:the\s+|their\s+)?({key_words})\s+order"
+                    r"(?:\s+(desc(?:ending)?|asc(?:ending)?|reversed?|in\s+reverse))?\b")
     if m:
         key = {"size": "size", "name": "name"}.get(m.group(1), "time")
         desc = key != "name"
@@ -1514,6 +1517,9 @@ def take_ls_options(u: Utterance) -> dict:
     keys = "|".join(f"(?P<k{i}>{pat})" for i, (pat, *_r) in enumerate(LS_KEYS))
     m = u.take(r"\b(?:sort(?:ed)?|order(?:ed)?|arrang(?:e|ed)|organi[sz]ed?|rank(?:ed)?|group(?:ed)?)?\s*(?:them\s+|it\s+)?"
                rf"(?:by|on|according\s+to)\s+(?:their\s+|the\s+|its\s+)?(?:{keys})\b")
+    # "in the order of time", "in order of their size", "in time order", "date order"
+    m = m or u.take(rf"\b(?:in\s+)?(?:the\s+)?order\s+of\s+(?:their\s+|the\s+|its\s+)?(?:{keys})\b")
+    m = m or u.take(rf"\b(?:in\s+)?(?:the\s+|their\s+|its\s+)?(?:{keys})\s+order\b")
     if m:
         i = next(int(k[1:]) for k, v in m.groupdict().items() if v)
         o["key"] = LS_KEYS[i][1]
