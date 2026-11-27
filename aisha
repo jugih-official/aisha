@@ -50,7 +50,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.12.4"
+VERSION = "0.13.0"
 NAME = "ai$ha"             # the shell's name as shown: ai shell hybrid alpha. The command stays `aisha`
 TAGLINE = "ai shell hybrid alpha"   # ($ in a command name would be read as a variable by every shell)
 
@@ -268,6 +268,15 @@ morning evening tonight night weekend
 # Negations the rules could not attach to a filter: never search terms, and
 # the parse is not trusted when one is left over.
 NEG_WORDS = {"not", "no", "never", "none", "without", "nor", "neither"}
+
+# Words about HOW to list, sort or show (order, sorted, alphabetical, ...). They are
+# never search terms; a leftover one means the parse missed an option, so the
+# request goes to the suggestions or the language model instead.
+OPTION_WORDS = set("""
+order ordered ordering sort sorted sorting arrange arranged arrangement according alphabetical
+alphabetically alphabetic abc ascending descending asc desc reverse reversed backwards inverse
+unsorted chronological chronologically numerically numeric numerical too
+""".split())
 
 # Nouns too vague to be search keywords ("the measurement *data*").
 GENERIC = set("""
@@ -1148,7 +1157,8 @@ kill run execute install send upload download print sort
 def absorb_keywords(u: Utterance, spec: FindSpec, mode: str, limit: int = 2) -> int:
     """Leftover nouns become name/content keywords ("find the budget pdf")."""
     words = [w for w in u.leftover() if w not in TIMEISH and w not in ACTION_WORDS
-             and w not in NEG_WORDS and not re.fullmatch(r"\d+", w)]   # a bare number is no search term
+             and w not in NEG_WORDS and w not in OPTION_WORDS
+             and not re.fullmatch(r"\d+", w)]   # a bare number is no search term
     texty = {"word", "words", "text", "string", "phrase", "term", "keyword"}
     if len([w for w in words if w not in texty]) >= 1 and any(w in texty for w in words):
         for low, orig, start in u.remaining():            # "files that have the word eggs": eggs, not "word"
@@ -1365,6 +1375,8 @@ def finish(u: Utterance, plan: Plan, guessed: int = 0, spec: FindSpec | None = N
     plan.confidence *= (UNKNOWN_PENALTY ** len(left)) * (GUESS_PENALTY ** guessed)
     if NEG_WORDS & set(left):
         plan.confidence *= 0.5    # an unplaced "not" may flip the meaning
+    if OPTION_WORDS & set(left):
+        plan.confidence *= 0.5    # an option the rules did not read: not this command
     if left:
         plan.why.append("ignored: " + " ".join(left))
     if looks_destructive(plan.command):
@@ -1441,7 +1453,7 @@ LS_KEYS = [
     (r"ctime|status\s+change(?:\s+time)?|inode\s+change(?:\s+time)?", "ctime", "tc", ""),
     (r"(?:last\s+)?modif(?:ied|ication)(?:\s+(?:time|date))?|mtime|(?:change|edit|update)[ds]?\s+(?:time|date)|time(?:stamps?)?|dates?|"
      r"age|recency|when\s+(?:they\s+were\s+)?(?:last\s+)?(?:modified|changed|edited|updated|saved)", "time", "t", ""),
-    (r"sizes?|bytes|how\s+big(?:\s+they\s+are)?|weight", "size", "S", ""),
+    (r"(?:file\s+)?sizes?|bytes|how\s+big(?:\s+they\s+are)?|weight", "size", "S", ""),
     (r"(?:file\s*)?extensions?|ext|suffix(?:es)?|(?:file\s*)?types?|kind|format", "ext", "X", ""),
     (r"versions?(?:\s+numbers?)?|natural(?:\s+order)?|numbers?\s+in\s+(?:the\s+)?names?", "version", "v", ""),
     (r"(?:file\s*)?names?|filenames?|alphabet|letters?|titles?", "name", "", ""),
@@ -1454,14 +1466,17 @@ def take_ls_options(u: Utterance) -> dict:
     """Listing parameters in any wording: sort key and direction, format, what to include."""
     o = {"key": None, "rev": None, "fmt": None, "all": False, "only": None, "dirs_first": False,
          "classify": False, "full_time": False, "bytes": False, "block": None, "why": []}
+    if u.take(r"\bunsorted\b|\bnot\s+sorted\b|\b(?:without|with\s+no|no)\s+sorting\b|"
+              r"\bin\s+(?:the\s+)?(?:directory|disk|no(?:\s+particular)?)\s+order\b"):
+        o["key"] = "none"
     if u.take(r"\b(?:folders|directories|dirs|subfolders)\s+(?:first|on\s+top|at\s+the\s+top|before\s+files)\b|"
               r"\bgroup(?:ed)?\s+(?:the\s+)?(?:folders|directories|dirs)(?:\s+(?:first|together))?\b"):
         o["dirs_first"] = True
         o["why"].append("folders first")
-    if u.take(r"\b(?:including|incl|with|plus|and|also|show(?:ing)?|even|together\s+with)\s+(?:the\s+)?(?:hidden|dot)(?:\s*(?:ones|files|items|folders|stuff))?\b|"
-              r"\b(?:hidden|dot\s*files)\s+(?:ones\s+)?(?:too|as\s+well|included)\b"):
+    if u.take(r"\b(?:and\s+|plus\s+)?(?:the\s+)?(?:hidden|dot)\s*(?:ones|files|items|folders|stuff)?\s+(?:too|as\s+well|included|also)\b|"
+              r"\b(?:including|incl|with|plus|and|also|show(?:ing)?|even|together\s+with)\s+(?:the\s+)?(?:hidden|dot)(?:\s*(?:ones|files|items|folders|stuff))?\b"):
         o["all"] = True
-    if u.take(r"\b(?:only|just)\s+(?:the\s+)?files\b|\bfiles\s+only\b|\b(?:no|without(?:\s+the)?|exclud(?:e|ing))\s+(?:folders|directories|dirs)\b"):
+    if u.take(r"\b(?:only|just)\s+(?:the\s+)?files\b|\bfiles\s+only\b(?!\s+(?:the\s+)?(?:file\s*)?names)|\b(?:no|without(?:\s+the)?|exclud(?:e|ing))\s+(?:folders|directories|dirs)\b"):
         o["only"] = "files"
         o["why"].append("files only")
     elif u.take(r"\b(?:only|just)\s+(?:the\s+)?(?:folders|directories|dirs|subfolders|subdirectories)\b|"
@@ -1498,6 +1513,13 @@ def take_ls_options(u: Utterance) -> dict:
     if u.take(r"\b(?:with\s+)?(?:file\s*)?type\s+(?:indicators|markers|symbols)\b|\bclassif(?:y|ied)\b|\bmark\s+(?:the\s+)?(?:folders|directories|types)\b"):
         o["classify"] = True
         o["why"].append("type markers")
+    # "largest to smallest", "from oldest to newest"
+    m = u.take(r"\b(?:from\s+)?(?:the\s+)?(largest|biggest|smallest|tiniest|newest|latest|oldest|most\s+recent)\s+"
+               r"(?:to|-|→)\s+(?:the\s+)?(?:largest|biggest|smallest|tiniest|newest|latest|oldest|least\s+recent)\b")
+    if m:
+        word = m.group(1)
+        o["key"] = o["key"] or ("size" if word in ("biggest", "largest", "smallest", "tiniest") else "time")
+        o["rev"] = word not in ("newest", "latest", "most recent", "biggest", "largest")
     # direction words that also name a key
     m = u.take(r"\b(newest|latest|most\s+recent|recent|biggest|largest|oldest|smallest|least\s+recent|tiniest)\s+"
                r"(first|last|on\s+top|at\s+the\s+(?:top|bottom)|at\s+the\s+end)\b")
@@ -1507,9 +1529,12 @@ def take_ls_options(u: Utterance) -> dict:
         big_first = word in ("newest", "latest", "most recent", "recent", "biggest", "largest")
         first = where in ("first", "on top", "at the top")
         o["rev"] = not (big_first == first)
-    if u.take(r"\bz\s*(?:to|-|→)\s*a\b|\breverse\s+alphabetical(?:ly)?\b|\balphabetical(?:ly)?\s+(?:in\s+)?reverse\b"):
+    if u.take(r"\b(?:from\s+)?z\s*(?:to|-|→)\s*a\b|"
+              r"\b(?:(?:sorted|ordered|arranged|sort)\s+)?(?:in\s+)?(?:reversed?|backwards?|inverse)\s+(?:alphabetical(?:ly)?|alphabetic|abc)(?:\s+order)?\b|"
+              r"\b(?:(?:sorted|ordered|arranged|sort)\s+)?alphabetical(?:ly)?\s+(?:in\s+)?(?:reversed?|backwards|descending)(?:\s+order)?\b"):
         o["key"], o["rev"] = "name", True
-    elif u.take(r"\ba\s*(?:to|-|→)\s*z\b|\balphabetical(?:ly)?\b|\bby\s+abc\b"):
+    elif u.take(r"\b(?:from\s+)?a\s*(?:to|-|→)\s*z\b|\bby\s+abc\b|"
+                r"\b(?:(?:sorted|ordered|arranged|sort)\s+)?(?:in\s+)?(?:an?\s+)?(?:alphabetical(?:ly)?|alphabetic|abc)(?:\s+order)?\b"):
         o["key"] = o["key"] or "name"
     if u.take(r"\bchronological(?:ly)?(?:\s+order)?\b|\bin\s+(?:the\s+)?order\s+(?:they\s+were\s+)?(?:made|created|modified)\b"):
         o["key"], o["rev"] = o["key"] or "time", True
@@ -2200,11 +2225,14 @@ def h_size(u: Utterance) -> Plan | None:
         root = qpath(spec.root)
         cmd = f"du -h --max-depth=1 {root} 2>/dev/null | sort -hr | head -n {n + 1}"
         return finish(u, Plan(cmd, "disk usage", [f"biggest folders in {spec.root}", f"top {n}"]))
-    if u.peek(r"\bhow\s+much\s+(?:space|room|disk|storage)\s+(?:is\s+|do\s+i\s+have\s+)?(?:free|left|available|remaining)\b"):
-        u.take(r"\bhow\s+much\s+(?:space|room|disk|storage)\s+(?:is\s+|do\s+i\s+have\s+)?(?:free|left|available|remaining)\b")
+    free_rx = (r"\bhow\s+much\s+(?:free\s+)?(?:disk\s+|drive\s+)?(?:space|room|disk|storage)\s+(?:is\s+|do\s+i\s+have\s+|have\s+i\s+got\s+)?"
+               r"(?:free|left|available|remaining)\b|\bdisk\s+usage\s+of\s+(?:the\s+|all\s+(?:the\s+)?|my\s+)?"
+               r"(?:drives|disks|partitions|file\s*systems|mounts)\b")
+    if u.peek(free_rx):
+        u.take(free_rx)
         return finish(u, Plan("df -h -x tmpfs -x devtmpfs -x squashfs", "disk space", ["free space on all drives"]))
     m = u.take(r"\b(?:how\s+(?:big|large|heavy)|how\s+much\s+(?:space|room|disk)|size\s+of|total\s+size|"
-               r"disk\s+usage\s+of|space\s+used\s+by|du)\b")
+               r"disk\s+usage\s+of|space\s+used\s+by|du)\b|(?<!\bby\s)(?<!file\s)(?<!sort\s)\bsize\b(?=\s*$)")
     if not m:
         m = u.take(r"\b(?:how\s+much\s+)?(?:free|available|remaining|used)?\s*(?:disk|storage|drive)\s*(?:space|usage|capacity)?"
                    r"(?:\s+(?:is\s+|do\s+i\s+have\s+)?(?:left|free|available|remaining))?\b|"
@@ -2546,8 +2574,10 @@ def h_find_then(u: Utterance) -> Plan | None:
 
 
 def h_copy_move(u: Utterance) -> Plan | None:
+    if u.peek(r"^\s*(?:copy|move|duplicate|rename)\s+(?:the\s+)?(?:folder|directory|dir|file)\s+\S+\s+(?:to|into|as)\b"):
+        u.take(r"\b(?:the\s+)?(?:folder|directory|dir|file)\b")       # "copy the folder run1 to backup"
     m = u.peek(r"\b(copy|cp|duplicate|move|mv|rename|put|throw|stick|chuck|toss)\s+(.+?)\s+(?:to|into|in|as|inside|over\s+to)\s+(.+)$")
-    mc = u.peek(r"\b(?:(?:make|create)\s+a\s+copy\s+of|^\s*duplicate)\s+(\S+)\s*$")
+    mc = u.peek(r"\b(?:(?:make|create)\s+a\s+copy\s+of|^\s*duplicate)\s+(\S+)(?:\s+(?:called|named|as)\s+(\S+))?\s*$")
     if mc:
         srcs = resolve_sources(u, u.o(mc, 1))
         if not srcs or len(srcs) != 1:
@@ -2555,7 +2585,7 @@ def h_copy_move(u: Utterance) -> Plan | None:
         u.text = " " * len(u.text)
         src = u.lit(u.o(mc, 1)) if not srcs[0].startswith("'") else srcs[0].strip("'")
         stem_, ext = os.path.splitext(src.rstrip("/"))
-        dest = f"{stem_}-copy{ext}"
+        dest = u.lit(u.o(mc, 2)) if mc.group(2) else f"{stem_}-copy{ext}"
         return Plan(f"cp -ai -- {qpath(src)} {qpath(dest)}", "copy", [f"{src} → {dest}"])
     mb = u.peek(r"\b(?:back\s*up|make\s+a\s+backup\s+of|create\s+a\s+backup\s+of)\s+(.+)$")
     if mb:
@@ -4504,7 +4534,7 @@ RECIPES = [
     Recipe("remote port", [rf"\bis\s+port\s+(?P<n>\d+)\s+open\s+on\s+{H}", rf"\bcheck\s+(?:if\s+)?port\s+(?P<n>\d+)\s+(?:is\s+open\s+)?on\s+{H}",
                            rf"\bcan\s+i\s+connect\s+to\s+{H}\s+(?:on\s+)?port\s+(?P<n>\d+)"],
            "timeout 3 bash -c '</dev/tcp/{host}/{n}' 2>/dev/null && echo 'port {n} is open' || echo 'port {n} is closed or filtered'"),
-    Recipe("headers", [r"\b(?:http\s+)?headers\s+(?:of|for|from)\s+(?P<url>\S+)"],
+    Recipe("headers", [r"\b(?:http\s+)?(?:response\s+)?headers\s+(?:of|for|from)\s+(?P<url>\S+)"],
            [("curl", "curl -sI {url}"),
             (None, "python3 -c 'import sys, urllib.request as u; r = u.urlopen(u.Request(sys.argv[1], method=\"HEAD\"), timeout=10); "
                    "print(r.status); print(r.headers)' {url}")]),
@@ -4533,7 +4563,8 @@ RECIPES = [
     Recipe("upload", [r"\b(?:copy|upload|send|transfer)\s+(?P<path>\S+)\s+to\s+(?:the\s+)?(?:server\s+)?(?P<remote>\S+)\s*$"],
            "scp -r -- {path} {remote}", needs=("scp",)),
     Recipe("download from server", [r"\b(?:copy|download|fetch|get)\s+(?P<remote>\S+)\s*(?:to\s+(?:here|this\s+folder))?\s*$"],
-           lambda v, u: f"scp -r -- {v['remote']} ." if ":" in u.lit(v["_raw_remote"]) else None, needs=("scp",)),
+           lambda v, u: f"scp -r -- {v['remote']} ." if ":" in u.lit(v["_raw_remote"])
+           and not re.match(r"[a-z]+://", u.lit(v["_raw_remote"]), re.I) else None, needs=("scp",)),
     Recipe("sync", [r"\b(?:sync|synchroni[sz]e|mirror)\s+(?P<dir>\S+)\s+(?:to|with|into|onto)\s+(?P<dest>\S+)"],
            [("rsync", "rsync -av --progress -- {dir}/ {dest}/"), (None, "mkdir -p -- {dest} && cp -a -- {dir}/. {dest}/")], destructive=True,
            warning="! copies over files in the destination"),
@@ -5436,6 +5467,258 @@ for _r in RECIPES:
             _r.patterns += [re.compile(a) for a in split_alternatives(_p)]
 
 
+SORT_FILE_WORDS = re.compile(r"\b(?:sort(?:ed|ing)?|alphabeti[sz]e|order|arrange)\b|\balphabetical(?:ly)?\b")
+
+
+def h_sort_file(u: Utterance) -> Plan | None:
+    """The lines of one file, sorted, in any wording and any mix of options:
+    "sort nums.txt numerically descending", "put names.txt in alphabetical order"."""
+    if not SORT_FILE_WORDS.search(u.low) or re.search(r"\b(?:column|field)s?\b", u.low):
+        return None
+    path = None
+    for low, orig, start in u.remaining():
+        tok = u.lit(orig)
+        if os.path.isfile(os.path.join(u.cwd, os.path.expanduser(tok))):
+            path = tok
+            u.blank(start, start + len(orig))
+            break
+    if not path:
+        return None
+    why = []
+    numeric = human = rev = uniq = fold = False
+    if u.take(r"\bhuman[- ]?(?:readable)?(?:\s+(?:numbers|sizes|values))?\b"):
+        human = True
+    if u.take(r"\b(?:in\s+)?(?:an?\s+)?numeric(?:al)?(?:ly)?(?:\s+order)?\b|\bby\s+(?:the\s+)?(?:numbers?|value)\b|"
+              r"\bas\s+numbers\b|\b(?:the\s+)?numbers\s+(?:in|of)\b"):
+        numeric = True
+    m = u.take(r"\b(?:from\s+)?(?:the\s+)?(largest|biggest|highest|smallest|lowest)\s+(?:first|to\s+(?:the\s+)?(?:smallest|lowest|largest|biggest|highest))\b")
+    if m:
+        numeric = numeric or not human
+        rev = m.group(1) in ("largest", "biggest", "highest")
+    if u.take(r"\b(?:in\s+)?(?:reversed?|backwards?|descending|inverse)(?:\s+(?:alphabetical|alphabetic))?(?:\s+order)?\b|"
+              r"\b(?:from\s+)?z\s*(?:to|-|→)\s*a\b"):
+        rev = True
+    u.take(r"\b(?:in\s+)?(?:ascending)(?:\s+order)?\b")
+    if u.take(r"\b(?:and\s+)?(?:remove|drop|without|no|delete|strip|skip)\s+(?:the\s+)?(?:duplicates?|doubles|repeats)(?:\s+lines)?\b|"
+              r"\bunique\b|\bdistinct\b|\bdedup(?:licated?)?\b"):
+        uniq = True
+    if u.take(r"\b(?:ignoring|ignore|regardless\s+of|without\s+regard\s+to)\s+(?:the\s+)?(?:upper\s+and\s+lower\s+)?case\b|"
+              r"\bcase[- ]?insensitive(?:ly)?\b"):
+        fold = True
+    u.take(r"\b(?:in\s+)?(?:an?\s+)?alphabetical(?:ly)?(?:\s+order)?\b|\balphabeti[sz]e\b|\b(?:from\s+)?a\s*(?:to|-|→)\s*z\b|"
+           r"\bin\s+abc\s+order\b")
+    u.take(r"\b(?:sort(?:ed)?|put|arrange|order|reverse)\b")
+    u.take(r"\b(?:the\s+)?(?:lines|contents?|rows|entries)\s*(?:of|in|from)?\b")
+    flags = ("f" if fold else "") + ("h" if human else "n" if numeric else "") + ("r" if rev else "") + ("u" if uniq else "")
+    if fold:
+        why.append("ignoring case")
+    if human or numeric:
+        why.append("as human-readable numbers" if human else "as numbers")
+    why.append("descending" if rev else "ascending")
+    if uniq:
+        why.append("without duplicates")
+    cmd = f"sort -{flags} -- {qpath(path)}" if flags else f"sort -- {qpath(path)}"
+    return finish(u, Plan(cmd, "sort", [path] + why))
+
+
+FILE_LIKE_TLDS = set("""txt md pdf py sh log csv json zip gz tgz tar bz2 xz conf cfg ini yaml yml xml html htm js ts css
+c h cpp java go rs rb php pl lua sql doc docx xls xlsx ppt odt png jpg jpeg gif svg mp3 mp4 mkv avi wav iso deb rpm bak tmp
+old swp lock toml env out bin img""".split())
+HOST_RX = r"(?P<host>(?:\d{1,3}\.){3}\d{1,3}|localhost|[a-z0-9][\w-]*(?:\.[\w-]+)*\.[a-z]{2,})"
+COMMON_PORTS = "21 22 23 25 53 80 110 143 443 445 993 3306 3389 5432 5900 8080 8443"
+
+
+def _one_file(u: Utterance) -> str | None:
+    """The first remaining word that is an existing regular file here. Blanks it."""
+    for low, orig, start in u.remaining():
+        tok = u.lit(orig)
+        if os.path.isfile(os.path.join(u.cwd, os.path.expanduser(tok))):
+            u.blank(start, start + len(orig))
+            return tok
+    return None
+
+
+GREP_FILE_V = re.compile(r"\b(?:search(?:es|ing)?|find|look(?:ing)?\s+for|grep|seek|which\s+lines|lines?\s+(?:with|containing|that|without|not|of|in)|without|"
+                         r"contain(?:s|ing)?|mention(?:s|ing)?|count|how\s+many|number\s+of|occurrences?|appear(?:s)?|excluding)\b")
+GREP_FILE_NOT = re.compile(r"\b(?:replace|delete|remove|sort|edit|open|copy|move|rename|first|last|top|bottom|follow|watch|"
+                           r"line\s+\d+|lines\s+\d+|duplicates?|columns?|fields?|json|csv)\b")
+
+
+def h_grep_file(u: Utterance) -> Plan | None:
+    """Search inside ONE file, with any mix of options in any order: case sensitive
+    or not, whole word, count, lines without, context."""
+    if not GREP_FILE_V.search(u.low) or GREP_FILE_NOT.search(u.low):
+        return None
+    for low, orig, start in u.remaining():
+        if os.path.isfile(os.path.join(u.cwd, os.path.expanduser(u.lit(orig)))):
+            if re.search(r"\b(?:for|named|called|file)\s+$", u.low[:start]):
+                return None                      # "search my home for report.pdf": looking for the file
+            break
+    path = _one_file(u)
+    if not path:
+        return None
+    inv = bool(u.take(r"\b(?:that\s+)?(?:do(?:es)?\s*n[o']t|does\s+not|do\s+not)\s+(?:contain|have|mention|include)\b|"
+                      r"\bnot\s+(?:containing|including|mentioning|matching|having)\b|\bwithout\b|\bexcluding\b|\bexcept\b|\bexclude\b"))
+    case = bool(u.take(r"\bcase[- ]?sensitive(?:ly)?\b|\b(?:matching|exact|same|respecting)\s+(?:the\s+)?case\b|\bexactly\b"))
+    u.take(r"\b(?:ignoring|ignore|regardless\s+of)\s+(?:the\s+)?case\b|\bcase[- ]?insensitive(?:ly)?\b|\bany\s+case\b")
+    word = bool(u.take(r"\b(?:as\s+a\s+)?whole\s+words?(?:\s+only)?\b|\b(?:the\s+)?exact\s+word\b|\bwords?\s+only\b"))
+    u.take(r"\bwith\s+(?:the\s+)?line\s+numbers\b|\bline\s+numbers\b")
+    cm = re.search(rf"\b{NUM}\s+lines?\s+(?:of\s+)?(?:context|around|before\s+and\s+after)\b", u.low)
+    ctx = int(num(cm.group(1), 2)) if cm else 0
+    if cm:
+        u.take(rf"\b(?:with\s+)?{NUM}\s+lines?\s+(?:of\s+)?(?:context|around(?:\s+(?:it|them))?|before\s+and\s+after)\b")
+    times = bool(u.take(r"\bhow\s+many\s+times\b|\boccurrences?\b|\binstances?\b|\bhow\s+often\b|\btimes\b"))
+    count = times or bool(u.take(r"\bcount(?:s|ing)?\b|\bhow\s+many\b|\bnumber\s+of\b|\bmatches\b"))
+    for rx in (r"\b(?:search(?:es|ing)?|find|look(?:ing)?\s+for|grep|seek|show|display|print|list|give|get|which|what)\b",
+               r"\b(?:the\s+)?(?:lines?|rows?|text|word|string|phrase|term)\b",
+               r"\b(?:contain(?:s|ing)?|mention(?:s|ing)?|appear(?:s)?|occur(?:s)?|with|having|have|has|that|does|do|is|are|"
+               r"in|of|for|inside|within|from)\b"):
+        while u.take(rx):
+            pass
+    left = [w for w in u.leftover() if w not in FILLER]
+    if len(left) != 1 or left[0] in ("line", "lines", "word", "words", "character", "characters", "char", "chars",
+                                     "byte", "bytes", "size", "count", "length", "unique", "distinct", "duplicate",
+                                     "duplicates", "different", "empty", "blank", "here", "everywhere", "home", "computer"):
+        return None
+    for low, orig, start in u.remaining():
+        if low == left[0]:
+            u.blank(start, start + len(orig))
+            term = u.lit(orig)
+            break
+    if count and not times and re.fullmatch(r"[a-z]{4,}s", term) and not term.endswith("ss"):
+        term = term[:-1]                          # "number of errors": lines with "error"
+    flags = ("v" if inv else "c" if count and not times else "o" if times else "n") + ("" if case else "i") + "F" + ("w" if word else "")
+    ctxf = f" -C {ctx}" if ctx and not count else ""
+    cmd = f"grep -{flags}{ctxf} -- {shlex.quote(term)} {qpath(path)}" + (" | wc -l" if times else "")
+    why = [path, ("lines without " if inv else "") + f'"{term}"', "case sensitive" if case else "any case"]
+    why += (["whole word"] if word else []) + (["count"] if count else []) + ([f"{ctx} lines of context"] if ctxf else [])
+    return finish(u, Plan(cmd, "search in file", why))
+
+
+def h_head_tail(u: Utterance) -> Plan | None:
+    """The first or last N lines of a file, or following it, in any wording."""
+    t = u.low
+    if re.search(r"\b(?:common|frequen\w*|most|repeat\w*|longest|shortest|sorted|sort|unique|duplicates?|contain\w*|with|without|"
+                 r"delete|remove|drop|insert|add|replace|change|edit|modified|changed|keys?|columns?|fields?)\b", t):
+        return None
+    follow = re.search(r"\bfollow(?:ing)?\b|\bwatch(?:ing)?\b|\bstream\b|\blive\b|\bkeep\s+(?:showing|printing|following)\b|"
+                       r"\bas\s+it\s+grows\b|\bnew\s+lines\b|\breal[- ]?time\b", t)
+    head = re.search(r"\b(?:first|top|beginning|start|opening|head|begin)\b", t)
+    tail = re.search(r"\b(?:last|final|bottom|end|tail|latest|ending)\b", t)
+    if not (follow or ((head or tail) and re.search(r"\blines\b|\b\d+\s+line\b|\bhead\b|\btail\b", t))):
+        return None
+    path = _one_file(u)
+    if not path:
+        return None
+    nm = re.search(rf"\b{NUM}\s+(?:first\s+|last\s+|final\s+|top\s+|bottom\s+)?lines?\b|\b(?:first|last|top|bottom|final)\s+{NUM}\b", t)
+    n = int(num(next((g for g in nm.groups() if g), None), 10)) if nm else 10
+    if follow:
+        cmd, why = f"tail -f {qpath(path)}", ["follow new lines (Ctrl-C to stop)"]
+    elif head and not tail:
+        cmd, why = f"head -n {n} {qpath(path)}", [f"first {n} lines"]
+    elif tail and not head:
+        cmd, why = f"tail -n {n} {qpath(path)}", [f"last {n} lines"]
+    else:
+        return None
+    u.text = " " * len(u.text)
+    return Plan(cmd, "lines", [path] + why)
+
+
+def h_exec_bit(u: Utterance) -> Plan | None:
+    """Make a file executable, in any wording."""
+    t = u.low
+    if not re.search(r"\bexecutable\b|\bexecut(?:e|ion)\s+(?:permissions?|rights?|bit|flag)\b|\bexec\s+bit\b|\brunnable\b|"
+                     r"\ballow\s+(?:running|to\s+run|execution)\b|\bpermission\s+to\s+(?:run|execute)\b", t):
+        return None
+    if re.search(r"\b(?:not|non|remove|take\s+away|without|un|drop|revoke|no\s+longer)\b|\bwhich\b|\bfind\b|\blist\b|\bis\b", t):
+        return None
+    path = _one_file(u)
+    if not path:
+        return None
+    u.text = " " * len(u.text)
+    return Plan(f"chmod +x -- {qpath(path)}", "permissions", [path, "add execute permission"], destructive=False)
+
+
+def h_procs(u: Utterance) -> Plan | None:
+    """Process lists in any wording: whose (mine, a user's), sorted by memory or CPU,
+    how many. Kill, count, tree, threads, swap and ports have their own rules."""
+    t = u.low
+    if not re.search(r"\b(?:process(?:es)?|programs|tasks)\b", t) or re.search(
+            r"\b(?:kill|stop|end|terminate|quit|close|signal|pause|resume|freeze|count|how\s+many|number\s+of|threads?|swap|tree|zombies?|ports?|"
+            r"forest|parent|children|limit|nice|priority)\b", t):
+        return None
+    mine = re.search(r"\bmy\b|\bmine\b|\bi\s+(?:own|run|started|am\s+running)\b|\bcurrent\s+user\b|\bof\s+(?:me|myself)\b", t)
+    um = re.search(r"\b(?:of|owned\s+by|by|for|from)\s+(?:the\s+)?user\s+([a-z_][\w.-]*)\b|\buser\s+([a-z_][\w.-]*)'s\b", t)
+    key = "mem" if re.search(r"\b(?:memory|ram|mem)\b", t) else "cpu" if re.search(r"\b(?:cpu|processor)\b", t) else None
+    if not (mine or um or key or re.search(r"\b(?:top|sort(?:ed)?|order(?:ed)?|list|show|running|all)\b", t)):
+        return None
+    nm = re.search(r"\btop\s+(\d+)\b|\b(\d+)\s+(?:top|biggest|heaviest)\b", t)
+    n = int(nm.group(1) or nm.group(2)) if nm else 10
+    sort = f"--sort=-%{key or 'cpu'}"
+    if mine or um:
+        who = '"$USER"' if mine else shlex.quote(um.group(1) or um.group(2))
+        cmd = f"ps -u {who} -o pid,%cpu,%mem,etime,cmd {sort}"
+        why = ["current user" if mine else f"user {who}", f"by {key or 'cpu'}"]
+    else:
+        cmd = f"ps aux {sort} | head -n {n + 1}"
+        why = [f"top {n} by {'memory' if key == 'mem' else 'CPU'}"]
+    u.text = " " * len(u.text)
+    return Plan(cmd, "processes", why)
+
+
+def h_reach(u: Utterance) -> Plan | None:
+    """A remote host, in any wording: ping it (N times), check a TCP port, scan its
+    ports, trace the route, look up its address. ping has no ports, so "ping X on
+    port 50" is a TCP connect test."""
+    t0 = u.raw.strip().rstrip("?!. ")
+    t = t0.lower()
+    m = re.search(rf"(?<![\w./@-]){HOST_RX}(?::(?P<hp>\d{{1,5}}))?(?![\w/@-])", t)
+    if not m or re.search(r"\b(?:ssh|scp|log\s*in|login|sftp)\b|@|^\s*connect\s+to\b", t):
+        return None
+    host = m.group("host")
+    orig = t0[m.start("host"):m.end("host")]
+    if (os.path.exists(os.path.join(u.cwd, orig)) or os.path.exists(os.path.join(u.cwd, host))
+            or host.rsplit(".", 1)[-1] in FILE_LIKE_TLDS):
+        return None                              # README.md, notes.txt: files, not hosts
+    rest = (t[:m.start()] + " " + t[m.end():]).strip()
+    words = set(re.findall(r"[a-z]+", rest))
+    pm = re.search(r"\bports?\s+(?:number\s+)?(\d{1,5})\b|\b(\d{1,5})\s+port\b", rest)
+    port = m.group("hp") or (pm.group(1) or pm.group(2) if pm else None)
+    qh = shlex.quote(host)
+    if re.search(r"\bport\s*scan\b|\bscan\b.*\bports?\b|\bscan\b|\b(?:which|what|open|all)\s+ports\b|\bports\s+(?:are\s+)?open\b", rest) and not port:
+        cmd = first_available([("nmap", f"nmap {qh}"),
+                               (None, f"for p in {COMMON_PORTS}; do timeout 1 bash -c \"</dev/tcp/{host}/$p\" 2>/dev/null "
+                                      f"&& echo \"$p open\"; done")])
+        plan = Plan(cmd, "port scan", [host, "nmap" if cmd.startswith("nmap") else "common ports, TCP connect"])
+    elif port and (words & {"ping", "reach", "reachable", "open", "check", "test", "connect", "connection", "listening",
+                            "available", "is", "can", "telnet", "nc", "port", "up", "accessible", "respond", "responding"}):
+        cmd = (f"timeout 3 bash -c '</dev/tcp/{host}/{port}' 2>/dev/null && echo '{host}:{port} is open' "
+               f"|| echo '{host}:{port} is closed or filtered'")
+        why = [f"{host}:{port}", "TCP connect test"] + (["ping has no ports"] if "ping" in words else [])
+        plan = Plan(cmd, "port check", why)
+    elif re.search(r"\btrace(?:route|path)?\b|\broute\s+to\b|\bpath\s+to\b|\bhops?\b", rest):
+        cmd = first_available([("tracepath", f"tracepath {qh}"), ("traceroute", f"traceroute {qh}"),
+                               ("mtr", f"mtr -r -c 3 {qh}"), (None, f"tracepath {qh}")])
+        plan = Plan(cmd, "trace route", [host])
+    elif re.search(r"\bdns\b|\blook\s*up\b|\bresolve\b|\bip(?:\s+address)?\b|\baddress\s+of\b", rest) and not re.search(r"\d", host[-1:]):
+        plan = Plan(f"getent ahosts {qh} | awk '{{print $1}}' | sort -u", "dns", [host])
+    elif re.search(r"\bping(?:s|ed)?\b|\bpackets?\b|\balive\b|\b(?:up|down|online|offline|reachable|responding)\b|"
+                   r"\bansw(?:er|ers|ering)\b|\brespond(?:s|ing)?\b|\breach\b", rest):
+        if re.fullmatch(r"ping", rest):
+            return None                          # "ping HOST" as typed: bash's ping, until Ctrl-C
+        nm = re.search(rf"\b{NUM}\s+(?:times|pings|packets|tries|echo(?:es)?)\b|\bwith\s+{NUM}\s+packets\b|\bsend\s+{NUM}\s+pings?\b|"
+                       r"\b(once|one\s+time)\b", rest)
+        n = 3
+        if nm:
+            g = next((x for x in nm.groups() if x), None)
+            n = 1 if g in ("once", "one time") else int(num(g, 3))
+        plan = Plan(f"ping -c {n} {qh}", "ping", [host, f"{n} packet{'s' if n != 1 else ''}"])
+    else:
+        return None
+    u.text = " " * len(u.text)
+    return plan
+
+
 def h_recipe(u: Utterance) -> Plan | None:
     best = None
     text = Utterance(u.raw, u.cwd).text
@@ -6318,7 +6601,7 @@ def h_unglue(u: Utterance) -> Plan | None:
     return Plan(fixed, "typo", [f"read '{u.raw.strip()}' as '{fixed}'"], confidence=0.95, source="guess")
 
 
-HANDLERS = [h_unglue, h_git, h_search, h_usb, h_power_later, h_net, h_service, h_recipe, h_system, h_power, h_version, h_installed, h_port, h_pkg_search, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
+HANDLERS = [h_unglue, h_git, h_grep_file, h_search, h_usb, h_power_later, h_net, h_service, h_sort_file, h_head_tail, h_exec_bit, h_reach, h_procs, h_recipe, h_system, h_power, h_version, h_installed, h_port, h_pkg_search, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
             h_find_then, h_reext, h_download, h_compare, h_replace, h_calc, h_copy_move, h_delete, h_read, h_grep, h_count, h_size, h_find, h_list]
 
 
@@ -7163,7 +7446,7 @@ SHUTDOWN_TIME = re.compile(r"now|\+?\d+|\d{1,2}:\d{2}|-[a-zA-Z-]+.*")
 
 # Real commands that are also everyday English verbs ("go up", "kill firefox",
 # "find big files"). For these, a confident rules parse wins over bash.
-AMBIGUOUS_FIRST = {"go", "kill", "find", "open", "make", "which", "who", "file", "install", "compare",
+AMBIGUOUS_FIRST = {"go", "kill", "find", "open", "make", "which", "who", "file", "install", "compare", "wc", "chmod",
                    "base64", "convert", "set", "sync", "ssh", "clone", "add", "pull", "push", "display", "shift",
                    "du", "df", "free", "locate", "look", "see", "show", "cd", "zip", "unzip", "head",
                    "tail", "touch", "less", "truncate", "last", "enable", "diff", "reset"}
@@ -7172,6 +7455,7 @@ AMBIGUOUS_FIRST = {"go", "kill", "find", "open", "make", "which", "who", "file",
 # On Debian `edit` is run-mailcap and `open` is openvt: nobody typing
 # "edit logs.txt" means those, so the rules always get first go.
 PREFER_RULES = {"edit", "open", "view", "read", "display"}
+NET_FIRST = {"ping", "test", "route", "trace", "traceroute", "tracepath", "host", "dig", "nslookup", "telnet", "nc"}
 
 
 def looks_like_shell(line: str, path_env: str | None = None, cwd: str | None = None,
@@ -7216,6 +7500,19 @@ def looks_like_shell(line: str, path_env: str | None = None, cwd: str | None = N
             and not any(re.search(r"[*?/]", t) for t in rest[1:])):
         # "grep pressure" would wait for input forever; "grep for todo in python files" is words
         plan = interpret(line, cwd)
+        if plan and plan.confidence >= threshold:
+            return False
+    if (cwd and toks[0] == "sort" and len(rest) > 1 and not any(t.startswith("-") for t in rest)
+            and not re.search(r"[|&;<>`$]", line)
+            and any(os.path.isfile(os.path.join(cwd, os.path.expanduser(t))) for t in rest)
+            and not all(os.path.exists(os.path.join(cwd, os.path.expanduser(t))) for t in rest)):
+        plan = interpret(line, cwd)          # "sort nums.txt numerically", "sort names.txt in reverse"
+        if plan and plan.confidence >= threshold:
+            return False
+    if (cwd and toks[0] in NET_FIRST and rest and not any(t.startswith("-") for t in rest)
+            and not re.search(r"[|&;<>`$]", line) and re.search(HOST_RX, line.lower())
+            and (len(rest) > 1 or re.search(r":\d{1,5}$", rest[0]))):
+        plan = interpret(line, cwd)          # "ping 10.0.0.5 on port 50", "test connection to host:80"
         if plan and plan.confidence >= threshold:
             return False
     if toks[0] == "reset" and rest and not any(t.startswith("-") for t in rest):

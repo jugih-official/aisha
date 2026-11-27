@@ -134,7 +134,9 @@ About 240 kinds of request are handled without a model:
   command, background execution, execution as root, notification on
   completion, `again`.
 - **Network**: IPs, gateway, routes, DNS servers, MAC addresses, host
-  reachability, DNS lookup, open ports on a host, HTTP headers, weather,
+  reachability, ping N times or once, DNS lookup, a TCP port on a host
+  ("ping 192.168.20.140 on port 50": ping has no ports, so a TCP connect test
+  runs), port scans, traceroute, HTTP headers, weather,
   Wi-Fi networks/name/password, ssh, scp to and from a server, folder sync,
   firewall (blocking or opening a port), active connections, devices on the
   local network, DHCP lease renewal.
@@ -427,6 +429,16 @@ removal of copies left in `/usr/local/bin`.
 `python3 -m unittest discover -s tests`: unit tests, the phrase corpus, a
 pty-free shell session, injection checks, and the model runtime against a
 stand-in server.
+
+`tests/test_options.py` is the option catalogue: the basic commands (`ls`,
+`sort`, `head`, `tail`, `wc`, `grep`, `du`, `df`, `ps`, `cp`, `mv`, `rm`,
+`mkdir`, `chmod`, `ping`, port checks, DNS, traceroute, `curl`), each option
+asked for in many wordings (1,325 in all). Sort keys are generated in every
+form: "by X", "sorted by X", "in X order", "in the order of X", "according to
+X". `python3 tests/test_options.py` prints every miss. Words about how to sort
+or show (order, sorted, alphabetical, reverse) are never used as file-name
+filters; a leftover one lowers confidence, so the request goes to the
+suggestions or the language model instead of running the wrong command.
 
 ## Disclaimer
 
