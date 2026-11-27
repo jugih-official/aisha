@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ai$ha • ai shell hybrid alpha</title>
-  <meta name="description" content="ai$ha (ai shell hybrid alpha) is a shell you can talk to: plain words become real commands, with no cloud and no API key." />
+  <meta name="description" content="ai$ha (ai shell hybrid alpha): a bash-compatible shell that translates plain-language requests into shell commands, locally, without a cloud service or API key." />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
@@ -19,44 +19,44 @@
     </nav>
 
     <section class="container hero-content">
-      <p class="eyebrow">Terminal Productivity</p>
-      <h1>Use plain language. Get real shell results.</h1>
+      <p class="eyebrow">Bash-compatible shell</p>
+      <h1>Plain-language requests translated to shell commands</h1>
       <p class="subtitle">
-        <strong>ai$ha</strong> (ai shell hybrid alpha, started as <code>aisha</code>) is a shell you can talk to. Type bash as usual, or say what you want
-        in plain words. It runs on a stock Debian system with no cloud and no API key.
+        <strong>ai$ha</strong> (ai shell hybrid alpha, installed as <code>aisha</code>) is a bash-compatible shell that
+        also accepts requests in plain English. Requirement: a stock Debian system. No cloud service or API key is used.
       </p>
       <div class="cta-row">
-        <a class="button primary" href="pages/getting-started.html">Get Started</a>
-        <a class="button" href="https://github.com/jugih-official/aisha" target="_blank" rel="noopener">View Repository</a>
+        <a class="button primary" href="pages/getting-started.html">Getting Started</a>
+        <a class="button" href="https://github.com/jugih-official/aisha" target="_blank" rel="noopener">Repository</a>
       </div>
     </section>
   </header>
 
   <main class="container grid">
     <article class="card">
-      <h2>A shell that understands words</h2>
-      <p><code>find files older than 2 months</code>, <code>show free on usb</code>, <code>list files by size</code>:
-      aisha shows the command it understood, asks before anything that deletes, and runs real bash unchanged.</p>
+      <h2>Plain-language requests</h2>
+      <p>Examples: <code>find files older than 2 months</code>, <code>show free on usb</code>, <code>list files by size</code>.
+      The interpreted command is printed, deletes require confirmation, and bash commands are passed to bash unchanged.</p>
     </article>
     <article class="card">
-      <h2>No model needed</h2>
-      <p>A deterministic rule engine handles hundreds of kinds of request: files, text, archives, git, processes,
-      services, packages, network, USB drives. An optional small local model helps only when the rules are unsure.</p>
+      <h2>No model required</h2>
+      <p>A deterministic rule engine handles several hundred kinds of request: files, text, archives, git, processes,
+      services, packages, network, USB drives. An optional small local model is consulted only when the rules are unsure.</p>
     </article>
     <article class="card">
-      <h2>Safe by default</h2>
-      <p>Anything that deletes or changes things lists what it will touch and asks <code>[y/N]</code>.
+      <h2>Confirmation before changes</h2>
+      <p>Commands that delete or change data list the affected items and require <code>[y/N]</code>.
       "Delete everything except report.pdf" keeps report.pdf; "reboot nginx" restarts the service, not the computer.</p>
     </article>
     <article class="card">
-      <h2>A real shell</h2>
-      <p>Bash commands, pipes, <code>cd</code>, aliases, jobs and Tab completion work as usual, so aisha can be your
-      login shell. Debian package included.</p>
+      <h2>Bash compatibility</h2>
+      <p>Bash commands, pipes, <code>cd</code>, aliases, jobs and Tab completion work as in bash, so aisha is usable as a
+      login shell. A Debian package is included.</p>
     </article>
   </main>
 
   <footer class="footer container">
-    <p>Built for fast Linux workflows. See usage and install details on the Getting Started page.</p>
+    <p>Installation and usage: see the Getting Started page.</p>
   </footer>
 </body>
 </html>

@@ -72,13 +72,14 @@ Recommends: procps, iproute2, sensible-utils, less
 Suggests: zip, unzip, xdg-utils
 Maintainer: $MAINTAINER
 Homepage: https://github.com/jugih-official/aisha
-Description: ai\$ha (ai shell hybrid alpha), a shell you can talk to
- ai\$ha, run as aisha, runs bash commands as usual and also understands plain requests
- such as "find recursively files older than 2 months from this folder"
- or "edit logs.txt with micro". A deterministic rule engine builds the
- command and shows what it understood; only when it is unsure does it
- ask a small local model through any OpenAI-compatible server (for
- example Ollama). Commands that delete or change data always ask first.
+Description: ai\$ha (ai shell hybrid alpha), bash-compatible shell with plain-language requests
+ ai\$ha, installed as aisha, passes bash commands to bash unchanged and also
+ accepts plain-language requests such as "find recursively files older than
+ 2 months from this folder" or "edit logs.txt with micro". A deterministic
+ rule engine builds the command and prints the interpretation; only when the
+ rules are unsure is a small local model queried through any
+ OpenAI-compatible server (for example Ollama). Commands that delete or
+ change data always require confirmation.
 EOF
 
 cat > "$PKG/DEBIAN/postinst" <<'EOF'

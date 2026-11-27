@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>ai$ha • Getting Started</title>
-  <meta name="description" content="Install and use ai$ha (ai shell hybrid alpha), the shell you can talk to." />
+  <meta name="description" content="Installation and usage of ai$ha (ai shell hybrid alpha)." />
   <link rel="stylesheet" href="../styles.css" />
 </head>
 <body>
@@ -19,49 +19,49 @@
     </nav>
     <section class="container">
       <h1>Getting Started</h1>
-      <p class="subtitle">Install once and start asking for shell tasks in plain words.</p>
+      <p class="subtitle">Installation, usage, update and removal.</p>
     </section>
   </header>
 
   <main class="container two-col">
     <section class="card">
-      <h2>Install</h2>
+      <h2>Installation</h2>
       <pre><code>git clone https://github.com/jugih-official/aisha.git
 cd aisha
 ./install.sh</code></pre>
-      <p>On Debian and Ubuntu this builds the Debian package and installs it with apt; elsewhere (or with
-      <code>--local</code>) it puts aisha in <code>/usr/local</code>. Needs Python 3.9+ (Debian 11 or newer).</p>
+      <p>On Debian and Ubuntu, the Debian package is built and installed with apt; on other systems (or with
+      <code>--local</code>), aisha is installed to <code>/usr/local</code>. Requirement: Python 3.9+ (Debian 11 or newer).</p>
     </section>
 
     <section class="card">
-      <h2>Quick usage</h2>
+      <h2>Usage</h2>
       <pre><code>aisha
 find files older than 2 months
 list all files here by size
 show free on usb
 delete everything except report.pdf</code></pre>
-      <p>aisha prints what it understood before running. <code>aisha -n …</code> or "how do I …" only shows the command.</p>
+      <p>The interpreted command is printed before execution. <code>aisha -n …</code> and "how do I …" only print the command.</p>
     </section>
 
     <section class="card">
-      <h2>Update and remove</h2>
+      <h2>Update and removal</h2>
       <pre><code>./update.sh
 ./uninstall.sh</code></pre>
-      <p><code>update.sh</code> pulls the latest version and reinstalls it the way you installed it.
-      <code>uninstall.sh</code> asks before deleting your settings in <code>~/.config/aisha</code>.</p>
+      <p><code>update.sh</code> pulls the latest version and reinstalls aisha in the same way as before.
+      <code>uninstall.sh</code> asks before settings in <code>~/.config/aisha</code> are deleted.</p>
     </section>
 
     <section class="card">
       <h2>Project links</h2>
       <ul>
         <li><a href="https://github.com/jugih-official/aisha" target="_blank" rel="noopener">Repository</a></li>
-        <li><a href="../README.md">README in this repo</a></li>
+        <li><a href="../README.md">README</a></li>
       </ul>
     </section>
   </main>
 
   <footer class="footer container">
-    <p>Need details? The README has the full list of requests, the safety rules and the optional local model.</p>
+    <p>Full list of requests, safety rules and the optional local model: see the README.</p>
   </footer>
 </body>
 </html>

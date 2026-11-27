@@ -1,6 +1,6 @@
 .TH AISHA 1 "November 2026" "aisha 0.12.2" "User Commands"
 .SH NAME
-aisha \- ai$ha (ai shell hybrid alpha), a shell you can talk to
+aisha \- ai$ha (ai shell hybrid alpha), a bash-compatible shell with plain-language requests
 .SH SYNOPSIS
 .B aisha
 .br
@@ -28,15 +28,15 @@ aisha \- ai$ha (ai shell hybrid alpha), a shell you can talk to
 .SH DESCRIPTION
 .B aisha
 is an interactive shell that accepts both bash and plain-language requests.
-Real commands (a program on PATH with flags, paths, pipes or redirects) run in
-bash unchanged.
-Other lines go to a deterministic rule engine that builds the command from the
-words and prints what it understood on a line starting with \(->.
-Only when the rules are not confident is a small local language model asked,
+Real commands (a program on PATH with flags, paths, pipes or redirects) are
+passed to bash unchanged.
+Other lines are passed to a deterministic rule engine; the command is built
+from the words, and the interpretation is printed on a line starting with \(->.
+Only when the rules are not confident is a small local language model queried,
 through any OpenAI-compatible server; its command is always shown and
-confirmed before it runs, and approved answers are remembered.
+confirmed before execution, and approved answers are remembered.
 .PP
-It is also a regular shell:
+Regular shell features:
 .BR cd ,
 .BR export ,
 aliases and functions persist between lines; Ctrl-Z,
@@ -45,16 +45,16 @@ aliases and functions persist between lines; Ctrl-Z,
 .B bg
 and
 .I "cmd &"
-work; Tab completes commands and paths.
+work; Tab completion covers commands and paths.
 .B "aisha \-c"
-and scripts run in plain bash, so aisha can be a login shell.
+and scripts are run in plain bash, so aisha is usable as a login shell.
 .PP
 Questions such as "how do I delete empty folders" print the command without
-running it.
+execution.
 .PP
-Commands that delete or change data always ask
+Commands that delete or change data always require
 .B [y/N]
-first, and deletes list the matching files before asking.
+confirmation; deletes list the matching files first.
 .SH EXAMPLES
 .nf
 find recursively files older than 2 months from this folder
@@ -94,7 +94,7 @@ list or drop remembered LLM answers
 check the local model
 .TP
 .BR exit ", Ctrl-D"
-leave
+exit the shell
 .SH OPTIONS
 .TP
 .B \-n
@@ -146,9 +146,9 @@ settings (same keys as the environment variables, lower case without AISHA_)
 .TP
 .I ~/.config/aisha/aisharc
 bash aliases, functions and exports loaded at start (as is ~/.bash_aliases).
-Before them aisha sets ls and dir to list one per line with only the size, modified time and name,
+Before them, ls and dir are set to list one per line with only the size, modified time and name,
 folders first, then files, newest first, in color;
-an ls alias or function here replaces that
+an ls alias or function here replaces that definition
 .TP
 .I ~/.local/share/aisha
 downloaded llama.cpp runtime and model
