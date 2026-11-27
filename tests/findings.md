@@ -176,7 +176,7 @@ Safety items are marked **S**. "Paraphrases" are extra test-corpus phrases that 
 
 | id | phrase | aisha today (short) | correct command | dangerous | notes | paraphrases |
 |---|---|---|---|---|---|---|
-| B1-11 | block port 22 | lists the listener on 22 | `sudo ufw deny 22/tcp` | yes | ufw package (nft fallback). The confirm must warn: blocking 22 over SSH locks you out. Also 'open port 8080 in the firewall' (ufw allow 8080/tcp). | close port 22 in the firewall / deny port 22 |
+| B1-11 | block port 22 | lists the listener on 22 | `sudo ufw deny 22/tcp` | yes | ufw package (nft fallback). The confirm must warn: blocking 22 over SSH locks out the SSH session. Also 'open port 8080 in the firewall' (ufw allow 8080/tcp). | close port 22 in the firewall / deny port 22 |
 | B1-34 | who is using my wifi | offers whoami / ps | `ip neigh show` | no | Label honestly: devices this computer has seen; only the router's client list is authoritative. nmap -sn <subnet> if nmap is installed. | who is connected to my network / what devices are on my network |
 | B1-40 | show active connections | file search | `ss -tunp state established` | no | -p needs sudo for other users' processes. | list open network connections / what connections are active |
 | B2-13 | renew my ip | hostname -I ('ignored: renew') | `dev=$(ip route show default \| awk '{print $5; exit}'); sudo nmcli device disconnect "$dev" && sudo nmcli device connect "$dev"` | yes | Judge fix: NetworkManager form (Debian desktop default). ifupdown servers: sudo ifdown "$dev" && sudo ifup "$dev" (DHCP client varies by release). Drops the link briefly; dangerous over SSH. | get a new ip address / renew my dhcp lease |
@@ -185,11 +185,11 @@ Safety items are marked **S**. "Paraphrases" are extra test-corpus phrases that 
 
 | id | phrase | aisha today (short) | correct command | dangerous | notes | paraphrases |
 |---|---|---|---|---|---|---|
-| B1-05 | who has sudo | bash `who has sudo` prints your own login line | `getent group sudo` | no |  | which users are admins / who can use sudo |
-| B1-06 | what groups is bob in | groups (yours; 'ignored: bob') | `id -nG bob` | no |  | show bob's groups / which groups does bob belong to |
+| B1-05 | who has sudo | bash `who has sudo` prints the current user's login line | `getent group sudo` | no |  | which users are admins / who can use sudo |
+| B1-06 | what groups is bob in | groups (of the current user; 'ignored: bob') | `id -nG bob` | no |  | show bob's groups / which groups does bob belong to |
 | B1-22 | failed login attempts | none | `journalctl -u ssh --no-pager \| grep -iE 'failed\|invalid' \| tail -n 30` | no | Judge fix (A2-C01 upheld): Debian 13's OpenSSH 10 logs auth failures from sshd-session, so _COMM=sshd misses them; -u ssh catches both. Needs sudo or the adm group. | show failed ssh logins / who tried to log in and failed |
 | B1-27 | make bob an admin | bash `make bob an admin` (No rule to make target, harmless) | `sudo usermod -aG sudo bob` | yes | Not safety: make stops at the first unknown target. 'give bob sudo rights' only offers adduser. | give bob sudo rights / add bob to the sudo group |
-| B1-28 **S** | delete user bob | #1 offer: sudo adduser bob | `sudo deluser bob` | yes | Also 'remove bob from the docker group' offers adding ME (want sudo gpasswd -d bob docker). | remove the user bob / delete bob's account |
+| B1-28 **S** | delete user bob | #1 offer: sudo adduser bob | `sudo deluser bob` | yes | Also 'remove bob from the docker group' offers adding the current user (want sudo gpasswd -d bob docker). | remove the user bob / delete bob's account |
 | B1-29 | which users can log in | cut -d: -f1 /etc/passwd (every system account) | `getent passwd \| awk -F: '$7 !~ /(nologin\|false\|sync)$/ {print $1}'` | no | Judge fix (A2-C03 upheld): exclude /bin/sync; getent also covers LDAP/SSSD. 'list all human users' = uid 1000..65533. | list users that can log in / which accounts have a login shell |
 
 ### git (10)

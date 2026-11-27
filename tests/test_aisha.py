@@ -518,7 +518,7 @@ class TestShellSession(LabTest):
             self.sh.handle("how big is this folder thing really")
         finally:
             aisha.say = orig
-        if any("closest things" in s for s in shown):      # weak suggestions came after the model
+        if any("closest known" in s for s in shown):      # weak suggestions came after the model
             self.assertGreaterEqual(len(_MockLLM.seen), 1)
 
     def test_llm_declined_is_not_remembered(self):
@@ -1358,7 +1358,7 @@ class TestTypos(LabTest):
             self.assertEqual(p.source, "guess")             # asks [Y/n] before running
         for word in ["gitfoo", "github", "gitk"]:
             p = self.plan(word)
-            self.assertFalse(p and p.intent == "did you mean", word)
+            self.assertFalse(p and p.intent == "typo", word)
 
     def test_lone_y_and_n_run_nothing(self):
         sh = aisha.Shell(dict(aisha.DEFAULTS, llm="off"))
@@ -1477,7 +1477,7 @@ class TestPlaces(LabTest):
             self.assertEqual(p.command, f"ls -lh -- {aisha.qpath(root)}", phrase)
             self.assertIn("no folder", p.rationale())
         os.makedirs(os.path.join(self.lab, "Downloads"))
-        self.assertIn("did you mean Downloads", self.plan("list files in Downlods").rationale())
+        self.assertIn("nearest: Downloads", self.plan("list files in Downlods").rationale())
         self.assertIn('"${PROJECT}"/src', self.cmd("find files in $PROJECT/src"))
 
     def test_in_still_means_other_things(self):

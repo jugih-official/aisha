@@ -2,7 +2,7 @@
 # Same format as phrases.tsv (fragments separated by " ;; ", alternatives by " || ").
 # Runs against test_aisha.make_corpus(); every command that stays below the lab is also run.
 # -- the bare word, and search with plain words (also where a `search` program is installed)
-search	you can say
+search	examples:
 search notes	-iname '*note*' ;; grep -IqiF -e note
 search pressure	pressur
 search notes.txt	-iname notes.txt

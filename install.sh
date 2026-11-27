@@ -2,9 +2,9 @@
 # install.sh — install (or update) ai$ha, the ai shell hybrid alpha (command: aisha).
 #   On Debian/Ubuntu: builds the Debian package and installs it with apt.
 #   Elsewhere, or with --local: puts aisha in /usr/local without a package.
-#   It asks whether to install the optional local language model while none is set up
-#   (--with-llm [0.5b|1.5b|3b] installs it without asking, --no-llm skips the question), and whether
-#   new terminal windows should open aisha while they don't. --no-ask skips both questions.
+#   Questions: the optional local language model, while none is set up (--with-llm [0.5b|1.5b|3b]
+#   installs it without the question, --no-llm skips the question); aisha in new terminal windows,
+#   while they don't open it. --no-ask skips both questions.
 #   Later: aisha --setup, packaging/terminal-default.sh set|unset.
 set -euo pipefail
 
@@ -74,9 +74,9 @@ else
     $SUDO python3 -m compileall -q "$LOCAL_LIB" || true
 fi
 
-green 'ai$ha (ai shell hybrid alpha) '"$VERSION"' is installed. Start it with: aisha'
+green 'ai$ha (ai shell hybrid alpha) '"$VERSION"' is installed. Command: aisha'
 
-# The optional local language model. It belongs to your user, so never as root.
+# The optional local language model. It belongs to the user account, so it is never set up as root.
 CFG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/aisha"
 llm_ready() {   # prints the model's name and succeeds when one is set up
     python3 - "$CFG_HOME/config.json" <<'PY' 2>/dev/null
@@ -95,9 +95,9 @@ PY
 AISHA_CMD="$(command -v aisha || echo "python3 $SRC_AISHA")"
 echo
 if [ "$(id -u)" -eq 0 ]; then
-    echo "Language model: run ./install.sh as yourself (not with sudo) to add it, or later: aisha --setup"
+    echo "Language model: set up only when ./install.sh runs without sudo, or later with: aisha --setup"
 elif [ "$LLM" = yes ]; then
-    $AISHA_CMD --setup "$LLM_SIZE" --yes || yellow "the language model was not set up; try again with: aisha --setup"
+    $AISHA_CMD --setup "$LLM_SIZE" --yes || yellow "the language model was not set up; retry: aisha --setup"
 elif model="$(llm_ready)"; then
     green "Language model: $model is set up. (A bigger one: ./install.sh --with-llm 1.5b, or aisha --setup 1.5b)"
 elif [ "$LLM" = ask ] && [ -t 0 ] && [ -z "${AISHA_UPDATING:-}" ]; then
@@ -106,17 +106,17 @@ elif [ "$LLM" = ask ] && [ -t 0 ] && [ -z "${AISHA_UPDATING:-}" ]; then
     echo "no cloud and no API key. It starts only when a request needs it."
     read -r -p "Install the language model now? [y/N] " yn
     case "${yn,,}" in
-        y|yes) echo; $AISHA_CMD --setup "$LLM_SIZE" --yes || yellow "the language model was not set up; try again with: aisha --setup" ;;
-        *) echo "  not installed. Add it any time with: aisha --setup   (or ./install.sh --with-llm)" ;;
+        y|yes) echo; $AISHA_CMD --setup "$LLM_SIZE" --yes || yellow "the language model was not set up; retry: aisha --setup" ;;
+        *) echo "  not installed. Later setup: aisha --setup   (or ./install.sh --with-llm)" ;;
     esac
 else
-    echo "Language model: not installed (optional). Add it with: aisha --setup   (or ./install.sh --with-llm)"
+    echo "Language model: not installed (optional). Setup: aisha --setup   (or ./install.sh --with-llm)"
 fi
 
 # New terminal windows: asked while they don't open aisha yet (not on ./update.sh, not as root).
 echo
 if [ "$(id -u)" -eq 0 ]; then
-    echo "Terminal: run ./install.sh as yourself (not with sudo) to open aisha in new terminal windows"
+    echo "Terminal: new terminal windows are configured only when ./install.sh runs without sudo"
 elif [ "$ASK_TERMINAL" -eq 1 ] && [ -t 0 ] && [ -z "${AISHA_UPDATING:-}" ]; then
     "$SRC_DIR/packaging/terminal-default.sh" ask || true
 else

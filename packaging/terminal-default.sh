@@ -3,10 +3,10 @@
 #   packaging/terminal-default.sh ask     ask, if new windows don't open aisha yet (install.sh runs this)
 #   packaging/terminal-default.sh report  one line: do new windows open aisha (./update.sh shows this)
 #   packaging/terminal-default.sh set     set it now, no question
-#   packaging/terminal-default.sh unset   back to your normal shell
+#   packaging/terminal-default.sh unset   back to the normal login shell
 #   packaging/terminal-default.sh status  what each terminal app opens
 # Works on GNOME Terminal (also Linux Mint, Ubuntu), Konsole and Xfce Terminal. Logins, ssh and
-# scripts keep using your login shell; only new windows of these apps change.
+# scripts keep the login shell; only new windows of these apps change.
 set -uo pipefail
 
 ACTION="${1:-status}"
@@ -20,7 +20,7 @@ yellow() { printf '\033[1;33m%s\033[0m\n' "$*"; }
 dim()    { printf '\033[2m%s\033[0m\n' "$*"; }
 
 if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
-    yellow "run this as yourself, not with sudo: terminal settings belong to your user"
+    yellow "not with sudo: terminal settings belong to the user account"
     exit 1
 fi
 
@@ -120,23 +120,23 @@ konsole_ok && APPS+=(konsole)
 xfce_ok    && APPS+=(xfce)
 [ ${#APPS[@]} -eq 0 ] && [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && APPS+=(bashrc)   # some other terminal app
 label() { case "$1" in gnome) echo "GNOME Terminal" ;; konsole) echo Konsole ;; xfce) echo "Xfce Terminal" ;;
-                       bashrc) echo "your terminal (through ~/.bashrc)" ;; esac; }
+                       bashrc) echo "terminal (through ~/.bashrc)" ;; esac; }
 
 manual() {
-    dim "  No supported terminal app found here. In your terminal's preferences, set the profile's"
-    dim "  command (\"run a custom command instead of my shell\") to: ${AISHA:-/usr/bin/aisha}"
+    dim "  No supported terminal app found. Manual setup: in the terminal's preferences, the profile's"
+    dim "  command (\"run a custom command instead of my shell\") set to: ${AISHA:-/usr/bin/aisha}"
 }
 
 case "$ACTION" in
     status)
         [ ${#APPS[@]} -eq 0 ] && { manual; exit 0; }
         for a in "${APPS[@]}"; do
-            if "${a}_is_set"; then echo "$(label "$a"): opens aisha"; else echo "$(label "$a"): opens your login shell"; fi
+            if "${a}_is_set"; then echo "$(label "$a"): opens aisha"; else echo "$(label "$a"): opens the login shell"; fi
         done ;;
     set|ask|report)
         [ -n "$AISHA" ] || { yellow "aisha is not installed yet"; exit 1; }
         if [ ${#APPS[@]} -eq 0 ]; then
-            if [ "$ACTION" = report ]; then echo "Terminal: no graphical session here; to open aisha in your terminal app, see: packaging/terminal-default.sh set"
+            if [ "$ACTION" = report ]; then echo "Terminal: no graphical session; terminal setup: packaging/terminal-default.sh set"
             else manual; fi
             exit 0
         fi
@@ -148,28 +148,28 @@ case "$ACTION" in
         fi
         names="$(for a in "${todo[@]}"; do label "$a"; done | paste -sd, - | sed 's/,/, /g')"
         if [ "$ACTION" = report ] || { [ "$ACTION" = ask ] && [ ! -t 0 ]; }; then
-            echo "Terminal: new windows ($names) open bash. To open aisha there: packaging/terminal-default.sh set"
+            echo "Terminal: new windows ($names) open bash. Change: packaging/terminal-default.sh set"
             exit 0
         fi
         if [ "$ACTION" = ask ]; then
             read -r -p "Open aisha in new terminal windows ($names)? Logins, ssh and scripts keep bash. [y/N] " yn
             case "${yn,,}" in
                 y|yes) ;;
-                *) dim "  kept your terminal as it is (later: packaging/terminal-default.sh set)"; exit 0 ;;
+                *) dim "  terminal unchanged (later: packaging/terminal-default.sh set)"; exit 0 ;;
             esac
         fi
         for a in "${todo[@]}"; do
             if "${a}_set"; then green "  $(label "$a"): new windows open aisha"; else yellow "  $(label "$a"): could not change it"; fi
         done
         if bashrc_is_set; then
-            dim "  (added to ~/.bashrc; for plain bash in one window: AISHA_SKIP=1 bash, or type bash inside aisha)"
+            dim "  (added to ~/.bashrc; plain bash in one window: AISHA_SKIP=1 bash, or bash inside aisha)"
         fi
-        dim "  open a new terminal window to see it. Undo with: packaging/terminal-default.sh unset" ;;
+        dim "  effective in new terminal windows. Undo: packaging/terminal-default.sh unset" ;;
     unset)
         for a in "${APPS[@]}"; do
-            if "${a}_is_set"; then "${a}_unset" && green "  $(label "$a"): back to your login shell"; fi
+            if "${a}_is_set"; then "${a}_unset" && green "  $(label "$a"): back to the login shell"; fi
         done
         rm -f "$ASKED"
-        green "new terminal windows open your login shell again" ;;
+        green "new terminal windows open the login shell again" ;;
     *) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

@@ -15,16 +15,16 @@ dim()    { printf '\033[2m%s\033[0m\n' "$*"; }
 
 if [ ! -d .git ]; then
     red "error: $SCRIPT_DIR is not a git checkout."
-    echo "Clone the repo first:  git clone https://github.com/jugih-official/aisha.git"
+    echo "A clone is required first:  git clone https://github.com/jugih-official/aisha.git"
     exit 1
 fi
 
 # Refuse to overwrite uncommitted local edits — they're likely the user's work.
 if ! git diff --quiet || ! git diff --cached --quiet; then
-    red "error: you have uncommitted local changes in $SCRIPT_DIR."
+    red "error: uncommitted local changes in $SCRIPT_DIR."
     git status --short
     echo
-    echo "Commit, stash, or discard them before updating."
+    echo "The changes must be committed, stashed or discarded before an update."
     exit 1
 fi
 
@@ -56,7 +56,7 @@ case "$mode" in
     deb)        AISHA_UPDATING=1 ./install.sh --deb ;;
     local)      AISHA_UPDATING=1 ./install.sh --local ;;
     auto|aisha) AISHA_UPDATING=1 ./install.sh ;;
-    *) red "unknown mode: $mode (use deb or local)"; exit 2 ;;
+    *) red "unknown mode: $mode (valid: deb, local)"; exit 2 ;;
 esac
 if [ -e /usr/local/bin/ai ] || [ -e /usr/local/bin/ai-code ]; then
     dim "The old ai tools are still in /usr/local/bin; ./uninstall.sh offers to remove them."

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# uninstall.sh — remove aisha. Asks before deleting your settings or a downloaded model.
+# uninstall.sh — remove aisha. Asks before the settings or a downloaded model are deleted.
 set -euo pipefail
 
 AISHA_BIN_TARGET=/usr/local/bin/aisha
@@ -38,7 +38,7 @@ ask() {  # ask "question" -> 0 on yes
 }
 
 echo "Uninstalling aisha."
-# terminal windows that open aisha go back to your login shell
+# terminal windows that open aisha revert to the login shell
 if [ "$(id -u)" -ne 0 ] && [ -x "$(dirname "$0")/packaging/terminal-default.sh" ]; then
     "$(dirname "$0")/packaging/terminal-default.sh" unset || true
 fi

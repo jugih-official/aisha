@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ai$ha (ai shell hybrid alpha), run as `aisha` — a natural-language shell.
 
-Type bash as usual, or say what you want in plain words:
+Input: bash commands, or requests in plain words:
 
     aisha ~/lab $ find files in this folder that have the measurement data
     → find · here and subfolders · files · name or content ~ "measur" (from "measurement"; "data" is generic)
@@ -12,19 +12,19 @@ handles it:
 
   1. Shell input. A command on PATH with flags, paths, pipes or redirects
      runs in bash unchanged. `!` forces this stage.
-  2. Memory. A phrase whose LLM-written command you approved before is
-     replayed without asking the model again.
+  2. Memory. A phrase whose LLM-written command was approved before is
+     replayed without a new model query.
   3. Rules. A deterministic parser pulls slots out of the words (action,
      where, file types, size, age, name and content keywords, sort, limit)
-     and builds the command from them. No model, instant, and it shows its
-     reasoning.
+     and builds the command from them. No model, instant; the reasoning is
+     printed.
   4. LLM. Only when the rules are not confident, a small local model is
-     asked, with the parser's partial understanding attached as hints. Any
+     queried, with the parser's partial understanding attached as hints. Any
      OpenAI-compatible server works (Ollama, llama.cpp, LM Studio). Its
      command is always shown and confirmed before it runs. `?` forces this
      stage.
 
-Commands that delete or overwrite data always ask first.
+Commands that delete or overwrite data always require confirmation.
 
 Standard library only. Python 3.9+.
 """
@@ -50,7 +50,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.12.2"
+VERSION = "0.12.3"
 NAME = "ai$ha"             # the shell's name as shown: ai shell hybrid alpha. The command stays `aisha`
 TAGLINE = "ai shell hybrid alpha"   # ($ in a command name would be read as a variable by every shell)
 
@@ -837,7 +837,7 @@ def _take_location(u: Utterance, spec: FindSpec) -> None:
             expanded = os.path.expanduser(os.path.expandvars(tok))
             if "$" not in expanded and not os.path.isdir(os.path.join(u.cwd, expanded)):
                 near = close_folders(tok, u.cwd)
-                spec.why.append(f"no folder {tok} here" + (f"; did you mean {' or '.join(near)}?" if near else ""))
+                spec.why.append(f"no folder {tok} here" + (f"; nearest: {' or '.join(near)}" if near else ""))
             return
     # a bare path: "find big files ~/videos"
     for low, orig, start in u.remaining():
@@ -1277,7 +1277,7 @@ def render_find(spec: FindSpec, action: str = "list", default_rec: bool = True) 
     if not rec:
         parts += ["-maxdepth", "1", "-mindepth", "1"]
     if rec and (action == "delete" or action.startswith(("exec:", "top"))):
-        parts += ["-mindepth", "1"]          # never the folder you started in
+        parts += ["-mindepth", "1"]          # never the starting folder itself
     if action == "delete":   # -delete implies -depth, which makes -prune a no-op error
         parts += find_tests(spec) + ["-not", "-path", "'*/.git/*'"]
     else:
@@ -1361,7 +1361,7 @@ def finish(u: Utterance, plan: Plan, guessed: int = 0, spec: FindSpec | None = N
         plan.keywords = [c[1] for c in spec.content] + [g.strip("*") for g in spec.names]
     plan.confidence *= (UNKNOWN_PENALTY ** len(left)) * (GUESS_PENALTY ** guessed)
     if NEG_WORDS & set(left):
-        plan.confidence *= 0.5    # a "not" we could not place may flip the meaning
+        plan.confidence *= 0.5    # an unplaced "not" may flip the meaning
     if left:
         plan.why.append("ignored: " + " ".join(left))
     if looks_destructive(plan.command):
@@ -1854,7 +1854,7 @@ def _search_find(u: Utterance, root: str | None, mode: str, case: bool, exact: b
 def h_search(u: Utterance) -> Plan | None:
     low = u.text.strip()
     if re.fullmatch(r"(?:search|searching)(?:\s+(?:help|for|commands?|how))?", low):
-        lines = " ".join(shlex.quote(x) for x in ["you can say, for example:", *SEARCH_HELP])
+        lines = " ".join(shlex.quote(x) for x in ["examples:", *SEARCH_HELP])
         plan = Plan(f"printf '%s\\n' {lines}", "search help", ["what search understands"])
         plan.runs_on_question = True
         return plan
@@ -2303,8 +2303,8 @@ def unique_stem_below(name: str, cwd: str) -> str | None:
 def default_editor() -> tuple[str, str]:
     # Debian's sensible-editor honours $VISUAL/$EDITOR, then the `editor` alternative.
     if shutil.which("sensible-editor"):
-        return "sensible-editor", "your default editor ($VISUAL/$EDITOR, else Debian's 'editor')"
-    return "${VISUAL:-${EDITOR:-nano}}", "your default editor ($VISUAL/$EDITOR, else nano)"
+        return "sensible-editor", "the default editor ($VISUAL/$EDITOR, else Debian's 'editor')"
+    return "${VISUAL:-${EDITOR:-nano}}", "the default editor ($VISUAL/$EDITOR, else nano)"
 
 
 def h_read(u: Utterance) -> Plan | None:
@@ -2971,10 +2971,10 @@ SYSTEM = [  # (pattern, command or alternatives, label)
      [("ss", "ss -tulpn"), (None, PORTS_PY)], "listening ports"),
     (r"\bwho\s+am\s+i\b|\bmy\s+(?:user\s*name|user|login)\b|\bwhich\s+user\b|\bcurrent\s+user\b", "whoami", "current user"),
     (r"\bwho\s+(?:else\s+)?is\s+(?:logged\s+in|online|on)\b|\blogged[- ]in\s+users\b", "who", "logged-in users"),
-    (r"\b(?:what|which)\s+groups\b|\bmy\s+groups\b|\bgroups\s+am\s+i\s+in\b", "groups", "your groups"),
+    (r"\b(?:what|which)\s+groups\b|\bmy\s+groups\b|\bgroups\s+am\s+i\s+in\b", "groups", "groups of the current user"),
     (r"\b(?:all\s+|the\s+|list\s+of\s+)?(?:user\s+accounts|users)\b(?!\s+(?:logged|online))", "cut -d: -f1 /etc/passwd",
      "user accounts"),
-    (r"\b(?:my\s+)?(?:crontab|cron\s+jobs|scheduled\s+(?:jobs|tasks))\b", "crontab -l", "your cron jobs"),
+    (r"\b(?:my\s+)?(?:crontab|cron\s+jobs|scheduled\s+(?:jobs|tasks))\b", "crontab -l", "cron jobs of the current user"),
     (r"\bwhat\s+day\s+is\s+(?:it|today)\b|\bday\s+(?:is\s+it\s+)?today\b|\bwhich\s+day\b|(?<!by )(?<!by the )(?<!sorted )\b(?:the\s+)?(?:date|time)(?:\s+is\s+it)?\b(?!\s*(?:order|stamp))|\btoday's\s+date\b", "date", "date and time"),
     (r"\bcalendar\b", [("cal", "cal"), (None, "python3 -m calendar $(date '+%Y %-m')")], "calendar"),
     (r"\bhost\s*name\b|\b(?:computer|machine|pc)\s+name\b|\bwhat\s+is\s+(?:this|the|my)\s+(?:computer|machine|pc|system)\s+called\b",
@@ -3154,7 +3154,7 @@ def require(plan: Plan, reqs: list) -> Plan:
         plan.command = f"{inst} && {plan.command}"
         plan.why.append(f"{names} is not installed — installs {' '.join(pkgs)} first")
         plan.destructive = True
-        note = f"! installs {' '.join(pkgs)} first (needs your password)"
+        note = f"! installs {' '.join(pkgs)} first (sudo password required)"
         plan.warning = f"{plan.warning}\n{note}" if plan.warning else note
     else:
         plan.why.append(f"{names} is not installed")
@@ -3477,7 +3477,7 @@ def net_plan(sl: dict, ifaces: list[dict], nm: bool, su: str, done) -> Plan | No
         up = act == "up"
         cmd = f"nmcli device {'connect' if up else 'disconnect'} {q}" if nm else f"{su}ip link set dev {q} {'up' if up else 'down'}"
         return done(cmd, "network", [f"{dev} {'up' if up else 'down'}"], change=True,
-                    warning=None if up else f"! takes {dev} down: you lose the network if it is how you are connected")
+                    warning=None if up else f"! takes {dev} down: network access is lost if {dev} carries the connection")
     if act == "restart":
         cmd = f"nmcli device disconnect {q} && nmcli device connect {q}" if nm else \
               f"{su}ip link set dev {q} down && {su}ip link set dev {q} up"
@@ -3587,7 +3587,7 @@ def h_net(u: Utterance) -> Plan | None:
                         warning=None if on else "! turns Bluetooth off (headphones, mice and keyboards disconnect)")
         cmd = f"nmcli radio wifi {'on' if on else 'off'}" if nm else f"{su}rfkill {'unblock' if on else 'block'} wifi"
         return done(cmd, "radio", [f"Wi-Fi {'on' if on else 'off'}"], change=True,
-                    warning=None if on else "! turns Wi-Fi off: you lose the network if Wi-Fi is how you are connected")
+                    warning=None if on else "! turns Wi-Fi off: network access is lost if the connection runs over Wi-Fi")
     m = re.fullmatch(r"(?:turn\s+|switch\s+|set\s+)?(?:on\s+|off\s+)?(?:the\s+)?(?:airplane|aeroplane|flight|plane)\s+mode"
                      r"(?:\s+(on|off))?|(?:enable|disable|turn\s+on|turn\s+off|enter|exit|leave)\s+(?:the\s+)?(?:airplane|aeroplane|flight|plane)\s+mode", low)
     if m:
@@ -3616,16 +3616,16 @@ def h_net(u: Utterance) -> Plan | None:
         pw = m.group("pw") or m.group("pw2")
         if pw:
             cmd = f"nmcli device wifi connect {shlex.quote(ssid)} password {shlex.quote(pw)}"
-            note = "the password is now in your shell history"
+            note = "the password is stored in the shell history"
         else:
             cmd = f"nmcli --ask device wifi connect {shlex.quote(ssid)}"
             note = "asks for the password if it needs one"
-        return done(cmd, "wifi", [f"connect to {ssid}", note], change=True, warning="! switches your Wi-Fi network")
+        return done(cmd, "wifi", [f"connect to {ssid}", note], change=True, warning="! switches the Wi-Fi network")
     if nm and re.fullmatch(r"disconnect\s+(?:from\s+)?(?:the\s+|my\s+)?(?:wifi|wi-fi|wireless)(?:\s+network)?", low):
         dev, problem = pick_iface("wifi", net_ifaces())
         if dev:
             return done(f"nmcli device disconnect {shlex.quote(dev)}", "wifi", [f"disconnect {dev}"], change=True,
-                        warning="! you lose the network if Wi-Fi is how you are connected")
+                        warning="! network access is lost if the connection runs over Wi-Fi")
     m = re.fullmatch(r"forget\s+(?:the\s+)?(?:wifi\s+|wi-fi\s+|network\s+)*(?P<ssid>\"[^\"]+\"|'[^']+'|\S+)(?:\s+(?:wifi|network))?", raw, re.I)
     if m and nm:
         ssid = m.group("ssid").strip("\"'")
@@ -4402,7 +4402,7 @@ RECIPES = [
            [("last", "last -n 20"), (None, "journalctl _COMM=sshd -n 20 --no-pager")]),
     Recipe("sudo rights", [r"\bam\s+i\s+(?:root|an?\s+admin(?:istrator)?|admin|a\s+sudoer)\b|\bdo\s+i\s+have\s+(?:sudo|admin|root)(?:\s+rights)?\b|"
                            r"\bcan\s+i\s+(?:use\s+)?sudo\b"],
-           "id; id -nG | grep -qwE 'sudo|wheel|admin' && echo 'you can use sudo' || echo 'you are not in a sudo group'"),
+           "id; id -nG | grep -qwE 'sudo|wheel|admin' && echo 'sudo: allowed' || echo 'sudo: not allowed (not in a sudo group)'"),
     Recipe("user id", [r"\bmy\s+(?:user\s+)?id\b|\bmy\s+uid\b"], "id"),
     Recipe("locale", [r"\b(?:my\s+|system\s+)?(?:locale|language\s+settings?|system\s+language)\b"], "locale"),
     Recipe("keyboard", [r"\bkeyboard\s+(?:layout|language|map)\b"], [("localectl", "localectl status"),
@@ -4553,7 +4553,7 @@ RECIPES = [
     Recipe("git pull", [r"\b(?:pull|get|fetch|download)\s+(?:the\s+)?(?:latest|new|newest)\s+(?:changes|commits|code|version)\b|"
                         r"\bupdate\s+(?:the\s+|this\s+|my\s+)?(?:repo|repository|project|code|checkout)\b|^\s*pull\s*$"], "git pull", git=True),
     Recipe("git undo commit", [r"\bundo\s+(?:the\s+|my\s+)?last\s+commit\b"], "git reset --soft HEAD~1", git=True, destructive=True,
-           warning="! undoes the last commit (your changes stay)"),
+           warning="! undoes the last commit (the changes stay)"),
     Recipe("git discard", [r"\b(?:discard|throw\s+away|revert|undo|reset)\s+(?:all\s+)?(?:my\s+|the\s+)?(?:local\s+|uncommitted\s+)?changes"
                            r"(?:\s+(?:to|in|of)\s+(?P<path>\S+))?\s*$"],
            "git restore -- {path}", defaults={"path": "."}, git=True, destructive=True,
@@ -5450,7 +5450,7 @@ def h_recipe(u: Utterance) -> Plan | None:
 
 # ---- USB drives --------------------------------------------------------------------
 # aisha looks at the drives itself (lsblk) so commands name the real device.
-# Only drives whose transport is USB are touched, never the disk you boot from.
+# Only drives whose transport is USB are touched, never the boot disk.
 
 def usb_drives() -> list[dict]:
     """[{dev, size, model, label, parts: [{dev, fstype, label, mount, size}]}] for USB disks."""
@@ -5569,7 +5569,7 @@ def h_usb(u: Utterance) -> Plan | None:
             return Plan(show, "usb", [name, "nothing is mounted"])
         return Plan(" && ".join(unmount), "usb", [f"unmount {name}"])
     if action == "eject":
-        power = f"udisksctl power-off -b {d['dev']}" if udisks else f"echo 'you can unplug {name} now'"
+        power = f"udisksctl power-off -b {d['dev']}" if udisks else f"echo '{name} can be unplugged now'"
         return Plan(" && ".join(unmount + ["sync", power]), "usb", [f"unmount and power off {name}"],
                     destructive=True, warning=f"! ejects {name}; close files on it first")
     fs = next(((w, spec) for w, spec in FS_TYPES.items() if re.search(rf"\b{w}\b", u.low)), None)
@@ -5790,7 +5790,7 @@ def h_git(u: Utterance) -> Plan | None:
             and "incoming" not in t and "remote" not in t and "their" not in t else "--theirs"
         fs = files_in(m.group("f") or m.group("f2") or "")
         target = " ".join(q(f) for f in fs) if fs else "$(git diff --name-only --diff-filter=U)"
-        return plan(f"git checkout {side} -- {target}", [f"resolve with {'your' if side == '--ours' else 'their'} version",
+        return plan(f"git checkout {side} -- {target}", [f"resolve with the {'local (ours)' if side == '--ours' else 'incoming (theirs)'} version",
                     "then stage the file and continue"], change=True, warning="! replaces the file with one side of the conflict")
     m = re.fullmatch(r"mark\s+(?P<f>.+?)\s+as\s+(?:resolved|fixed|done)", t)
     if m and files_in(m.group("f")):
@@ -5841,7 +5841,7 @@ def h_git(u: Utterance) -> Plan | None:
                         warning=f"! deletes the commit{'s' if n > 1 else ''} above and every uncommitted change")
         return plan(f"git reset --soft HEAD~{n}", [f"undo the last {n} commit{'s' if n > 1 else ''}",
                     "the changes stay staged, nothing is lost"], change=True, preview=f"git log --oneline -n {n}",
-                    warning="! rewrites history: don't do this to commits you already pushed (use 'revert the last commit')")
+                    warning="! rewrites history: not for commits already pushed ('revert the last commit' is the safe form)")
     if re.fullmatch(r"uncommit", t):
         return plan("git reset --soft HEAD~1", ["undo the last commit", "the changes stay staged"], change=True)
     m = re.fullmatch(rf"revert\s+(?:the\s+)?(?:last|latest|previous)\s+{n_pat}\s+commits", t)
@@ -6039,7 +6039,7 @@ def h_git(u: Utterance) -> Plan | None:
         b = orig(m.group("b") or m.group("b2"))
         force = re.search(r"\bforce\b|\banyway\b|\beven\s+if\b|\bunmerged\b|-d\b", t)
         if b == current:
-            return plan("git branch", f"{b} is the branch you are on: switch to another one first", conf=0.9)
+            return plan("git branch", f"{b} is the current branch: a switch to another branch is required first", conf=0.9)
         return plan(f"git branch {'-D' if force else '-d'} {q(b)}", f"delete the branch {b}" +
                     ("" if force else " (refused if it is not merged; say 'force delete' to delete anyway)"), change=True)
     m = re.fullmatch(r"rename\s+(?:this|the\s+current|my|current)\s+branch\s+(?:to|as|into)\s+(?P<b2>[\w./-]+)|"
@@ -6066,7 +6066,7 @@ def h_git(u: Utterance) -> Plan | None:
                     f"create {m.group('n')}" + (f" from {base}" if base else "") + " and switch to it")
     if re.search(r"\b(?:which|what)\s+branch\b|\bcurrent\s+branch\b|\bbranch\s+(?:am\s+i|are\s+we)\s+on\b|\bon\s+which\s+branch\b|"
                  r"\bwhat\s+is\s+this\s+branch\b|\bwhere\s+am\s+i\s+in\s+git\b", t) and not re.search(r"\bbranches\b", t):
-        return plan("git branch --show-current", "the branch you are on")
+        return plan("git branch --show-current", "the current branch")
     if re.search(r"\bbranches\b", t) and re.search(r"\b(?:list|show|see|view|what|which|all|my|every|are)\b|^branches$", t + " ") \
             or re.fullmatch(r"(?:the\s+)?branches", t):
         if re.search(r"\b(?:not|un)[- ]?merged\b", t):
@@ -6081,7 +6081,7 @@ def h_git(u: Utterance) -> Plan | None:
     if re.fullmatch(r"(?:switch|change|jump|hop)\s+back(?:\s+to\s+(?:the\s+)?(?:previous|last|other|old|former)\s+branch)?|"
                     r"(?:go|move|get)\s+back\s+to\s+(?:the\s+)?(?:previous|last|other|old|former)\s+branch|"
                     r"(?:switch|go|change|move)\s+to\s+(?:the\s+)?(?:previous|last|other|former)\s+branch|(?:the\s+)?previous\s+branch", t):
-        return plan("git switch -", "back to the branch you were on before")
+        return plan("git switch -", "back to the previous branch")
     m = re.fullmatch(r"(?:switch|go|change|move|jump|hop|checkout|check\s+out|get\s+on|work\s+on)\s+(?:over\s+|back\s+)?(?:to|onto|into|on)?\s*(?:the\s+)?"
                      r"(?:branch\s+)?(?P<b>[\w./-]+?)(?:\s+branch)?", t)
     if m and (is_branch(m.group("b")) or re.search(r"\bbranch\b", t)) and m.group("b") not in ("back", "previous", "the"):
@@ -6133,7 +6133,7 @@ def h_git(u: Utterance) -> Plan | None:
                     warning="! rewrites those commits")
     # -- push
     if re.search(r"\bforce[- ]?push\b|\bpush\b.*\b(?:force(?:fully)?|--force|-f|overwrite\s+(?:the\s+)?remote)\b", t):
-        return plan(f"git push --force-with-lease", ["overwrite the remote branch with yours",
+        return plan(f"git push --force-with-lease", ["overwrite the remote branch with the local one",
                     "refused if someone else pushed meanwhile"], change=True, warning="! replaces the remote branch's history")
     if re.search(r"\b(?:push|publish|share|upload|send)\s+(?:this|my|the\s+current|current|the\s+new|my\s+new)\s+(?:new\s+)?branch\b|\bpublish\b|"
                  r"\bset\s+(?:the\s+)?upstream\b|\bpush\b.*\b(?:upstream|first\s+time|for\s+the\s+first\s+time|-u)\b|\btrack\s+(?:the\s+)?remote\b", t):
@@ -6157,11 +6157,11 @@ def h_git(u: Utterance) -> Plan | None:
                      r"fetch(?:\s+(?:the\s+)?(?:latest|changes|updates|commits|new\s+commits))?(?:\s+(?:from\s+)?(?:the\s+)?(?P<r>[\w.-]+))?", t)
     if m:
         if m.group("all"):
-            return plan("git fetch --all --prune", "fetch every remote (nothing changes in your files)")
+            return plan("git fetch --all --prune", "fetch every remote (working files stay unchanged)")
         r = m.group("r")
-        return plan(f"git fetch {r}" if r in remotes else "git fetch", f"fetch {r if r in remotes else 'the remote'} (nothing changes in your files)")
+        return plan(f"git fetch {r}" if r in remotes else "git fetch", f"fetch {r if r in remotes else 'the remote'} (working files stay unchanged)")
     if re.search(r"\bpull\b.*\brebase\b", t):
-        return plan("git pull --rebase", "pull, putting your commits on top of the new ones")
+        return plan("git pull --rebase", "pull, with local commits placed on top of the new ones")
     m = re.fullmatch(r"pull(?:\s+(?:the\s+)?(?:latest|newest|recent|changes|updates|code|commits|everything|down|in|it))*(?:\s+(?:from|off)\s+(?:the\s+)?(?P<r>[\w.-]+)(?:\s+(?P<b>[\w./-]+))?)?", t)
     m2 = re.fullmatch(r"(?:bring|get)\s+(?:my\s+|this\s+|the\s+)?(?:branch|repo|repository|code|checkout)\s+up\s+to\s+date|"
                       r"(?:get|grab|download|fetch\s+and\s+merge|bring\s+in|receive)\s+(?:the\s+)?(?:latest|newest|new|recent|remote)?\s*(?:changes|code|commits|updates|version|work)"
@@ -6195,7 +6195,7 @@ def h_git(u: Utterance) -> Plan | None:
         return plan("git diff -- " + " ".join(q(f) for f in fs), f"uncommitted changes in {', '.join(fs)}")
     if re.fullmatch(r"(?:show|view|see|display|print|list)?\s*(?:me\s+)?(?:the\s+|my\s+|all\s+(?:my\s+)?)?(?:current\s+|local\s+|unstaged\s+|uncommitted\s+|working\s+)?"
                     r"(?:diff|changes|differences|edits|modifications)(?:\s+(?:i\s+made|so\s+far|here))?", t):
-        return plan("git diff", "your uncommitted changes")
+        return plan("git diff", "uncommitted changes")
     if re.fullmatch(r"(?:what(?:'s|\s+has|\s+is)?\s+changed|what\s+did\s+i\s+change|(?:repo|git|repository)\s+status|status|"
                     r"is\s+(?:my|the|this)\s+(?:repo|repository|working\s+(?:tree|copy|directory)|branch|checkout)\s+(?:clean|dirty)|"
                     r"(?:are\s+there\s+|do\s+i\s+have\s+|any\s+)(?:any\s+)?(?:uncommitted|unsaved|pending|local|unpushed\s+or\s+uncommitted)\s+changes|"
@@ -6210,10 +6210,10 @@ def h_git(u: Utterance) -> Plan | None:
                   r"\b(?:unpushed|not\s+(?:yet\s+)?pushed|local\s+only|outgoing)\s+commits\b|\bcommits\s+(?:i\s+)?(?:have(?:n'?t|\s+not)|that\s+are\s+not|not)\s+(?:yet\s+)?pushed\b|"
                   r"\bwhat\s+(?:will|would|am\s+i\s+going\s+to)\s+(?:i\s+|be\s+)?push", t)
     if m:
-        return plan("git log --oneline @{u}..", "your commits the remote doesn't have yet")
+        return plan("git log --oneline @{u}..", "local commits not yet on the remote")
     if re.search(r"\b(?:incoming|new|remote|upstream)\s+(?:changes|commits)\b|\bwhat(?:'s|\s+is)\s+new\s+(?:on|in)\s+(?:the\s+)?(?:remote|origin|server|upstream)\b|"
                  r"\bwhat\s+(?:would|will)\s+(?:i\s+get|a\s+pull\s+bring|pull\s+bring)", t):
-        return plan("git fetch -q && git log --oneline ..@{u}", "commits on the remote you don't have yet (fetched, not merged)")
+        return plan("git fetch -q && git log --oneline ..@{u}", "remote commits not yet local (fetched, not merged)")
     if re.search(r"\b(?:am\s+i|are\s+we|is\s+(?:my|this|the)\s+(?:branch|repo|code|checkout))\s+(?:behind|ahead|up\s+to\s+date|in\s+sync|current|synced)\b|"
                  r"\bhow\s+far\s+(?:behind|ahead)\b|\bup\s+to\s+date\s+with\s+(?:the\s+)?(?:remote|origin|upstream)\b|\bbehind\s+(?:the\s+)?(?:remote|origin)\b", t):
         return plan("git fetch -q && git status -sb | head -n 1", "ahead or behind the remote, after fetching")
@@ -6230,7 +6230,7 @@ def h_git(u: Utterance) -> Plan | None:
         f = files_in(m.group("f") or m.group("f2") or m.group("f3"))[0]
         return plan(f"git log --oneline --follow --format='%h %ad %an  %s' --date=short -- {q(f)}", f"commits that changed {f}, with who and when")
     if re.search(r"\b(?:my|mine)\s+commits\b|\bcommits\s+(?:i\s+made|by\s+me|i\s+did)\b", t):
-        return plan('git log --oneline --author="$(git config user.name)"', "your commits")
+        return plan('git log --oneline --author="$(git config user.name)"', "commits by the configured git user")
     m = re.search(r"\bcommits?\s+(?:by|from|of|made\s+by|authored\s+by)\s+(?P<a>[\w.@-]+(?:\s+[A-Z][\w-]+)?)", traw, re.I)
     if m and not _git_since(m.group("a")) and m.group("a").lower() not in ("last", "the", "yesterday", "today", "this", "branch", "main"):
         return plan(f"git log --oneline --author={q(m.group('a'))}", f"commits by {m.group('a')}")
@@ -6269,7 +6269,7 @@ def h_git(u: Utterance) -> Plan | None:
     m = re.search(r"\b(?:set|change|configure|use)\s+(?:my\s+)?git\s+(?:user\s*)?(?P<k>name|e-?mail|username)\s+(?:to|as)\s+(?P<v>.+)$", traw, re.I)
     if m:
         key = "email" if "mail" in m.group("k").lower() else "name"
-        return plan(f"git config --global user.{key} {q(m.group('v').strip())}", f"your git {key} for every repository")
+        return plan(f"git config --global user.{key} {q(m.group('v').strip())}", f"git {key} for every repository")
     if re.search(r"\b(?:update|init|initiali[sz]e|fetch|pull|get|clone)\s+(?:the\s+|all\s+(?:the\s+)?)?submodules?\b|\bsubmodules?\s+update\b", t):
         return plan("git submodule update --init --recursive", "fetch and check out every submodule")
     return None
@@ -6309,7 +6309,7 @@ def h_unglue(u: Utterance) -> Plan | None:
     if not fixed:
         return None
     u.text = " " * len(u.text)
-    return Plan(fixed, "did you mean", [f"read '{u.raw.strip()}' as '{fixed}'"], confidence=0.95, source="guess")
+    return Plan(fixed, "typo", [f"read '{u.raw.strip()}' as '{fixed}'"], confidence=0.95, source="guess")
 
 
 HANDLERS = [h_unglue, h_git, h_search, h_usb, h_power_later, h_net, h_service, h_recipe, h_system, h_power, h_version, h_installed, h_port, h_pkg_search, h_process, h_package, h_pwd, h_cd, h_create, h_chmod, h_archive,
@@ -6431,7 +6431,7 @@ def interpret(text: str, cwd: str) -> Plan | None:
         plan = _interpret_fixing(text[q.end():].rstrip(" ?"), cwd)
         if plan and not plan.runs_on_question:
             plan.show_only = True
-            plan.why.append("shown, not run: you asked how")
+            plan.why.append("shown, not run: question form")
     else:
         plan = _interpret_fixing(text, cwd)
     if plan and not plan.destructive and not plan.checked and needs_care(plan.command):
@@ -7294,7 +7294,7 @@ def _looks_like_shell(line: str, path_env: str | None = None, known: set = froze
 
 # ---- local LLM fallback -----------------------------------------------------------
 
-SYSTEM_PROMPT = """You turn a request into ONE bash command for GNU/Linux.
+SYSTEM_PROMPT = """Task: convert a request into ONE bash command for GNU/Linux.
 Rules:
 - Reply with the command only, on a single line. No explanation, no markdown, no backticks.
 - Use tools every Debian system has: ls, find, grep, du, df, ps, cp, mv, mkdir, tar, sort, head, wc,
@@ -7338,7 +7338,7 @@ def os_name() -> str:
 
 # ---- local model runtime ---------------------------------------------------------
 # The only optional extra aisha uses is a model. `aisha --setup` either reuses
-# a server you already run (Ollama, llama-server, LM Studio) or downloads
+# an already running server (Ollama, llama-server, LM Studio) or downloads
 # llama.cpp's llama-server and a small Qwen coder model, which aisha then
 # starts on demand and stops when it exits.
 
@@ -7636,7 +7636,7 @@ class LLM:
             detail = e.read().decode(errors="replace")[:300]
             if e.code == 404 and "model" in detail.lower():
                 have = ollama_models(self.cfg["llm_url"])
-                hint = (f" Models you have: {', '.join(have)} (use one with AISHA_LLM_MODEL=<name>, "
+                hint = (f" Installed models: {', '.join(have)} (use one with AISHA_LLM_MODEL=<name>, "
                         f"or in {CFG_FILE})." if have else "")
                 raise LLMError(f"the model {self.cfg['llm_model']} is not downloaded yet. Run: aisha --setup "
                                f"(or: ollama pull {self.cfg['llm_model']}).{hint}") from None
@@ -7649,7 +7649,7 @@ class LLM:
             self._hinted = True
             raise LLMError(f"no LLM reachable at {self.cfg['llm_url']} ({reason}).{hint}") from None
         if self.runtime.configured and not self.runtime.running() and not getattr(self, "_watch_last", False):
-            self._watch_last = True          # a server another window started: stop it if we are the last
+            self._watch_last = True          # a server started by another window: stopped when this is the last one
             atexit.register(self.runtime.stop_if_last)
         try:
             return data["choices"][0]["message"]["content"] or ""
@@ -7817,7 +7817,7 @@ class Memory:
 
 # ---- the shell --------------------------------------------------------------------
 
-HELP = """ai$ha — type bash, or say what you want. Some things you can say:
+HELP = """ai$ha: bash commands, or requests in plain words. Example requests:
 
 Files       find files older than 2 months in this folder · find big files · show file tree
             find files containing "invoice" · find duplicate files · delete empty folders
@@ -7836,19 +7836,19 @@ Shell       set EDITOR to micro · make an alias ll for ls -la · add ~/bin to m
             run make in the background · run make and notify me · time how long make takes
 Other       what time is it in tokyo · what date is it 30 days from now · set a timer for 5 minutes
             remind me to stretch in 20 minutes · generate a password · weather in helsinki
-            how do I delete empty folders   (shows the command, runs nothing)
+            how do I delete empty folders   (command shown, nothing run)
 
 Shell features: pipes, loops, aliases, functions, Ctrl-Z/jobs/fg/bg, Tab completion.
 
 aisha commands:
-  !<command>         force plain bash             ?<request>         ask the LLM directly
-  explain <request>  show what would run          again              repeat the last line
-  teach <what you say> = <command>               e.g. teach backup {dir} = tar -czf {dir}.tgz {dir}
-  learned / forget   what aisha was taught        llm                check the optional language model
-  exit               leave (or Ctrl-D)            aisha --setup      add an optional small language model
+  !<command>         plain bash, no rules         ?<request>         direct LLM query
+  explain <request>  command that would run       again              repetition of the last line
+  teach <request> = <command>                    e.g. teach backup {dir} = tar -czf {dir}.tgz {dir}
+  learned / forget   taught phrases               llm                check of the optional language model
+  exit               end of session (or Ctrl-D)   aisha --setup      optional small language model
 
-When aisha isn't sure, it offers the closest requests it knows (pick a number), or you type the
-command once and it learns it — with your file names as slots, so it works for other files too.
+Unknown requests: the closest known requests are offered as a numbered list, or a bash command
+typed once is stored, with the file names as slots, so the same request works for other files.
 """
 
 
@@ -8032,16 +8032,16 @@ class Shell:
             say(HELP)
             return 0
         if CHATTER.fullmatch(low):          # "yes" would run yes(1), which prints y forever
-            say(dim("you're welcome" if low.startswith("thank") else
-                    "nothing is waiting for an answer: say what to do, or 'help'"))
+            say(dim("ok" if low.startswith("thank") else
+                    "no question pending; 'help' lists examples"))
             return 0
         if GREETING.fullmatch(low):
             if re.match(r"(?:who|what)\s+are\s+you", low):
-                say(f"I'm {NAME} ({TAGLINE}), a shell you can talk to: type bash as usual, or say what you "
-                    f"want done. Start me with: aisha")
+                say(f"{NAME} ({TAGLINE}): a bash-compatible shell with plain-language requests. "
+                    f"Started with: aisha")
             else:
-                say(("Hi! " if not low.startswith("how") else "") + "All good here, ready when you are.")
-            say(dim("  try: show the biggest files here · what's using my memory · find pdfs older than a month · help"))
+                say("ready: bash commands or plain-language requests")
+            say(dim("  examples: show the biggest files here · what's using my memory · find pdfs older than a month · help"))
             return 0
         if low in ("again", "repeat", "repeat that", "do it again", "do that again", "run it again",
                    "run that again", "same again", "once more") or line == "!!":
@@ -8059,7 +8059,7 @@ class Shell:
         if word == "teach":
             m = re.match(r"teach\s+(.+?)\s+=\s+(.+)$", line)
             if not m:
-                say("usage: teach <what you say> = <bash command>   e.g. teach backup {dir} = tar -czf {dir}.tgz {dir}")
+                say("usage: teach <request> = <bash command>   e.g. teach backup {dir} = tar -czf {dir}.tgz {dir}")
                 return 1
             pattern, template = self.memory.teach(m.group(1), m.group(2))
             say(f"learned: “{pattern}” → {template}")
@@ -8090,7 +8090,7 @@ class Shell:
         polite = strip_politeness(line)
         if polite != line and (POLITE_HEAD.match(line) or not looks_like_shell(line, self.env.get("PATH"))):
             line = polite                      # "go ahead and show README.md" -> "show README.md"
-        if self.memory.match(line):           # what you taught wins over guessing (! still forces bash)
+        if self.memory.match(line):           # taught phrases win over guessing (! still forces bash)
             return self.natural(line)
         if looks_like_shell(line, self.env.get("PATH"), self.cwd, self.cfg["threshold"], self.names):
             return self.shell_line(line)
@@ -8150,7 +8150,7 @@ class Shell:
     def natural(self, line: str) -> int:
         remembered = self.memory.match(line)
         if remembered:
-            plan = Plan(remembered, "remembered", ["you taught or approved this"], source="learned",
+            plan = Plan(remembered, "remembered", ["taught or approved earlier"], source="learned",
                         destructive=needs_care(remembered))
             return self.execute(plan)
         plan = interpret(line, self.cwd)
@@ -8173,16 +8173,16 @@ class Shell:
             if rc is not None:
                 return rc
         if choices:
-            say(yellow("Not sure — closest things I know:"))
+            say(yellow("Unsure; closest known requests:"))
             for i, (phrase, plan) in enumerate(choices, 1):
                 say(f"  {bold(str(i))}) {phrase}")
                 say(dim(f"     $ {plan.command}"))
         else:
-            say(yellow("I don't know that one yet."))
+            say(yellow("No known command for this request."))
         if self.dry_run:
             return 1
         hint = ((f"1–{len(choices)} to run, " if len(choices) > 1 else "1 to run, ") if choices else "") + \
-            "type the bash command to teach me"
+            "a bash command to teach it"
         hint += ", ? to ask the language model" if self.llm.enabled else ""
         ans = ask(f"{hint}, or Enter to skip: ")
         if ans is None or not ans.strip():
@@ -8444,7 +8444,7 @@ class Shell:
         except OSError:
             return
         defs, _, rest = defs.partition("#__aisha_vars__\n")
-        # keep everything but our own helper function
+        # everything except aisha's own helper function
         defs = re.sub(r"(?ms)^__aisha_\w+ \(\) \n\{.*?^\}\n?", "", defs)
         with open(self.defs_file, "w") as f:
             f.write(defs + "\n" + shell_vars(rest))
@@ -8910,7 +8910,7 @@ def install_runtime() -> str:
     except (OSError, urllib.error.URLError, ValueError) as e:
         problems.append(f"llama.cpp from GitHub: {e}")
     raise OSError("could not download a model server:\n  " + "\n  ".join(problems)
-                  + "\n  Or install llama.cpp yourself and run: aisha --setup --runtime /path/to/llama-server")
+                  + "\n  Alternative: a separately installed llama.cpp, via: aisha --setup --runtime /path/to/llama-server")
 
 
 def install_llama_runtime() -> str:
@@ -8968,7 +8968,7 @@ def setup(args: list[str]) -> int:
     say(bold(f"{NAME}: optional language model"))
     say(dim(f"{NAME} works without one (rules + built-in model). This adds a small language model for the rest,"))
     say(dim("run by Mozilla's llamafile (llama.cpp in one file), which aisha starts when needed and stops on exit."))
-    if "--url" in args:                      # use a server you already run
+    if "--url" in args:                      # an already running server
         i = args.index("--url")
         url = args[i + 1] if i + 1 < len(args) else ""
         if not server_answers(url):
