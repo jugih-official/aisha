@@ -492,6 +492,51 @@ class TestShellSession(LabTest):
         self.assertTrue(any("command ls" in x for x in shown), shown)
         self.assertEqual(_MockLLM.seen, [])
 
+    def test_learned_requests_are_offered_for_close_wordings(self):
+        self.sh.memory.remember("zorp the logs", "ls -1")
+        self.assertEqual(self.sh.memory.similar("zorp all the logs", self.lab)[0][2], "ls -1")
+        self.assertEqual(self.sh.memory.similar("show disk space", self.lab), [])
+        _MockLLM.replies = ["NONE"]
+        shown = []
+        orig = aisha.say
+        aisha.say = lambda *x, **k: shown.append(" ".join(map(str, x)))
+        try:
+            self.answers = ["1"]                                      # pick the learned one
+            self.sh.handle("zorp all the logs")
+        finally:
+            aisha.say = orig
+        self.assertTrue(any("(learned) zorp the logs" in x for x in shown), shown)
+        self.assertEqual(self.sh.memory.match("zorp all the logs"), "ls -1")   # the new wording is learned too
+
+    def test_taught_templates_fill_close_wordings(self):
+        self.sh.memory.teach("frobnicate {x}", "touch {x}")
+        hits = self.sh.memory.similar("please frobnicate the file a.txt", self.lab)
+        self.assertEqual(hits[0][2], "touch a.txt")
+
+    def test_learned_pairs_are_examples_for_the_model(self):
+        self.sh.memory.remember("zorp the logs", "tail -n 50 logs.txt")
+        _MockLLM.seen.clear()
+        _MockLLM.replies = ["NONE"]
+        self.sh.handle("?zorp logs now")
+        msgs = _MockLLM.seen[-1]["messages"]
+        self.assertIn({"role": "user", "content": "Request: zorp the logs"}, msgs)
+        self.assertIn({"role": "assistant", "content": "tail -n 50 logs.txt"}, msgs)
+
+    def test_declined_model_answers_are_not_offered_again(self):
+        _MockLLM.seen.clear()
+        _MockLLM.replies = ["touch blarg.txt"]
+        self.answers = ["n"]
+        self.assertEqual(self.sh.handle("?make a blarg"), 1)
+        self.assertEqual(self.sh.memory.rejected_for("make a blarg"), ["touch blarg.txt"])
+        _MockLLM.replies = ["touch blarg.txt", "touch blarg.txt"]     # the model insists: refused twice
+        self.sh.handle("?make a blarg")
+        prompt = _MockLLM.seen[-2]["messages"][-1]["content"]
+        self.assertIn("Already declined", prompt)
+        self.assertIn("touch blarg.txt", prompt)
+        self.assertFalse(os.path.exists(os.path.join(self.lab, "blarg.txt")))
+        self.assertTrue(self.sh.memory.forget("make a blarg"))
+        self.assertEqual(self.sh.memory.rejected_for("make a blarg"), [])
+
     def test_question_mark_without_a_failure_is_help(self):
         self.sh.interactive = True
         self.sh.handle("true")

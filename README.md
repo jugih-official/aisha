@@ -59,6 +59,26 @@ offered. Every answer is shown and confirmed before it runs, and a confirmed
 answer that succeeds is remembered for that line. `"fix_hint": false` (or
 `AISHA_FIX_HINT=false`) turns the hint off.
 
+### Memory
+
+Memory grows only from confirmed results, in `~/.config/aisha/learned.json`:
+language model answers that were confirmed and succeeded, picks from the
+suggestion list, and taught commands (as templates, so "frobnicate notes.md"
+also works for other files). It is used in three ways:
+
+- **Exact replay.** The same phrase runs the learned command without asking
+  the model again.
+- **Close wordings.** A new wording near a learned one is offered first in the
+  suggestion list, marked `(learned)`; templates get the new request's values.
+  A pick that succeeds is learned under the new wording too.
+- **Examples for the model.** The most similar learned pairs go into the
+  language model's prompt as examples, so its answers follow earlier choices.
+
+A declined model answer is recorded in `learned-rejected.json`: the model is
+told about it, and the same command is refused if offered again for that
+request. `learned` lists the memory; `forget <request>` removes an entry and
+its declined commands.
+
 Accuracy on 30 phrasings outside the test set, before tuning: 23 correct
 commands (77%) from the rules and the built-in model. Of the 7 misses, 6
 produced no command and 1 a wrong command. Each miss was turned into a general

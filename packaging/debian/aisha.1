@@ -1,4 +1,4 @@
-.TH AISHA 1 "November 2026" "aisha 0.14.0" "User Commands"
+.TH AISHA 1 "November 2026" "aisha 0.15.0" "User Commands"
 .SH NAME
 aisha \- ai$ha (ai shell hybrid alpha), a bash-compatible shell with plain-language requests
 .SH SYNOPSIS
@@ -162,7 +162,11 @@ an ls alias or function here replaces that definition
 downloaded llama.cpp runtime and model
 .TP
 .I ~/.config/aisha/learned.json
-remembered phrases
+remembered phrases: replayed exactly, offered for close wordings, and given to
+the language model as examples
+.TP
+.I ~/.config/aisha/learned-rejected.json
+model answers declined per request, never offered again for it
 .TP
 .I ~/.config/aisha/history
 command history

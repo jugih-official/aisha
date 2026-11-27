@@ -50,7 +50,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.14.0"
+VERSION = "0.15.0"
 NAME = "ai$ha"             # the shell's name as shown: ai shell hybrid alpha. The command stays `aisha`
 TAGLINE = "ai shell hybrid alpha"   # ($ in a command name would be read as a variable by every shell)
 
@@ -7962,7 +7962,10 @@ class LLM:
         except (KeyError, IndexError, TypeError):
             raise LLMError(f"unexpected reply from LLM server: {str(data)[:200]}") from None
 
-    def command_for(self, request: str, cwd: str, hints: str, failure: str = "") -> str | None:
+    def command_for(self, request: str, cwd: str, hints: str, failure: str = "",
+                    examples: list | None = None, avoid: list | None = None) -> str | None:
+        """examples: (request, command) pairs approved earlier; avoid: commands declined for this request."""
+        avoid = [a.strip() for a in avoid or []]
         try:
             entries = sorted(os.listdir(cwd))
         except OSError:
@@ -7978,8 +7981,10 @@ class LLM:
         if failure:
             context += (f"This request was typed as a bash line and failed: {failure}. "
                         "Reply with the command that was meant.\n")
+        if avoid:
+            context += "Already declined for this request (never reply with these): " + " ; ".join(avoid) + "\n"
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for q, a in FEWSHOT:
+        for q, a in FEWSHOT + [(f"Request: {q}", c) for q, c in examples or []]:
             messages += [{"role": "user", "content": q}, {"role": "assistant", "content": a}]
         messages.append({"role": "user", "content": f"{context}Request: {request}"})
         for attempt in range(2):
@@ -7987,7 +7992,7 @@ class LLM:
             cmd = clean_llm_command(raw)
             if cmd is None:
                 return None
-            problem = validate_command(cmd)
+            problem = validate_command(cmd) or ("it was already declined" if cmd.strip() in avoid else None)
             if not problem:
                 return cmd
             messages += [{"role": "assistant", "content": raw},
@@ -8045,14 +8050,73 @@ def validate_command(cmd: str) -> str | None:
 FIX_CODES = {2: "wrong usage or a missing file", 126: "not executable", 127: "command not found"}
 
 
+LEARNED_MIN = 0.45        # how close a request must be to a learned one to be offered
+
+
 class Memory:
     def __init__(self, path: str):
         self.path = path
+        self.rej_path = os.path.splitext(path)[0] + "-rejected.json"
+        self.data = self._load(path)
+        self.rejected: dict = self._load(self.rej_path)     # phrase key -> commands declined for it
+        self._index: tuple | None = None                    # (phrases, IntentModel, entries)
+
+    @staticmethod
+    def _load(path: str) -> dict:
         try:
             with open(path) as f:
-                self.data = json.load(f)
+                return json.load(f)
         except (OSError, ValueError):
-            self.data = {}
+            return {}
+
+    def similar(self, text: str, cwd: str, k: int = 3, min_score: float = LEARNED_MIN) -> list[tuple[float, str, str]]:
+        """Learned requests close to this one, as (score, phrase, command). Taught
+        templates get this request's values in their slots ("frobnicate {1}")."""
+        if not self.data:
+            return []
+        phrases, entries = [], []
+        for key, v in self.data.items():
+            pat = v.get("pattern")
+            phrases.append(" ".join(re.sub(r"\{\d+\}", " ", pat).split()) if pat else key)
+            entries.append((key, v))
+        if not self._index or self._index[0] != phrases:
+            self._index = (phrases, IntentModel(phrases), dict(zip(phrases, entries)))
+        _, model, by_phrase = self._index
+        own = self.key(text)
+        out, seen = [], set()
+        for score, ph in model.rank(text, k=10):
+            if score < min_score:
+                break
+            key, v = by_phrase[ph]
+            if key == own:
+                continue                        # the exact phrase is replayed elsewhere
+            pat = v.get("pattern")
+            if pat:
+                n = len(re.findall(r"\{\d+\}", pat))
+                vals = [val for _, val in request_values(text, cwd)[1]]
+                if len(vals) < n:
+                    continue
+                cmd = fill_command(v["command"], pat, tuple(vals[:n]))
+                shown = pat
+                for i, val in enumerate(vals[:n], 1):
+                    shown = shown.replace("{%d}" % i, val)
+            else:
+                cmd, shown = v["command"], key
+            if cmd and cmd not in seen:
+                seen.add(cmd)
+                out.append((score, shown, cmd))
+            if len(out) >= k:
+                break
+        return out
+
+    def reject(self, phrase: str, command: str) -> None:
+        lst = self.rejected.setdefault(self.key(phrase), [])
+        if command not in lst:
+            lst.append(command)
+            self._write(self.rej_path, self.rejected)
+
+    def rejected_for(self, phrase: str) -> list[str]:
+        return list(self.rejected.get(self.key(phrase), []))
 
     @staticmethod
     def key(phrase: str) -> str:
@@ -8114,18 +8178,25 @@ class Memory:
         return pattern, template
 
     def forget(self, phrase: str) -> bool:
+        dropped = self.rejected.pop(self.key(phrase), None) is not None
+        if dropped:
+            self._write(self.rej_path, self.rejected)
         for k in (self.key(phrase), "pattern: " + _clean_phrase(phrase).lower()):
             if self.data.pop(k, None) is not None:
                 self._save()
                 return True
-        return False
+        return dropped
 
     def _save(self) -> None:
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
-        tmp = self.path + ".tmp"
+        self._write(self.path, self.data)
+
+    @staticmethod
+    def _write(path: str, data: dict) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
         with open(tmp, "w") as f:
-            json.dump(self.data, f, indent=2, sort_keys=True)
-        os.replace(tmp, self.path)
+            json.dump(data, f, indent=2, sort_keys=True)
+        os.replace(tmp, path)
 
 
 # ---- the shell --------------------------------------------------------------------
@@ -8502,6 +8573,14 @@ class Shell:
         """The rules are not sure: offer the built-in model's closest matches, the
         rules' guess, the language model (if set up), or teaching by example."""
         options = suggest(line, self.cwd, self.cfg["threshold"])
+        learned = []
+        for score, phrase, cmd in self.memory.similar(line, self.cwd):
+            plan = Plan(cmd, "learned", [f"close to “{phrase}”, learned earlier"], source="learned",
+                        destructive=needs_care(cmd), confidence=score)
+            learned.append((f"(learned) {phrase}", plan, score))
+        known = {c for _, _, c in self.memory.similar(line, self.cwd)}
+        options = sorted(learned, key=lambda x: (x[1].destructive, -x[2])) + \
+            [o for o in options if o[1].command not in known]
         choices = [(phrase, plan) for phrase, plan, _ in options]
         if partial and partial.command not in [p.command for _, p in choices] and partial.confidence >= 0.4:
             partial.source = "guess"
@@ -8561,7 +8640,9 @@ class Shell:
         say(dim(f"… {'the bash line failed' if failure else 'rules not sure'}, asking {self.cfg['llm_model']}"))
         t0 = time.time()
         try:
-            cmd = self.llm.command_for(line, self.cwd, hints, failure)
+            examples = [(p, c) for _, p, c in self.memory.similar(line, self.cwd, k=3, min_score=0.25)]
+            cmd = self.llm.command_for(line, self.cwd, hints, failure, examples=examples,
+                                       avoid=self.memory.rejected_for(line))
         except LLMError as e:
             say(red(f"LLM: {e}"))
             if not fall_back:
@@ -8605,6 +8686,9 @@ class Shell:
             if not ok:
                 other = ans and ans.strip().lower() not in ("n", "no", "")
                 say(dim("skipped" + (f" ('{ans.strip()}' is not y or n)" if other else "")))
+                if plan.source == "llm" and phrase and ans is not None and not other:
+                    self.memory.reject(phrase, plan.command)
+                    say(dim("(declined: not offered again for this request; 'forget <request>' clears it)"))
                 return 1
         rc = self.run(plan.command)
         if plan.source == "llm" and phrase and rc == 0:
