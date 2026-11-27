@@ -463,6 +463,50 @@ class TestShellSession(LabTest):
         self.home.cleanup()
         super().tearDown()
 
+    def test_failed_bash_line_question_mark_asks_the_model(self):
+        self.sh.interactive = True
+        _MockLLM.seen.clear()
+        _MockLLM.replies = ["ls -1"]
+        self.assertEqual(self.sh.handle("ls --bogus-flag"), 2)
+        self.assertEqual(self.sh.last_failed, ("ls --bogus-flag", 2))
+        self.answers = [""]                                               # accept the model's command
+        self.assertEqual(self.sh.handle("?"), 0)
+        prompt = _MockLLM.seen[-1]["messages"][-1]["content"]
+        self.assertIn("failed", prompt)
+        self.assertIn("ls --bogus-flag", prompt)
+        self.assertEqual(self.sh.memory.match("ls --bogus-flag"), "ls -1")   # remembered for next time
+        self.assertIsNone(self.sh.last_failed)
+
+    def test_failed_bash_line_rules_reading_comes_first(self):
+        self.sh.interactive = True
+        _MockLLM.seen.clear()
+        self.assertEqual(self.sh.handle("sort alphabetically"), 2)       # sort: cannot read 'alphabetically'
+        shown = []
+        orig = aisha.say
+        aisha.say = lambda *x, **k: shown.append(" ".join(map(str, x)))
+        try:
+            self.answers = [""]                                           # confirm the rules' reading
+            self.assertEqual(self.sh.handle("?"), 0)
+        finally:
+            aisha.say = orig
+        self.assertTrue(any("command ls" in x for x in shown), shown)
+        self.assertEqual(_MockLLM.seen, [])
+
+    def test_question_mark_without_a_failure_is_help(self):
+        self.sh.interactive = True
+        self.sh.handle("true")
+        _MockLLM.seen.clear()
+        self.assertEqual(self.sh.handle("?"), 0)
+        self.assertEqual(_MockLLM.seen, [])
+
+    def test_failure_hint_only_once(self):
+        self.sh.interactive = True
+        self.sh.handle("sort alphabetically")
+        self.sh.handle("true")                     # another line in between: "?" is help again
+        _MockLLM.seen.clear()
+        self.sh.handle("?")
+        self.assertEqual(_MockLLM.seen, [])
+
     def test_cd_and_export_persist(self):
         self.sh.handle("go to run1")
         self.assertEqual(self.sh.cwd, os.path.join(self.lab, "run1"))

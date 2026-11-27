@@ -49,6 +49,16 @@ processing stops at the first step that handles it.
 Questions such as "how do I delete empty folders?" print the command without
 executing it.
 
+When a typed bash line fails with exit code 2 (wrong usage or a missing file),
+126 (not executable) or 127 (command not found), a hint line follows, and `?`
+(or `fix`) on the next line asks what was meant. A line of plain words is read
+by the rules first ("sort alphabetically" → the alphabetical listing); a line
+with flags or shell syntax goes to the language model, with the failed line and
+its exit code; without a model, the built-in model's closest requests are
+offered. Every answer is shown and confirmed before it runs, and a confirmed
+answer that succeeds is remembered for that line. `"fix_hint": false` (or
+`AISHA_FIX_HINT=false`) turns the hint off.
+
 Accuracy on 30 phrasings outside the test set, before tuning: 23 correct
 commands (77%) from the rules and the built-in model. Of the 7 misses, 6
 produced no command and 1 a wrong command. Each miss was turned into a general
@@ -291,7 +301,8 @@ aisha --doctor                          # check of tools, fallbacks, built-in mo
 ```
 
 Built-in commands: `!cmd` bypasses the rules and runs bash; `?request`
-bypasses the rules and queries the LLM; `explain <request>` prints the command
+bypasses the rules and queries the LLM; `?` alone right after a failed bash
+line asks what was meant; `explain <request>` prints the command
 that would run; `learned` / `forget <request>` list and remove remembered
 phrases; `llm` checks the model; `help` prints examples.
 
@@ -367,6 +378,7 @@ Settings are read from `~/.config/aisha/config.json` or the environment:
 | `confirm` | `AISHA_CONFIRM` | `llm` (`always`, or `destructive` only) |
 | `prompt_git` | `AISHA_PROMPT_GIT` | `false` (`true` shows `git:branch` in the prompt) |
 | `banner` | `AISHA_BANNER` | `true` (`false` hides the greeting) |
+| `fix_hint` | `AISHA_FIX_HINT` | `true` (`false`: no "?" hint after a failed bash line) |
 
 ## Installation
 

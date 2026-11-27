@@ -1,4 +1,4 @@
-.TH AISHA 1 "November 2026" "aisha 0.13.0" "User Commands"
+.TH AISHA 1 "November 2026" "aisha 0.14.0" "User Commands"
 .SH NAME
 aisha \- ai$ha (ai shell hybrid alpha), a bash-compatible shell with plain-language requests
 .SH SYNOPSIS
@@ -84,6 +84,11 @@ run in bash, skipping the rules
 .BI ? request
 skip the rules and ask the LLM
 .TP
+.B ?
+alone, right after a bash line that failed with exit code 2, 126 or 127:
+what was meant (the rules for plain words, else the language model, else the
+built-in model's closest requests); shown and confirmed before it runs
+.TP
 .BI explain " request"
 show what would run, run nothing
 .TP
@@ -133,6 +138,9 @@ set to off to disable the LLM fallback
 .TP
 .B AISHA_THRESHOLD
 confidence below which the rules defer to the LLM (default 0.7)
+.TP
+.B AISHA_FIX_HINT
+false: no hint after a failed bash line
 .TP
 .B AISHA_CONFIRM
 llm (default), always, or destructive

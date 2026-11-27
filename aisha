@@ -50,7 +50,7 @@ import urllib.error
 import urllib.parse
 from dataclasses import dataclass, field
 
-VERSION = "0.13.0"
+VERSION = "0.14.0"
 NAME = "ai$ha"             # the shell's name as shown: ai shell hybrid alpha. The command stays `aisha`
 TAGLINE = "ai shell hybrid alpha"   # ($ in a command name would be read as a variable by every shell)
 
@@ -87,6 +87,7 @@ DEFAULTS = {
     "prompt_git": False,                    # show the git branch in the prompt (off by default)
     "llm_server": "",                       # llama-server binary aisha starts on demand
     "llm_model_file": "",                   # .gguf model for llm_server
+    "fix_hint": True,                       # after a bash line fails (exit 2, 126, 127): "?" asks what was meant
 }
 ENV_KEYS = {
     "llm": "AISHA_LLM",
@@ -100,6 +101,7 @@ ENV_KEYS = {
     "prompt_git": "AISHA_PROMPT_GIT",
     "llm_server": "AISHA_LLM_SERVER",
     "llm_model_file": "AISHA_LLM_MODEL_FILE",
+    "fix_hint": "AISHA_FIX_HINT",
 }
 
 
@@ -132,6 +134,7 @@ def load_config() -> dict:
     cfg["threshold"] = float(cfg["threshold"])
     cfg["banner"] = str(cfg["banner"]).lower() not in ("0", "false", "no", "off")
     cfg["prompt_git"] = str(cfg["prompt_git"]).lower() in ("1", "true", "yes", "on")
+    cfg["fix_hint"] = str(cfg["fix_hint"]).lower() not in ("0", "false", "no", "off")
     # A language model is used only when it was set up (aisha --setup) or named.
     try:
         with open(CFG_FILE) as f:
@@ -7959,7 +7962,7 @@ class LLM:
         except (KeyError, IndexError, TypeError):
             raise LLMError(f"unexpected reply from LLM server: {str(data)[:200]}") from None
 
-    def command_for(self, request: str, cwd: str, hints: str) -> str | None:
+    def command_for(self, request: str, cwd: str, hints: str, failure: str = "") -> str | None:
         try:
             entries = sorted(os.listdir(cwd))
         except OSError:
@@ -7972,6 +7975,9 @@ class LLM:
                    f"Entries here: {', '.join(shown) or '(empty)'}{more}\n")
         if hints:
             context += f"Partial parse by the rule engine (may be wrong): {hints}\n"
+        if failure:
+            context += (f"This request was typed as a bash line and failed: {failure}. "
+                        "Reply with the command that was meant.\n")
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         for q, a in FEWSHOT:
             messages += [{"role": "user", "content": q}, {"role": "assistant", "content": a}]
@@ -8034,6 +8040,10 @@ def validate_command(cmd: str) -> str | None:
 
 
 # ---- memory of approved LLM answers -----------------------------------------------
+
+# Exit codes of a typed bash line after which "?" asks what was meant.
+FIX_CODES = {2: "wrong usage or a missing file", 126: "not executable", 127: "command not found"}
+
 
 class Memory:
     def __init__(self, path: str):
@@ -8145,6 +8155,7 @@ Shell features: pipes, loops, aliases, functions, Ctrl-Z/jobs/fg/bg, Tab complet
 
 aisha commands:
   !<command>         plain bash, no rules         ?<request>         direct LLM query
+  ?                  after a failed bash line: what was meant (rules, then the model)
   explain <request>  command that would run       again              repetition of the last line
   teach <request> = <command>                    e.g. teach backup {dir} = tar -czf {dir}.tgz {dir}
   learned / forget   taught phrases               llm                check of the optional language model
@@ -8294,6 +8305,8 @@ class Shell:
         self.jobs: list[Job] = []
         self.names: set[str] = set()        # aliases and functions, for shell detection
         self.tty = sys.stdin.fileno() if interactive and sys.stdin.isatty() else None
+        self.interactive = interactive
+        self.last_failed: tuple[str, int] | None = None   # (bash line, exit code), for "?"
         self.workdir = tempfile.mkdtemp(prefix="aisha-")
         self.defs_file = os.path.join(self.workdir, "defs.sh")
         self._seq = 0
@@ -8328,6 +8341,10 @@ class Shell:
                 say("There are stopped jobs. ('exit' again to leave anyway)")
                 return 1
             raise ExitShell(int(toks[1]) if len(toks) == 2 and toks[1].isdigit() else self.rc)
+        failed, self.last_failed = getattr(self, "last_failed", None), None
+        if failed and (line in ("?", "??") or line.lower().strip(" ?!.") in (
+                "fix", "fix it", "fix that", "what did i mean", "what was meant", "help with that")):
+            return self.fix_failed(*failed)
         low = line.lower().strip(" ?!.")
         if line in ("help", "?") or low in (
                 "what can you do", "what can i ask", "what can i say", "what can you help with", "what do you understand",
@@ -8406,7 +8423,27 @@ class Shell:
             say(dim("(bash line; dry run, not run)"))
             return 0
         self.rc = self.run_line(line)
+        if self.rc in FIX_CODES and self.cfg.get("fix_hint", True) and self.interactive:
+            self.last_failed = (line, self.rc)
+            helper = "the language model" if self.llm.enabled else "the built-in model"
+            say(dim(f"(exit {self.rc}, {FIX_CODES[self.rc]}: '?' asks {helper} what was meant)"))
         return self.rc
+
+    def fix_failed(self, line: str, rc: int) -> int:
+        """A bash line failed: ask what was meant. The language model if one is set up,
+        else the rules and the built-in model's closest requests. Nothing runs unconfirmed."""
+        failure = f"`{line}` exited with {rc} ({FIX_CODES.get(rc, 'error')})"
+        partial = interpret(line, self.cwd)
+        words_only = not re.search(r"(?:^|\s)-\S|[|&;<>`$]", line)     # flags or shell syntax: bash was meant
+        if words_only and partial and partial.confidence >= self.cfg["threshold"] and partial.command.strip() != line.strip():
+            partial.source = "guess"            # the rules read it as words: confirm like a guess
+            partial.why.append("read as words, not as a bash line")
+            return self.execute(partial)
+        if self.llm.enabled and not self.dry_run:
+            rc2 = self.via_llm(line, partial, fall_back=False, failure=failure)
+            if rc2 is not None:
+                return rc2
+        return self.unsure(line, partial, ask_llm=False)
 
     def job_kill(self, args: list[str]) -> int:
         """kill [-SIG] %N: signal one of aisha's jobs (bash's %N means nothing to bash -c)."""
@@ -8461,7 +8498,7 @@ class Shell:
             return self.execute(plan)
         return self.unsure(line, plan)
 
-    def unsure(self, line: str, partial: Plan | None) -> int:
+    def unsure(self, line: str, partial: Plan | None, ask_llm: bool = True) -> int:
         """The rules are not sure: offer the built-in model's closest matches, the
         rules' guess, the language model (if set up), or teaching by example."""
         options = suggest(line, self.cwd, self.cfg["threshold"])
@@ -8470,7 +8507,7 @@ class Shell:
             partial.source = "guess"
             choices.append(("(best guess) " + partial.rationale(), partial))
         best = max((s for _, _, s in options), default=0.0)
-        if self.llm.enabled and not self.dry_run and (not choices or best < STRONG_SUGGESTION):
+        if ask_llm and self.llm.enabled and not self.dry_run and (not choices or best < STRONG_SUGGESTION):
             # nothing close: the language model goes first; the list only if it can't help
             rc = self.via_llm(line, partial, fall_back=not choices)
             if rc is not None:
@@ -8511,7 +8548,7 @@ class Shell:
         pattern, template = self.memory.learn(phrase, command)
         say(dim(f"learned: “{pattern}” → {template}"))
 
-    def via_llm(self, line: str, partial: Plan | None, fall_back: bool = True) -> int | None:
+    def via_llm(self, line: str, partial: Plan | None, fall_back: bool = True, failure: str = "") -> int | None:
         """Ask the language model. With fall_back=False, None if it could not help."""
         if not self.llm.enabled:
             say(red("the LLM is turned off (AISHA_LLM=off)"))
@@ -8521,10 +8558,10 @@ class Shell:
             hints = f"{partial.rationale()}; draft command: {partial.command}"
             if partial.unknown:
                 hints += f"; words the rules could not place: {' '.join(partial.unknown)}"
-        say(dim(f"… rules not sure, asking {self.cfg['llm_model']}"))
+        say(dim(f"… {'the bash line failed' if failure else 'rules not sure'}, asking {self.cfg['llm_model']}"))
         t0 = time.time()
         try:
-            cmd = self.llm.command_for(line, self.cwd, hints)
+            cmd = self.llm.command_for(line, self.cwd, hints, failure)
         except LLMError as e:
             say(red(f"LLM: {e}"))
             if not fall_back:
